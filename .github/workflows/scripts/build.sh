@@ -20,7 +20,7 @@ if [[ -z "$python_executable" ]]; then
   exit 1
 fi
 
-# Ensure uv is installed (using the provided python executable to install it if missing, 
+# Ensure uv is installed (using the provided python executable to install it if missing,
 # though ideally it should be pre-installed in CI)
 if ! command -v uv >/dev/null 2>&1; then
     log "INFO" "uv not found, installing via pip"

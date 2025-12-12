@@ -27,7 +27,7 @@ jobs:
       - name: Install uv
         run: |
           pip install uv
-          
+
       - name: Build Wheel
         run: |
           bash .github/workflows/scripts/build.sh python
