@@ -18,7 +18,7 @@ from torch import nn
 from transformers.utils import ModelOutput
 
 try:
-    from flash_attn import flash_attn_varlen_func  # type: ignore
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
 except Exception as exc:  # pragma: no cover
     flash_attn_varlen_func = None
     _flash_attn_import_error = exc
