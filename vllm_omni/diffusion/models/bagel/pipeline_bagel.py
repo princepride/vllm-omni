@@ -265,6 +265,11 @@ class BagelPipeline(nn.Module):
         # Typically cfg_img_context mirrors gen_context for text-to-image.
         cfg_img_context = copy.deepcopy(gen_context)
 
+        if req.seed is not None:
+            torch.manual_seed(req.seed)
+            if self.device.type == "cuda":
+                torch.cuda.manual_seed(req.seed)
+
         # Prepare latent query and run flow
         generation_input = self.bagel.prepare_vae_latent(
             curr_kvlens=gen_context["kv_lens"],
