@@ -1,7 +1,7 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch import nn
@@ -391,21 +391,21 @@ class Bagel(PreTrainedModel):
         timestep_shift: float = 1.0,
         cfg_renorm_min: float = 0.0,
         cfg_renorm_type: str = "global",
-        cfg_interval: Optional[tuple[float, float]] = [0, 1],
+        cfg_interval: tuple[float, float] | None = (0, 1),
         # cfg_text
         cfg_text_scale: float = 1.0,
-        cfg_text_packed_query_indexes: Optional[torch.LongTensor] = None,
-        cfg_text_packed_position_ids: Optional[torch.LongTensor] = None,
-        cfg_text_past_key_values: Optional[NaiveCache] = None,
-        cfg_text_key_values_lens: Optional[torch.IntTensor] = None,
-        cfg_text_packed_key_value_indexes: Optional[torch.LongTensor] = None,
+        cfg_text_packed_query_indexes: torch.LongTensor | None = None,
+        cfg_text_packed_position_ids: torch.LongTensor | None = None,
+        cfg_text_past_key_values: NaiveCache | None = None,
+        cfg_text_key_values_lens: torch.IntTensor | None = None,
+        cfg_text_packed_key_value_indexes: torch.LongTensor | None = None,
         # cfg_img
         cfg_img_scale: float = 1.0,
-        cfg_img_packed_query_indexes: Optional[torch.LongTensor] = None,
-        cfg_img_packed_position_ids: Optional[torch.LongTensor] = None,
-        cfg_img_past_key_values: Optional[NaiveCache] = None,
-        cfg_img_key_values_lens: Optional[torch.IntTensor] = None,
-        cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
+        cfg_img_packed_query_indexes: torch.LongTensor | None = None,
+        cfg_img_packed_position_ids: torch.LongTensor | None = None,
+        cfg_img_past_key_values: NaiveCache | None = None,
+        cfg_img_key_values_lens: torch.IntTensor | None = None,
+        cfg_img_packed_key_value_indexes: torch.LongTensor | None = None,
         cfg_type: str = "parallel",
         # cache_args
     ):
@@ -494,26 +494,26 @@ class Bagel(PreTrainedModel):
         cfg_renorm_type: str = "global",
         # cfg_text
         cfg_text_scale: float = 1.0,
-        cfg_text_packed_position_ids: Optional[torch.LongTensor] = None,
-        cfg_text_packed_query_indexes: Optional[torch.LongTensor] = None,
-        cfg_text_key_values_lens: Optional[torch.Tensor] = None,
-        cfg_text_past_key_values: Optional[NaiveCache] = None,
-        cfg_text_packed_key_value_indexes: Optional[torch.LongTensor] = None,
+        cfg_text_packed_position_ids: torch.LongTensor | None = None,
+        cfg_text_packed_query_indexes: torch.LongTensor | None = None,
+        cfg_text_key_values_lens: torch.Tensor | None = None,
+        cfg_text_past_key_values: NaiveCache | None = None,
+        cfg_text_packed_key_value_indexes: torch.LongTensor | None = None,
         # cfg_img
         cfg_img_scale: float = 1.0,
-        cfg_img_packed_position_ids: Optional[torch.LongTensor] = None,
-        cfg_img_packed_query_indexes: Optional[torch.LongTensor] = None,
-        cfg_img_key_values_lens: Optional[torch.Tensor] = None,
-        cfg_img_past_key_values: Optional[NaiveCache] = None,
-        cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
+        cfg_img_packed_position_ids: torch.LongTensor | None = None,
+        cfg_img_packed_query_indexes: torch.LongTensor | None = None,
+        cfg_img_key_values_lens: torch.Tensor | None = None,
+        cfg_img_past_key_values: NaiveCache | None = None,
+        cfg_img_packed_key_value_indexes: torch.LongTensor | None = None,
         cfg_type: str = "parallel",
         # cache
-        model_pred_cache_dic: Optional[dict[str, Any]] = None,
-        model_pred_current: Optional[int] = None,
-        model_pred_text_cache_dic: Optional[dict[str, Any]] = None,
-        model_pred_text_current: Optional[int] = None,
-        model_pred_img_cache_dic: Optional[dict[str, Any]] = None,
-        model_pred_img_current: Optional[int] = None,
+        model_pred_cache_dic: dict[str, Any] | None = None,
+        model_pred_current: int | None = None,
+        model_pred_text_cache_dic: dict[str, Any] | None = None,
+        model_pred_text_current: int | None = None,
+        model_pred_img_cache_dic: dict[str, Any] | None = None,
+        model_pred_img_current: int | None = None,
     ):
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
