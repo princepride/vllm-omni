@@ -12,7 +12,6 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional
 
 import torch
 from torch import nn
@@ -217,7 +216,7 @@ class NaiveCache:
 @dataclass
 class BaseNavitOutputWithPast(ModelOutput):
     packed_query_sequence: torch.FloatTensor = None
-    past_key_values: Optional[NaiveCache] = None
+    past_key_values: NaiveCache | None = None
 
 
 def pad_sequence(tensor, pad_size):
@@ -227,7 +226,7 @@ def pad_sequence(tensor, pad_size):
 
 
 class PackedAttentionMoT(Qwen2Attention):
-    def __init__(self, config, layer_idx: Optional[int] = None):
+    def __init__(self, config, layer_idx: int | None = None):
         super().__init__(config, layer_idx)
         if self.config.qk_norm:
             self.q_norm = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -260,9 +259,9 @@ class PackedAttentionMoT(Qwen2Attention):
         query_lens: torch.Tensor,
         packed_query_position_embeddings: torch.Tensor,
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        past_key_values: NaiveCache | None = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
         update_past_key_values=True,
         is_causal=True,
         mode="und",
@@ -374,8 +373,8 @@ class Qwen2MoTDecoderLayer(nn.Module):
     def __init__(
         self,
         config,
-        layer_idx: Optional[int] = None,
-        attn_module: Optional[Qwen2Attention] = PackedAttentionMoT,
+        layer_idx: int | None = None,
+        attn_module: Qwen2Attention | None = PackedAttentionMoT,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -399,9 +398,9 @@ class Qwen2MoTDecoderLayer(nn.Module):
         query_lens: torch.Tensor,
         packed_query_position_embeddings: torch.Tensor,
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        past_key_values: NaiveCache | None = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
         update_past_key_values=True,
         is_causal=True,
         mode="und",
@@ -497,9 +496,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
         query_lens: torch.Tensor,
         packed_query_position_ids: torch.Tensor,
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        past_key_values: NaiveCache | None = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
         update_past_key_values=True,
         is_causal=True,
         mode="und",
@@ -601,9 +600,9 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         query_lens: torch.Tensor,
         packed_query_position_ids: torch.Tensor,
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        past_key_values: NaiveCache | None = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
         update_past_key_values=True,
         is_causal=True,
         mode="und",
