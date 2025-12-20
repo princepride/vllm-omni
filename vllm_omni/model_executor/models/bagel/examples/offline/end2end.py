@@ -1,6 +1,5 @@
 import argparse
 import os
-import os as _os_env_toggle
 import random
 import time
 
@@ -9,8 +8,6 @@ import torch
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.omni_llm import OmniLLM
-
-_os_env_toggle.environ["VLLM_USE_V1"] = "1"
 
 SEED = 42
 # Set all random seeds
@@ -33,119 +30,27 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        required=True,
-        help="Path to merged model directory (will be created if downloading).",
+        default="../models/BAGEL-7B-MoT",
+        help="Path to merged model directory.",
     )
-    parser.add_argument("--thinker-model", type=str, default=None)
-    parser.add_argument("--talker-model", type=str, default=None)
-    parser.add_argument("--code2wav-model", type=str, default=None)
-    parser.add_argument(
-        "--hf-hub-id",
-        default="Qwen/Qwen2.5-Omni-7B",
-        help="Hugging Face repo id to download if needed.",
-    )
-    parser.add_argument("--hf-revision", default=None, help="Optional HF revision (branch/tag/commit).")
     parser.add_argument("--prompts", nargs="+", default=None, help="Input text prompts.")
-    parser.add_argument("--voice-type", default="default", help="Voice type, e.g., m02, f030, default.")
-    parser.add_argument(
-        "--code2wav-dir",
-        default=None,
-        help="Path to code2wav folder (contains spk_dict.pt).",
-    )
-    parser.add_argument("--dit-ckpt", default=None, help="Path to DiT checkpoint file (e.g., dit.pt).")
-    parser.add_argument("--bigvgan-ckpt", default=None, help="Path to BigVGAN checkpoint file.")
-    parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
-    parser.add_argument("--max-model-len", type=int, default=32768)
-    parser.add_argument(
-        "--init-sleep-seconds",
-        type=int,
-        default=20,
-        help="Sleep seconds after starting each stage process to allow initialization (default: 20)",
-    )
-
-    parser.add_argument("--thinker-only", action="store_true")
-    parser.add_argument("--text-only", action="store_true")
-    parser.add_argument("--do-wave", action="store_true")
-    parser.add_argument(
-        "--prompt_type",
-        choices=[
-            "text",
-            "audio",
-            "audio-long",
-            "audio-long-chunks",
-            "audio-long-expand-chunks",
-            "image",
-            "video",
-            "video-frames",
-            "audio-in-video",
-            "audio-in-video-v2",
-            "audio-multi-round",
-            "badcase-vl",
-            "badcase-text",
-            "badcase-image-early-stop",
-            "badcase-two-audios",
-            "badcase-two-videos",
-            "badcase-multi-round",
-            "badcase-voice-type",
-            "badcase-voice-type-v2",
-            "badcase-audio-tower-1",
-            "badcase-audio-only",
-        ],
-        default="text",
-    )
-    parser.add_argument("--use-torchvision", action="store_true")
-    parser.add_argument("--tokenize", action="store_true")
-    parser.add_argument(
-        "--output-wav",
-        default="output.wav",
-        help="[Deprecated] Output wav directory (use --output-dir).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="outputs",
-        help="Output directory to save text and wav files together.",
-    )
-    parser.add_argument(
-        "--thinker-hidden-states-dir",
-        default="thinker_hidden_states",
-        help="Path to thinker hidden states directory.",
-    )
-    parser.add_argument(
-        "--batch-timeout",
-        type=int,
-        default=5,
-        help="Timeout for batching in seconds (default: 5)",
-    )
-    parser.add_argument(
-        "--init-timeout",
-        type=int,
-        default=300,
-        help="Timeout for initializing stages in seconds (default: 300)",
-    )
-    parser.add_argument(
-        "--shm-threshold-bytes",
-        type=int,
-        default=65536,
-        help="Threshold for using shared memory in bytes (default: 65536)",
-    )
-    parser.add_argument(
-        "--enable-stats",
-        action="store_true",
-        default=False,
-        help="Enable writing detailed statistics (default: disabled)",
-    )
     parser.add_argument(
         "--txt-prompts",
         type=str,
         default=None,
         help="Path to a .txt file with one prompt per line (preferred).",
     )
-    parser.add_argument("--worker-backend", type=str, default="process", choices=["process", "ray"], help="backend")
-    parser.add_argument(
-        "--ray-address", type=str, default=None, help="Path to a .txt file with one prompt per line (preferred)."
-    )
+    parser.add_argument("--prompt_type", default="text", choices=["text"])
 
-    parser.add_argument("--stage-configs-path", type=str, default=None, help="Path to yaml config file")
+    # OmniLLM init args
+    parser.add_argument("--enable-stats", action="store_true", default=False)
+    parser.add_argument("--init-sleep-seconds", type=int, default=20)
+    parser.add_argument("--batch-timeout", type=int, default=5)
+    parser.add_argument("--init-timeout", type=int, default=300)
+    parser.add_argument("--shm-threshold-bytes", type=int, default=65536)
+    parser.add_argument("--worker-backend", type=str, default="process", choices=["process", "ray"])
+    parser.add_argument("--ray-address", type=str, default=None)
+    parser.add_argument("--stage-configs-path", type=str, default=None)
 
     args = parser.parse_args()
     return args
@@ -166,7 +71,9 @@ def main():
         raise
 
     if args.prompts is None:
-        raise ValueError("No prompts provided. Use --prompts ... or --txt-prompts <file.txt> (with --prompt_type text)")
+        # Default prompt for text2img test if none provided
+        args.prompts = ["<|im_start|>user\ndraw a cat<|im_end|>\n<|im_start|>assistant\n"]
+        print(f"[Info] No prompts provided, using default: {args.prompts}")
 
     omni_llm = OmniLLM(
         model=model_name,
@@ -182,11 +89,12 @@ def main():
     )
     sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=20, stop=["<|im_end|>"])
 
-    sampling_params_list = [sampling_params]
+    sampling_params_list = [sampling_params] * len(args.prompts)
 
     t1 = time.time()
-    prompt = [{"prompt": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"}]
-    omni_outputs = omni_llm.generate(prompt, sampling_params_list)
+    # Format prompts as required by OmniLLM (list of dicts)
+    formatted_prompts = [{"prompt": p} for p in args.prompts]
+    omni_outputs = omni_llm.generate(formatted_prompts, sampling_params_list)
     t2 = time.time()
     print(f"==========> time:{t2 - t1}")
     print(omni_outputs)
