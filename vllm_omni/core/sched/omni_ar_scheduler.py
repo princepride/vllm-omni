@@ -349,9 +349,25 @@ class OmniARScheduler(VLLMScheduler):
                     "kv_metadata": {"seq_len": transfer_data["seq_len"], "block_ids": transfer_data["block_ids"]},
                 }
                 # Also update request.additional_information for good measure
-                if not hasattr(request, "additional_information") or request.additional_information is None:
+                add_info = getattr(request, "additional_information", None)
+                # If additional_information is an AdditionalInformationPayload-like object,
+                # unpack list_data into a plain dict.
+                if (
+                    add_info is not None
+                    and hasattr(add_info, "entries")
+                    and isinstance(getattr(add_info, "entries"), dict)
+                ):
+                    request.additional_information = {
+                        k: getattr(v, "list_data")
+                        for k, v in getattr(add_info, "entries").items()
+                        if getattr(v, "list_data", None) is not None
+                    }
+                    add_info = request.additional_information
+                if add_info is None:
                     request.additional_information = {}
-                request.additional_information.update(kv_xfer_params)
+                    add_info = request.additional_information
+                if isinstance(add_info, dict):
+                    add_info.update(kv_xfer_params)
 
             return kv_xfer_params
 

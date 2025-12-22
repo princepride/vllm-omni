@@ -30,7 +30,7 @@ from vllm_omni.distributed.ray_utils.utils import (
 )
 from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
 from vllm_omni.entrypoints.omni_stage import OmniStage
-from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK
+from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, _to_dict
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
@@ -271,6 +271,87 @@ class OmniBase:
                 self.omni_transfer_config,
                 stage_id,
             )
+
+            # Inject YAML-resolved connector config into omni_config for
+            # in-engine usage (GPU model runner reads model_config.omni_config).
+            try:
+                transfer_cfg = self.omni_transfer_config
+                if transfer_cfg is not None and getattr(transfer_cfg, "connectors", None):
+                    # For SENDER logic (GPUARModelRunner): find outgoing edge
+                    outgoing = [
+                        (to_stage, spec)
+                        for (from_stage, to_stage), spec in transfer_cfg.connectors.items()
+                        if from_stage == str(stage_id)
+                    ]
+
+                    # For RECEIVER logic (Diffusion): find incoming edge
+                    incoming = [
+                        (from_stage, spec)
+                        for (from_stage, to_stage), spec in transfer_cfg.connectors.items()
+                        if to_stage == str(stage_id)
+                    ]
+
+                    omni_conn_cfg = None
+                    omni_from = None
+                    omni_to = None
+
+                    # Prioritize outgoing (Sender) if exists, else check incoming (Receiver)
+                    # Note: A stage could be both, but typically one primary role per runner type.
+                    # We inject the config, runner decides if it uses it.
+                    if outgoing:
+                        if len(outgoing) > 1:
+                            logger.debug(
+                                "[Omni] stage-%s has %d outgoing edges; using the smallest to_stage",
+                                stage_id,
+                                len(outgoing),
+                            )
+                        outgoing.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]))
+                        to_s, spec = outgoing[0]
+                        omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
+                        omni_from = str(stage_id)
+                        omni_to = str(to_s)
+                    elif incoming:
+                        # For receiver, pick one incoming edge to configure the connector
+                        # (Assuming same connector type for all incoming if multiple)
+                        incoming.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]))
+                        from_s, spec = incoming[0]
+                        omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
+                        omni_from = str(from_s)
+                        omni_to = str(stage_id)
+
+                    if omni_conn_cfg:
+                        # Prepare omni_config dict
+                        omni_conf_dict = {}
+                        try:
+                            # Access engine_args safely (might be OmegaConf or dict)
+                            existing_args = stage.engine_args
+                            if hasattr(existing_args, "get"):
+                                _oc = existing_args.get("omni_config", None)
+                                if _oc:
+                                    if hasattr(_oc, "items"):  # dict-like
+                                        omni_conf_dict = dict(_oc)
+                                    else:  # object?
+                                        omni_conf_dict = _to_dict(_oc)
+                        except Exception:
+                            omni_conf_dict = {}
+
+                        # Inject connector info
+                        omni_conf_dict["connector_config"] = omni_conn_cfg
+                        omni_conf_dict["omni_from_stage"] = omni_from
+                        omni_conf_dict["omni_to_stage"] = omni_to
+
+                        # Write back to engine_args
+                        try:
+                            if hasattr(stage.engine_args, "__setitem__"):
+                                stage.engine_args["omni_config"] = omni_conf_dict
+                            else:
+                                setattr(stage.engine_args, "omni_config", omni_conf_dict)
+                        except Exception:
+                            # Fallback for OmegaConf or similar if direct set fails?
+                            pass
+
+            except Exception as e:
+                logger.debug("[Omni] Failed to inject omni connector config into stage-%s: %s", stage_id, e)
 
             stage.init_stage_worker(
                 model,
