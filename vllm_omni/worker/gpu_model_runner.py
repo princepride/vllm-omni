@@ -16,7 +16,6 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 
-from vllm_omni.model_executor.models.bagel.bagel import BagelModelOutput
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 if TYPE_CHECKING:
@@ -315,9 +314,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
-
-        elif isinstance(hidden_states, BagelModelOutput):
-            return hidden_states.logits, hidden_states.multimodal_outputs
 
         elif isinstance(hidden_states, torch.Tensor):
             text_hidden_states = hidden_states
