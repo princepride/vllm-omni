@@ -58,6 +58,7 @@ _DIFFUSION_MODELS = {
         "bagel",
         "pipeline_bagel",
         "BagelPipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",

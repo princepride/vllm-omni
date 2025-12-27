@@ -2,11 +2,26 @@
 # Copyright (c) 2025 Bytedance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
 
+# Copyright (c) 2024 The Qwen Team and The HuggingFace Inc. team.
+# Copyright (c) 2025 Bytedance Ltd. and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file is a modified version for Bagel model split:
+# Image Generator with MoE layers for generation mode.
+# Retains und weights for <|vision_start|> and <|vision_end|> tokens.
+
+
+import glob
+import os
 from collections.abc import Iterable
-from typing import Optional
+from dataclasses import dataclass
+from math import isqrt
 
 import torch
-from torch import nn
+from einops import rearrange
+from PIL import Image
+from safetensors.torch import load_file
+from torch import Tensor, nn
 from tqdm import tqdm
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2MLP,
@@ -16,22 +31,13 @@ from transformers.models.qwen2.modeling_qwen2 import (
     apply_rotary_pos_emb,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.vllm_flash_attn import flash_attn_varlen_func
 
-# Adjust imports to point to the correct location in vllm_omni/diffusion/models/bagel
-# Adjust imports to use local copies in vllm_omni/model_executor/models/bagel
-from .bagel_core import (
-    BagelConfig,
-    PositionEmbedding,
-    TimestepEmbedder,
-    get_flattened_position_ids_extrapolate,
-    prepare_vae_latent,
-)
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+from .bagel_core import BagelConfig, BagelGenParams, PositionEmbedding, TimestepEmbedder, prepare_vae_latent
 from .qwen2_navit import NaiveCache, Qwen2Config
-
-try:
-    from vllm.vllm_flash_attn import flash_attn_varlen_func
-except ImportError:
-    pass
 
 
 class Qwen2GenAttention(nn.Module):
@@ -98,15 +104,14 @@ class Qwen2GenAttention(nn.Module):
         packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
 
         # Text tokens (<|vision_start|>, <|vision_end|>) use und weights
-        if packed_text_indexes.numel() > 0:
-            packed_query_states[packed_text_indexes] = self.q_proj(packed_text_query_sequence)
-            packed_key_states[packed_text_indexes] = self.k_proj(packed_text_query_sequence)
-            packed_value_states[packed_text_indexes] = self.v_proj(packed_text_query_sequence)
+        packed_query_states[packed_text_indexes] = self.q_proj(packed_text_query_sequence)
+        packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(packed_vae_query_sequence)
 
-        if packed_vae_token_indexes.numel() > 0:
-            packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(packed_vae_query_sequence)
-            packed_key_states[packed_vae_token_indexes] = self.k_proj_moe_gen(packed_vae_query_sequence)
-            packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(packed_vae_query_sequence)
+        packed_key_states[packed_text_indexes] = self.k_proj(packed_text_query_sequence)
+        packed_key_states[packed_vae_token_indexes] = self.k_proj_moe_gen(packed_vae_query_sequence)
+
+        packed_value_states[packed_text_indexes] = self.v_proj(packed_text_query_sequence)
+        packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(packed_vae_query_sequence)
 
         packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
         packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
@@ -114,17 +119,14 @@ class Qwen2GenAttention(nn.Module):
 
         # Apply QK normalization with routing
         packed_query_states = packed_query_states.to(torch.float32)
-        if packed_text_indexes.numel() > 0:
-            packed_query_states[packed_text_indexes] = self.q_norm(packed_query_states[packed_text_indexes])
-            packed_key_states[packed_text_indexes] = self.k_norm(packed_key_states[packed_text_indexes])
+        packed_query_states[packed_text_indexes] = self.q_norm(packed_query_states[packed_text_indexes])
+        packed_query_states[packed_vae_token_indexes] = self.q_norm_moe_gen(
+            packed_query_states[packed_vae_token_indexes]
+        )
 
-        if packed_vae_token_indexes.numel() > 0:
-            packed_query_states[packed_vae_token_indexes] = self.q_norm_moe_gen(
-                packed_query_states[packed_vae_token_indexes]
-            )
-            packed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(
-                packed_key_states[packed_vae_token_indexes]
-            )
+        packed_key_states = packed_key_states.to(torch.float32)
+        packed_key_states[packed_text_indexes] = self.k_norm(packed_key_states[packed_text_indexes])
+        packed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_vae_token_indexes])
 
         # Apply rotary position embeddings
         packed_cos, packed_sin = packed_query_position_embeddings
@@ -171,12 +173,8 @@ class Qwen2GenAttention(nn.Module):
         packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
 
         # Route output projection
-        if packed_text_indexes.numel() > 0:
-            packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
-        if packed_vae_token_indexes.numel() > 0:
-            packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(
-                packed_attn_output[packed_vae_token_indexes]
-            )
+        packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
+        packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
 
         if update_past_key_values:
             past_key_values.key_cache[self.layer_idx] = merged_key_states
@@ -215,21 +213,17 @@ class Qwen2GenDecoderLayer(nn.Module):
         packed_key_value_indexes: torch.Tensor | None = None,
         packed_text_indexes: torch.Tensor | None = None,
         packed_vae_token_indexes: torch.Tensor | None = None,
-        past_key_values: Optional[NaiveCache] = None,
+        past_key_values: NaiveCache | None = None,
         update_past_key_values: bool = False,
-    ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
+    ) -> tuple[torch.Tensor, NaiveCache | None]:
         residual = packed_query_sequence
 
         # Input LayerNorm with routing
         packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
-        if packed_text_indexes.numel() > 0:
-            packed_query_sequence_[packed_text_indexes] = self.input_layernorm(
-                packed_query_sequence[packed_text_indexes]
-            )
-        if packed_vae_token_indexes.numel() > 0:
-            packed_query_sequence_[packed_vae_token_indexes] = self.input_layernorm_moe_gen(
-                packed_query_sequence[packed_vae_token_indexes]
-            )
+        packed_query_sequence_[packed_text_indexes] = self.input_layernorm(packed_query_sequence[packed_text_indexes])
+        packed_query_sequence_[packed_vae_token_indexes] = self.input_layernorm_moe_gen(
+            packed_query_sequence[packed_vae_token_indexes]
+        )
         packed_query_sequence = packed_query_sequence_
 
         # Self Attention
@@ -249,21 +243,15 @@ class Qwen2GenDecoderLayer(nn.Module):
 
         # FFN with routing
         residual = packed_query_sequence
+        packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
+        packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
+
+        packed_text_query_sequence = self.post_attention_layernorm(packed_text_query_sequence).to(torch.bfloat16)
+        packed_vae_query_sequence = self.post_attention_layernorm_moe_gen(packed_vae_query_sequence).to(torch.bfloat16)
 
         packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
-
-        if packed_text_indexes.numel() > 0:
-            packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-            packed_text_query_sequence = self.post_attention_layernorm(packed_text_query_sequence).to(torch.bfloat16)
-            packed_query_sequence_[packed_text_indexes] = self.mlp(packed_text_query_sequence)
-
-        if packed_vae_token_indexes.numel() > 0:
-            packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
-            packed_vae_query_sequence = self.post_attention_layernorm_moe_gen(packed_vae_query_sequence).to(
-                torch.bfloat16
-            )
-            packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
-
+        packed_query_sequence_[packed_text_indexes] = self.mlp(packed_text_query_sequence)
+        packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
         packed_query_sequence = packed_query_sequence_
 
         packed_query_sequence = residual + packed_query_sequence
@@ -307,9 +295,9 @@ class Qwen2ImageGeneratorModel(Qwen2PreTrainedModel):
         packed_key_value_indexes: torch.Tensor | None = None,
         packed_text_indexes: torch.Tensor | None = None,
         packed_vae_token_indexes: torch.Tensor | None = None,
-        past_key_values: Optional[NaiveCache] = None,
+        past_key_values: NaiveCache | None = None,
         update_past_key_values: bool = False,
-    ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
+    ) -> tuple[torch.Tensor, NaiveCache | None]:
         # Create position embeddings
         cos, sin = self.rotary_emb(packed_query_sequence, packed_query_position_ids.unsqueeze(0))
         cos = cos.squeeze(0)
@@ -332,22 +320,342 @@ class Qwen2ImageGeneratorModel(Qwen2PreTrainedModel):
 
         # Final norm with routing
         packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
-        if packed_text_indexes.numel() > 0:
-            packed_query_sequence_[packed_text_indexes] = self.norm(packed_query_sequence[packed_text_indexes])
-        if packed_vae_token_indexes.numel() > 0:
-            packed_query_sequence_[packed_vae_token_indexes] = self.norm_moe_gen(
-                packed_query_sequence[packed_vae_token_indexes]
-            )
+        packed_query_sequence_[packed_text_indexes] = self.norm(packed_query_sequence[packed_text_indexes])
+        packed_query_sequence_[packed_vae_token_indexes] = self.norm_moe_gen(
+            packed_query_sequence[packed_vae_token_indexes]
+        )
         packed_query_sequence = packed_query_sequence_
 
         return packed_query_sequence, past_key_values
+
+
+@dataclass
+class AutoEncoderParams:
+    resolution: int
+    in_channels: int
+    downsample: int
+    ch: int
+    out_ch: int
+    ch_mult: list[int]
+    num_res_blocks: int
+    z_channels: int
+    scale_factor: float
+    shift_factor: float
+
+
+def swish(x: Tensor) -> Tensor:
+    return x * torch.sigmoid(x)
+
+
+class AttnBlock(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.in_channels = in_channels
+
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+
+        self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+    def attention(self, h_: Tensor) -> Tensor:
+        h_ = self.norm(h_)
+        q = self.q(h_)
+        k = self.k(h_)
+        v = self.v(h_)
+
+        b, c, h, w = q.shape
+        q = rearrange(q, "b c h w -> b 1 (h w) c").contiguous()
+        k = rearrange(k, "b c h w -> b 1 (h w) c").contiguous()
+        v = rearrange(v, "b c h w -> b 1 (h w) c").contiguous()
+        h_ = nn.functional.scaled_dot_product_attention(q, k, v)
+
+        return rearrange(h_, "b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.proj_out(self.attention(x))
+
+
+class ResnetBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.in_channels = in_channels
+        out_channels = in_channels if out_channels is None else out_channels
+        self.out_channels = out_channels
+
+        self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_channels, eps=1e-6, affine=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        if self.in_channels != self.out_channels:
+            self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        h = x
+        h = self.norm1(h)
+        h = swish(h)
+        h = self.conv1(h)
+
+        h = self.norm2(h)
+        h = swish(h)
+        h = self.conv2(h)
+
+        if self.in_channels != self.out_channels:
+            x = self.nin_shortcut(x)
+
+        return x + h
+
+
+class Downsample(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        # no asymmetric padding in torch conv, must do it ourselves
+        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
+
+    def forward(self, x: Tensor):
+        pad = (0, 1, 0, 1)
+        x = nn.functional.pad(x, pad, mode="constant", value=0)
+        x = self.conv(x)
+        return x
+
+
+class Upsample(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x: Tensor):
+        x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+        x = self.conv(x)
+        return x
+
+
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        resolution: int,
+        in_channels: int,
+        ch: int,
+        ch_mult: list[int],
+        num_res_blocks: int,
+        z_channels: int,
+    ):
+        super().__init__()
+        self.ch = ch
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        self.resolution = resolution
+        self.in_channels = in_channels
+        # downsampling
+        self.conv_in = nn.Conv2d(in_channels, self.ch, kernel_size=3, stride=1, padding=1)
+
+        curr_res = resolution
+        in_ch_mult = (1,) + tuple(ch_mult)
+        self.in_ch_mult = in_ch_mult
+        self.down = nn.ModuleList()
+        block_in = self.ch
+        for i_level in range(self.num_resolutions):
+            block = nn.ModuleList()
+            attn = nn.ModuleList()
+            block_in = ch * in_ch_mult[i_level]
+            block_out = ch * ch_mult[i_level]
+            for _ in range(self.num_res_blocks):
+                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out))
+                block_in = block_out
+            down = nn.Module()
+            down.block = block
+            down.attn = attn
+            if i_level != self.num_resolutions - 1:
+                down.downsample = Downsample(block_in)
+                curr_res = curr_res // 2
+            self.down.append(down)
+
+        # middle
+        self.mid = nn.Module()
+        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
+        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
+
+        # end
+        self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
+        self.conv_out = nn.Conv2d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # downsampling
+        hs = [self.conv_in(x)]
+        for i_level in range(self.num_resolutions):
+            for i_block in range(self.num_res_blocks):
+                h = self.down[i_level].block[i_block](hs[-1])
+                if len(self.down[i_level].attn) > 0:
+                    h = self.down[i_level].attn[i_block](h)
+                hs.append(h)
+            if i_level != self.num_resolutions - 1:
+                hs.append(self.down[i_level].downsample(hs[-1]))
+
+        # middle
+        h = hs[-1]
+        h = self.mid.block_1(h)
+        h = self.mid.attn_1(h)
+        h = self.mid.block_2(h)
+        # end
+        h = self.norm_out(h)
+        h = swish(h)
+        h = self.conv_out(h)
+        return h
+
+
+class Decoder(nn.Module):
+    def __init__(
+        self,
+        ch: int,
+        out_ch: int,
+        ch_mult: list[int],
+        num_res_blocks: int,
+        in_channels: int,
+        resolution: int,
+        z_channels: int,
+    ):
+        super().__init__()
+        self.ch = ch
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        self.resolution = resolution
+        self.in_channels = in_channels
+        self.ffactor = 2 ** (self.num_resolutions - 1)
+
+        # compute in_ch_mult, block_in and curr_res at lowest res
+        block_in = ch * ch_mult[self.num_resolutions - 1]
+        curr_res = resolution // 2 ** (self.num_resolutions - 1)
+        self.z_shape = (1, z_channels, curr_res, curr_res)
+
+        # z to block_in
+        self.conv_in = nn.Conv2d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
+
+        # middle
+        self.mid = nn.Module()
+        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
+        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
+
+        # upsampling
+        self.up = nn.ModuleList()
+        for i_level in reversed(range(self.num_resolutions)):
+            block = nn.ModuleList()
+            attn = nn.ModuleList()
+            block_out = ch * ch_mult[i_level]
+            for _ in range(self.num_res_blocks + 1):
+                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out))
+                block_in = block_out
+            up = nn.Module()
+            up.block = block
+            up.attn = attn
+            if i_level != 0:
+                up.upsample = Upsample(block_in)
+                curr_res = curr_res * 2
+            self.up.insert(0, up)  # prepend to get consistent order
+
+        # end
+        self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
+        self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, z: Tensor) -> Tensor:
+        # z to block_in
+        h = self.conv_in(z)
+
+        # middle
+        h = self.mid.block_1(h)
+        h = self.mid.attn_1(h)
+        h = self.mid.block_2(h)
+
+        # upsampling
+        for i_level in reversed(range(self.num_resolutions)):
+            for i_block in range(self.num_res_blocks + 1):
+                h = self.up[i_level].block[i_block](h)
+                if len(self.up[i_level].attn) > 0:
+                    h = self.up[i_level].attn[i_block](h)
+            if i_level != 0:
+                h = self.up[i_level].upsample(h)
+
+        # end
+        h = self.norm_out(h)
+        h = swish(h)
+        h = self.conv_out(h)
+        return h
+
+
+class DiagonalGaussian(nn.Module):
+    def __init__(self, sample: bool = True, chunk_dim: int = 1):
+        super().__init__()
+        self.sample = sample
+        self.chunk_dim = chunk_dim
+
+    def forward(self, z: Tensor) -> Tensor:
+        mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
+        if self.sample:
+            std = torch.exp(0.5 * logvar)
+            return mean + std * torch.randn_like(mean)
+        else:
+            return mean
+
+
+class AutoEncoder(nn.Module):
+    def __init__(self, params: AutoEncoderParams):
+        super().__init__()
+        self.encoder = Encoder(
+            resolution=params.resolution,
+            in_channels=params.in_channels,
+            ch=params.ch,
+            ch_mult=params.ch_mult,
+            num_res_blocks=params.num_res_blocks,
+            z_channels=params.z_channels,
+        )
+        self.decoder = Decoder(
+            resolution=params.resolution,
+            in_channels=params.in_channels,
+            ch=params.ch,
+            out_ch=params.out_ch,
+            ch_mult=params.ch_mult,
+            num_res_blocks=params.num_res_blocks,
+            z_channels=params.z_channels,
+        )
+        self.reg = DiagonalGaussian()
+
+        self.scale_factor = params.scale_factor
+        self.shift_factor = params.shift_factor
+
+    def encode(self, x: Tensor) -> Tensor:
+        z = self.reg(self.encoder(x))
+        z = self.scale_factor * (z - self.shift_factor)
+        return z
+
+    def decode(self, z: Tensor) -> Tensor:
+        z = z / self.scale_factor + self.shift_factor
+        return self.decoder(z)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.decode(self.encode(x))
+
+
+def default_ae_params() -> AutoEncoderParams:
+    return AutoEncoderParams(
+        resolution=256,
+        in_channels=3,
+        downsample=8,
+        ch=128,
+        out_ch=3,
+        ch_mult=[1, 2, 4, 4],
+        num_res_blocks=2,
+        z_channels=16,
+        scale_factor=0.3611,
+        shift_factor=0.1159,
+    )
 
 
 class Qwen2ImageGenerator(Qwen2PreTrainedModel):
     """
     Qwen2 Image Generator for Bagel.
     Wrapper around Qwen2ImageGeneratorModel for consistent API.
-    Including diffusion generation loop.
     """
 
     _tied_weights_keys = ["lm_head.weight"]
@@ -357,18 +665,13 @@ class Qwen2ImageGenerator(Qwen2PreTrainedModel):
         self.model = Qwen2ImageGeneratorModel(config)
         self.vocab_size = config.vocab_size
 
-        # If bagel_config not passed, try to extract from config
-        if bagel_config is None and hasattr(config, "bagel_config"):
-            bagel_config = config.bagel_config
-
         if bagel_config:
+            self.bagel_config = bagel_config
             self.hidden_size = config.hidden_size
             self.latent_patch_size = bagel_config.latent_patch_size
             self.max_latent_size = bagel_config.max_latent_size
             self.latent_channel = bagel_config.vae_config.z_channels
             self.patch_latent_dim = self.latent_patch_size**2 * self.latent_channel
-            self.timestep_shift = bagel_config.timestep_shift
-            self.latent_downsample = bagel_config.vae_config.downsample * bagel_config.latent_patch_size
 
             # Additional layers for DiT
             self.time_embedder = TimestepEmbedder(self.hidden_size)
@@ -376,11 +679,13 @@ class Qwen2ImageGenerator(Qwen2PreTrainedModel):
             self.llm2vae = nn.Linear(self.hidden_size, self.patch_latent_dim)
             self.latent_pos_embed = PositionEmbedding(self.max_latent_size, self.hidden_size)
 
+            # Initialize VAE
+            self.vae = AutoEncoder(default_ae_params())
+
             # Init weights for new layers
             nn.init.constant_(self.llm2vae.weight, 0)
             nn.init.constant_(self.llm2vae.bias, 0)
 
-        self.get_flattened_position_ids = get_flattened_position_ids_extrapolate
         self.post_init()
 
     def get_input_embeddings(self):
@@ -391,145 +696,32 @@ class Qwen2ImageGenerator(Qwen2PreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        past_key_values: torch.Tensor | None = None,
-        **kwargs,
+        packed_query_sequence: torch.Tensor,
+        query_lens: torch.Tensor,
+        packed_query_position_ids: torch.Tensor,
+        packed_query_indexes: torch.Tensor,
+        past_key_values: NaiveCache | None = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
+        update_past_key_values: bool = False,
+        packed_vae_token_indexes: torch.Tensor | None = None,
+        packed_text_indexes: torch.Tensor | None = None,
     ):
-        """
-        Forward pass for Bagel DiT.
-        Expects `past_key_values` from AR stage (shape: [2, num_layers, seq_len, num_heads, head_dim]).
-        input_ids/positions are generally ignored/dummy as this is an image generation stage
-        driven by the AR context and configuration.
-        """
-        if past_key_values is None:
-            # If strictly required, raise error. But for partial pipeline test, maybe allow?
-            # User objective implies we NEED to handle it.
-            # If passed as None, the generation will likely fail or produce garbage if dependent on it.
-            # Let's verify if we can get it from kwargs just in case.
-            past_key_values = kwargs.get("past_key_values", None)
-
-        if past_key_values is None:
-            raise ValueError("past_key_values (AR KV Cache) is required for Bagel DiT generation.")
-
-        # 1. Wrap AR KV Cache into NaiveCache
-        # Input shape: [2, num_layers, seq_len, num_heads, head_dim]
-        # or maybe [layers, 2, ...] depending on how "someone else" implements it.
-        # Assuming [2, num_layers, seq_len, num_heads, head_dim] as per standard stacking.
-
-        # If the tensor is on CPU, move to device?
-        if past_key_values.device != self.device:
-            past_key_values = past_key_values.to(self.device)
-
-        num_layers = past_key_values.shape[1]
-        seq_len = past_key_values.shape[2]
-
-        ar_cache = NaiveCache(num_layers)
-        for i in range(num_layers):
-            # keys: [seq_len, num_heads, head_dim]
-            ar_cache.key_cache[i] = past_key_values[0, i]
-            # values: [seq_len, num_heads, head_dim]
-            ar_cache.value_cache[i] = past_key_values[1, i]
-
-        curr_kvlens = [seq_len]
-        # Assuming RoPE continues from where text left off
-        curr_rope = [seq_len]
-
-        # 2. Prepare VAE Latent Inputs
-        # Get image size from config or kwargs
-        # Default to configured max size if not specified
-        image_size = kwargs.get(
-            "image_size", (self.max_latent_size * self.latent_downsample, self.max_latent_size * self.latent_downsample)
-        )
-        if isinstance(image_size, int):
-            image_size = (image_size, image_size)
-
-        # We need token IDs for <|vision_start|> etc.
-        # These should align with tokenizer.
-        # Hardcoding standard Bagel special token IDs or extracting if available.
-        new_token_ids = {
-            "start_of_image": self.config.vision_start_token_id
-            if hasattr(self.config, "vision_start_token_id")
-            else 151939,  # Example default, should check
-            "end_of_image": self.config.vision_end_token_id if hasattr(self.config, "vision_end_token_id") else 151940,
-        }
-
-        # Check for user passed new_token_ids
-        if "new_token_ids" in kwargs:
-            new_token_ids.update(kwargs["new_token_ids"])
-
-        generation_input = prepare_vae_latent(
-            curr_kvlens=curr_kvlens,
-            curr_rope=curr_rope,
-            image_sizes=[image_size],  # Batch size 1 assumption
-            new_token_ids=new_token_ids,
-            bagel_config=self.bagel_config,
-        )
-
-        # Move tensors to device
-        for k, v in generation_input.items():
-            if torch.is_tensor(v):
-                generation_input[k] = v.to(self.device)
-
-        # 3. Run Generation Loop
-        return self.generate_image(
-            past_key_values=ar_cache,
-            **generation_input,
-            num_timesteps=kwargs.get("num_timesteps", 24),
-            timestep_shift=kwargs.get("timestep_shift", getattr(self, "timestep_shift", 1.0)),
+        return self.model(
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_ids=packed_query_position_ids,
+            packed_query_indexes=packed_query_indexes,
+            past_key_values=past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=packed_key_value_indexes,
+            update_past_key_values=update_past_key_values,
+            packed_vae_token_indexes=packed_vae_token_indexes,
+            packed_text_indexes=packed_text_indexes,
         )
 
     @torch.no_grad
-    def generate_image(
-        self,
-        packed_text_ids: torch.LongTensor,
-        packed_text_indexes: torch.LongTensor,
-        packed_init_noises: torch.Tensor,
-        packed_vae_position_ids: torch.LongTensor,
-        packed_vae_token_indexes: torch.LongTensor,
-        packed_seqlens: torch.IntTensor,
-        packed_position_ids: torch.LongTensor,
-        packed_indexes: torch.LongTensor,
-        past_key_values: NaiveCache,
-        key_values_lens: torch.IntTensor,
-        packed_key_value_indexes: torch.LongTensor,
-        num_timesteps: int = 24,
-        timestep_shift: float = 1.0,
-    ):
-        x_t = packed_init_noises
-
-        timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
-        timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
-        dts = timesteps[:-1] - timesteps[1:]
-        timesteps = timesteps[:-1]
-
-        # Use caching dictionaries if needed, for now omitted/simplified as in original Reference
-        # Assuming sequential scheduling for simplicity as per Bagel implementation
-
-        for i, t in tqdm(enumerate(timesteps), total=len(timesteps), desc="Bagel Generation"):
-            timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-            v_t = self._forward_flow(
-                x_t=x_t,
-                timestep=timestep,
-                packed_vae_token_indexes=packed_vae_token_indexes,
-                packed_vae_position_ids=packed_vae_position_ids,
-                packed_text_ids=packed_text_ids,
-                packed_text_indexes=packed_text_indexes,
-                packed_position_ids=packed_position_ids,
-                packed_indexes=packed_indexes,
-                packed_seqlens=packed_seqlens,
-                key_values_lens=key_values_lens,
-                past_key_values=past_key_values,
-                packed_key_value_indexes=packed_key_value_indexes,
-            )
-
-            x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
-
-        unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-        return unpacked_latent
-
-    @torch.no_grad
-    def _forward_flow(
+    def forward_step(
         self,
         x_t: torch.Tensor,
         timestep: torch.LongTensor,
@@ -543,7 +735,13 @@ class Qwen2ImageGenerator(Qwen2PreTrainedModel):
         key_values_lens: torch.IntTensor,
         past_key_values: NaiveCache,
         packed_key_value_indexes: torch.LongTensor,
+        **kwargs,
     ):
+        """
+        Use image_generator for flow matching generation.
+        Receives KV cache from text_encoder.
+        """
+        # Get embeddings for <|vision_start|> and <|vision_end|> tokens
         packed_text_embedding = self.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
@@ -553,13 +751,13 @@ class Qwen2ImageGenerator(Qwen2PreTrainedModel):
         packed_timestep_embeds = self.time_embedder(timestep)
 
         # Project x_t to LLM dim and add embeddings
-        x_t_mapped = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
-        if x_t_mapped.dtype != packed_sequence.dtype:
-            x_t_mapped = x_t_mapped.to(packed_sequence.dtype)
+        x_t_embed = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
 
-        # Ensure we don't write OOB if indexes are messy, though they should be correct from prep
-        packed_sequence[packed_vae_token_indexes] = x_t_mapped
+        if x_t_embed.dtype != packed_sequence.dtype:
+            x_t_embed = x_t_embed.to(packed_sequence.dtype)
+        packed_sequence[packed_vae_token_indexes] = x_t_embed
 
+        # Forward through image generator model
         output_sequence, _ = self.model(
             packed_query_sequence=packed_sequence,
             query_lens=packed_seqlens,
@@ -569,16 +767,88 @@ class Qwen2ImageGenerator(Qwen2PreTrainedModel):
             key_values_lens=key_values_lens,
             packed_key_value_indexes=packed_key_value_indexes,
             update_past_key_values=False,
-            packed_text_indexes=packed_text_indexes,
             packed_vae_token_indexes=packed_vae_token_indexes,
+            packed_text_indexes=packed_text_indexes,
         )
 
-        # Project back
-        # output_sequence is flattened [total_tokens, hidden]
+        # Project back to VAE dim
         v_t = self.llm2vae(output_sequence)
         v_t = v_t[packed_vae_token_indexes]
 
         return v_t
+
+    def _decode_image_from_latent(
+        self, vae: AutoEncoder, latent: torch.Tensor, image_shape: tuple[int, int]
+    ) -> Image.Image:
+        H, W = image_shape
+        h, w = (
+            H // self.bagel_config.vae_config.downsample // self.bagel_config.latent_patch_size,
+            W // self.bagel_config.vae_config.downsample // self.bagel_config.latent_patch_size,
+        )
+        p = self.bagel_config.latent_patch_size
+        c = self.bagel_config.vae_config.z_channels
+        latent = latent.reshape(1, h, w, p, p, c)
+        latent = torch.einsum("nhwpqc->nchpwq", latent)
+        latent = latent.reshape(1, c, h * p, w * p)
+
+        # Cast to VAE dtype
+        vae_dtype = next(vae.parameters()).dtype
+        latent = latent.to(vae_dtype)
+
+        image = vae.decode(latent)
+        image = (image * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
+        return Image.fromarray(image.to(torch.uint8).cpu().numpy())
+
+    def generate(
+        self,
+        past_key_values: NaiveCache,
+        new_token_ids: dict,
+        req: OmniDiffusionRequest = None,
+        height: int = 1024,
+        width: int = 1024,
+    ):
+        kv_lens = [past_key_values.key_cache[0].shape[0]]
+        ropes = [past_key_values.key_cache[0].shape[0]]
+        steps = 50
+        if req and req.num_inference_steps:
+            steps = int(req.num_inference_steps)
+
+        gen_params = BagelGenParams(
+            num_timesteps=steps,
+            timestep_shift=3.0,
+        )
+        generation_input = prepare_vae_latent(
+            curr_kvlens=kv_lens,
+            curr_rope=ropes,
+            image_sizes=[(height, width)],
+            new_token_ids=new_token_ids,
+            bagel_config=self.bagel_config,
+        )
+        for k, v in generation_input.items():
+            if torch.is_tensor(v):
+                generation_input[k] = v.to(self.device)
+
+        with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
+            # Generation Loop
+            x_t = generation_input["packed_init_noises"]
+            timestep_shift = gen_params.timestep_shift
+            num_timesteps = gen_params.num_timesteps
+
+            timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
+            timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
+            dts = timesteps[:-1] - timesteps[1:]
+            timesteps = timesteps[:-1]
+
+            for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
+                timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+
+                v_t = self.forward_step(x_t=x_t, timestep=timestep, past_key_values=past_key_values, **generation_input)
+
+                x_t = x_t - v_t.to(x_t.device) * dts[i]
+
+            latents = x_t.split((generation_input["packed_seqlens"] - 2).tolist())
+        img = self._decode_image_from_latent(self.vae, latents[0], (height, width))
+        return DiffusionOutput(output=img)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """
@@ -606,3 +876,71 @@ class Qwen2ImageGenerator(Qwen2PreTrainedModel):
             else:
                 # Fallback or specific mapping
                 pass
+
+
+def load_bagel_weights(model_path: str, image_generator: Qwen2ImageGenerator, text_encoder: nn.Module = None):
+    """
+    Helper function to load weights from a checkpoint directory into image_generator and optional text_encoder.
+    Handles key mapping and parameter resizing (e.g. latent_pos_embed).
+    """
+    print(f"Loading weights from {model_path}...")
+    full_state_dict = {}
+
+    # Load all safetensors
+    chk_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+    if not chk_files:
+        print(f"No .safetensors found in {model_path}")
+        return
+
+    for bf in chk_files:
+        state = load_file(bf)
+        for k, v in state.items():
+            new_k = k
+            if k.startswith("language_model."):
+                new_k = k[len("language_model.") :]
+            elif k.startswith("vae_model."):
+                new_k = "vae." + k[len("vae_model.") :]
+            elif (
+                k.startswith("encoder.")
+                or k.startswith("decoder.")
+                or k.startswith("post_quant_conv.")
+                or k.startswith("quant_conv.")
+            ):
+                new_k = "vae." + k
+
+            # Handle latent_pos_embed resize if needed
+            if new_k == "latent_pos_embed.pos_embed" and v.shape != image_generator.latent_pos_embed.pos_embed.shape:
+                print(f"Resizing latent_pos_embed from {image_generator.latent_pos_embed.pos_embed.shape} to {v.shape}")
+                npos, hdim = v.shape
+                side = isqrt(int(npos))
+                if side * side == int(npos) and hdim == int(image_generator.hidden_size):
+                    # Resize model parameter
+                    curr_param = image_generator.latent_pos_embed.pos_embed
+                    curr_param.data = curr_param.data.new_empty((npos, hdim))
+                    # Update configs
+                    if hasattr(image_generator, "bagel_config") and image_generator.bagel_config:
+                        image_generator.bagel_config.max_latent_size = int(side)
+                    image_generator.max_latent_size = int(side)
+                    if hasattr(image_generator.latent_pos_embed, "max_num_patch_per_side"):
+                        image_generator.latent_pos_embed.max_num_patch_per_side = int(side)
+
+            full_state_dict[new_k] = v
+
+    # Load to text_encoder
+    if text_encoder is not None:
+        text_encoder_dict = {
+            k: v
+            for k, v in full_state_dict.items()
+            if "_moe_gen" not in k
+            and not k.startswith("vae.")
+            and not k.startswith("time_embedder")
+            and not k.startswith("vae2llm")
+            and not k.startswith("llm2vae")
+            and not k.startswith("latent_pos_embed")
+        }
+        print("Loading state dict into text_encoder...")
+        text_encoder.load_state_dict(text_encoder_dict, strict=False)
+
+    # Load to image_generator
+    print("Loading state dict into image_generator...")
+    image_generator.load_state_dict(full_state_dict, strict=False)
