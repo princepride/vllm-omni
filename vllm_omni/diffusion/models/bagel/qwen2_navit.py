@@ -11,7 +11,6 @@
 
 
 from dataclasses import dataclass
-from functools import partial
 
 import torch
 from torch import nn
@@ -344,11 +343,6 @@ class Qwen2MoTDecoderLayer(nn.Module):
         return packed_query_sequence, past_key_values
 
 
-Decoder_layer_dict = {
-    "Qwen2MoTDecoderLayer": partial(Qwen2MoTDecoderLayer, attn_module=PackedAttentionMoT),
-}
-
-
 class Qwen2Model(Qwen2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -357,8 +351,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.use_moe = "Mo" in config.layer_module
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        layer_module = Decoder_layer_dict[config.layer_module]
-        self.layers = nn.ModuleList([layer_module(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [
+                Qwen2MoTDecoderLayer(config, layer_idx, attn_module=PackedAttentionMoT)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         if self.use_moe:
