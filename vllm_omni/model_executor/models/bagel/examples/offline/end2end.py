@@ -78,13 +78,10 @@ def main():
     omni_llm = OmniLLM(
         model=model_name,
         log_stats=args.enable_stats,
-        log_file=("omni_llm_pipeline.log" if args.enable_stats else None),
         init_sleep_seconds=args.init_sleep_seconds,
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
         shm_threshold_bytes=args.shm_threshold_bytes,
-        worker_backend=args.worker_backend,
-        ray_address=args.ray_address,
         stage_configs_path=args.stage_configs_path,
     )
     sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=20, stop=["<|im_end|>"])

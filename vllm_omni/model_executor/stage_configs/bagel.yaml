@@ -32,6 +32,7 @@ stage_args:
       repetition_penalty: 1.05
 
   - stage_id: 1
+    stage_type: diffusion  # DiT models use diffusion stage type
     runtime:
       devices: "0"
       max_batch_size: 1
