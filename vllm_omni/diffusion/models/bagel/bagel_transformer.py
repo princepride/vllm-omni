@@ -15,7 +15,6 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn.attention.flex_attention import flex_attention
-from tqdm import tqdm
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config as _Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
@@ -24,10 +23,11 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2PreTrainedModel,
     Qwen2RMSNorm,
     Qwen2RotaryEmbedding,
-    apply_rotary_pos_emb,
 )
 from transformers.utils import ModelOutput
 from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 torch._dynamo.config.cache_size_limit = 512
 torch._dynamo.config.accumulated_cache_size_limit = 4096
@@ -139,6 +139,8 @@ class PackedAttentionMoT(Qwen2Attention):
         self.v_proj_moe_gen = nn.Linear(config.hidden_size, config.num_key_value_heads * head_dim, bias=True)
         self.o_proj_moe_gen = nn.Linear(config.num_attention_heads * head_dim, config.hidden_size, bias=False)
 
+        self.rotary_op = RotaryEmbedding(is_neox_style=True)
+
     def forward(
         self,
         packed_query_sequence: torch.Tensor,
@@ -200,10 +202,9 @@ class PackedAttentionMoT(Qwen2Attention):
                 packed_key_states[packed_vae_token_indexes]
             )
 
-        packed_cos, packed_sin = packed_query_position_embeddings
-        packed_query_states, packed_key_states = apply_rotary_pos_emb(
-            packed_query_states, packed_key_states, packed_cos, packed_sin, unsqueeze_dim=1
-        )
+        cos, sin = [x[..., : self.head_dim // 2] for x in packed_query_position_embeddings]
+        packed_query_states = self.rotary_op(packed_query_states.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
+        packed_key_states = self.rotary_op(packed_key_states.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
 
         packed_query_states = packed_query_states.to(torch.bfloat16)
         packed_key_states = packed_key_states.to(torch.bfloat16)
@@ -802,7 +803,7 @@ class Bagel(torch.nn.Module):
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
 
-        for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
+        for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             v_t = self._forward_flow(
                 x_t=x_t,
