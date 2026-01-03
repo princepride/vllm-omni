@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch import nn
-from transformers import AutoTokenizer, SiglipImageProcessor, SiglipVisionModel
+from transformers import AutoTokenizer, SiglipImageProcessor, SiglipVisionConfig, SiglipVisionModel
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -189,9 +189,6 @@ class BagelPipeline(nn.Module):
             local_files_only=True,
             trust_remote_code=True,
         )
-
-        # Initialize SigLIP vision model
-        from transformers import SiglipVisionConfig
 
         # Try finding vision_config or interpolate from top-level config
         vit_cfg_dict = bagel_cfg.get("vit_config") or {}
