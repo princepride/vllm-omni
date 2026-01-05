@@ -42,7 +42,8 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             if size > self.threshold:
                 # Use Shared Memory
-                meta = shm_write_bytes(payload)
+                shm_name = f"omni_{request_id}"
+                meta = shm_write_bytes(payload, name=shm_name)
                 # meta contains {'name': ..., 'size': ...}
                 metadata = {"shm": meta, "size": size}
                 self._metrics["shm_writes"] += 1
@@ -65,13 +66,64 @@ class SharedMemoryConnector(OmniConnectorBase):
     def get(
         self, from_stage: str, to_stage: str, request_id: str, metadata: dict[str, Any] | None = None
     ) -> tuple[Any, int] | None:
+        # Helper to try reading SHM with a specific name
+        def try_read_shm(name: str):
+            # _shm is imported at module level as: import multiprocessing.shared_memory as _shm
+            # but to be safe inside this closure if not picked up:
+            from multiprocessing import shared_memory as shm_pkg
+
+            shm = shm_pkg.SharedMemory(name=name)
+            try:
+                # We assume the buffer size matches the data size
+                return shm_read_bytes({"name": name, "size": shm.size})
+            finally:
+                shm.close()
+
         if not metadata:
-            logger.error(f"SharedMemoryConnector get called without metadata for req {request_id}")
-            return None
+            # Try to infer metadata from request_id for KV cache transfer scenarios
+            # where metadata is not passed out-of-band.
+            logger.debug(
+                f"SharedMemoryConnector get called without metadata for req {request_id}, trying deterministic name"
+            )
+            shm_name = f"omni_{request_id}"
+            metadata = {"shm": {"name": shm_name}, "is_fallback": True}
 
         try:
             obj = None
             size = 0
+
+            if "shm" in metadata:
+                meta = metadata["shm"]
+                # shm_read_bytes handles reading and unlinking
+                data_bytes = shm_read_bytes(meta)
+                obj = self.deserialize_obj(data_bytes)
+                size = metadata.get("size", len(data_bytes))
+            elif "inline_bytes" in metadata:
+                # Deserialize bytes back to object
+                payload = metadata["inline_bytes"]
+                obj = self.deserialize_obj(payload)
+                size = metadata.get("size", len(payload))
+            elif "inline" in metadata:
+                obj = metadata["inline"]
+                size = metadata.get("size", 0)
+                if size == 0:
+                    # Fallback if size wasn't recorded
+                    try:
+                        size = len(self.serialize_obj(obj))
+                    except Exception:
+                        pass
+            else:
+                logger.error(
+                    f"Unknown metadata format in SharedMemoryConnector for req {request_id}: {list(metadata.keys())}"
+                )
+                return None
+
+            self._metrics["gets"] += 1
+            return obj, size
+
+        except Exception as e:
+            logger.error(f"SharedMemoryConnector get failed for req {request_id}: {e}")
+            return None
 
             if "shm" in metadata:
                 meta = metadata["shm"]
