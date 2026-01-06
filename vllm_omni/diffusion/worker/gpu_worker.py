@@ -228,12 +228,13 @@ class GPUWorker:
                     layer_blocks = data["layer_blocks"]
 
                     # Move tensors to GPU if needed (OmniSerializer should handle tensor reconstruction)
-                    for k, v in layer_blocks.items():
-                        if isinstance(v, torch.Tensor) and v.device != self.pipeline.device:
-                            layer_blocks[k] = v.to(self.pipeline.device).contiguous()
+                    for cache_list in [layer_blocks["key_cache"], layer_blocks["value_cache"]]:
+                        for i, tensor in enumerate(cache_list):
+                            if isinstance(tensor, torch.Tensor) and tensor.device != self.pipeline.device:
+                                cache_list[i] = tensor.to(self.pipeline.device).contiguous()
+                    from types import SimpleNamespace
 
-                    # Store in request for pipeline to use
-                    req.past_key_values = layer_blocks
+                    req.past_key_values = SimpleNamespace(**layer_blocks)
 
                 if "metadata" in data:
                     req.kv_metadata = data["metadata"]

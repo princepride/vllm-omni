@@ -59,7 +59,7 @@ stage_args:
     # The user says "pass KV cache... directly... skipping logic".
     # vllm-omni usually has a `stage_input_processors` module.
     # We need to ensure the processor passes `past_key_values` in the request.
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.bagel.ar2dit
+
     final_output: true
     final_output_type: image
     is_comprehension: false

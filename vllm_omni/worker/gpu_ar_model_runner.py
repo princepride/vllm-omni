@@ -567,21 +567,28 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 continue
 
             # Extract KV cache blocks for this request
-            layer_blocks = {}
+            key_cache = []
+            value_cache = []
+            num_layers = len(self.kv_caches)
+
+            # Pre-allocate lists with None to fill in correct order
+            key_cache = [None] * num_layers
+            value_cache = [None] * num_layers
+
             for layer_idx, kv_cache_item in enumerate(self.kv_caches):
                 try:
                     # with shape [2, num_blocks, block size, kv heads, head size]
                     if isinstance(kv_cache_item, torch.Tensor) and kv_cache_item.dim() == 5:
                         # return [2, seq_len, n_heads, head_dim]
                         combined_kv = self._extract_blocks_from_kv_tensor(kv_cache_item, block_ids, seq_len)
-                        layer_blocks[f"{layer_idx}_k"] = combined_kv[0]  # [seq_len, 4, 128]
-                        layer_blocks[f"{layer_idx}_v"] = combined_kv[1]  # [seq_len, 4, 128]
+                        key_cache[layer_idx] = combined_kv[0]
+                        value_cache[layer_idx] = combined_kv[1]
                     # for kv list (k_cache, v_cache)
                     elif isinstance(kv_cache_item, (tuple, list)) and len(kv_cache_item) == 2:
                         k_data = self._extract_blocks_from_kv_tensor(kv_cache_item[0], block_ids, seq_len)
                         v_data = self._extract_blocks_from_kv_tensor(kv_cache_item[1], block_ids, seq_len)
-                        layer_blocks[f"{layer_idx}_k"] = k_data
-                        layer_blocks[f"{layer_idx}_v"] = v_data
+                        key_cache[layer_idx] = k_data
+                        value_cache[layer_idx] = v_data
                     else:
                         logger.warning(f"Unexpected kv_cache structure at layer {layer_idx}: {type(kv_cache_item)}")
                         continue
@@ -590,7 +597,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     logger.error(f"Failed to extract KV blocks for layer {layer_idx}, request {req_id}: {e}")
                     continue
 
-            if layer_blocks:
+            # Check if we successfully extracted any layers
+            if any(k is not None for k in key_cache):
+                layer_blocks = {"key_cache": key_cache, "value_cache": value_cache}
                 metadata = self._get_kv_cache_metadata()
                 metadata.update(
                     {
@@ -607,7 +616,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     metadata=metadata,
                 )
                 result[req_id] = kv_data
-                logger.debug(f"Extracted KV cache for {req_id}, {len(layer_blocks)} items, len={seq_len}")
+                logger.debug(f"Extracted KV cache for {req_id}, len={seq_len}")
 
         return result
 
