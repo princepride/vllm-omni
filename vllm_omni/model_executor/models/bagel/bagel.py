@@ -84,41 +84,6 @@ class BagelImagePixelInputs(TensorSchema):
 BagelImageInputs: TypeAlias = BagelImagePixelInputs
 
 
-@dataclass
-class BagelModelOutput:
-    """
-    Wrapper for vllm-omni model output.
-    Must contain multimodal_outputs and act like a Tensor/Tuple.
-    """
-
-    logits: torch.Tensor | IntermediateTensors
-    multimodal_outputs: Any | None = None
-
-    def __getitem__(self, item):
-        if isinstance(item, torch.Tensor):
-            return self.logits[item]
-        if isinstance(item, int):
-            if item == 0:
-                return self.logits
-            if item == 1:
-                return self.multimodal_outputs
-            return None
-        return self.logits[item]
-
-    def __getattr__(self, name):
-        # Forward attribute access to the internal logits tensor
-        return getattr(self.logits, name)
-
-    # ======================================================
-    # =======================================================
-    @property
-    def text_hidden_states(self):
-        """
-        Alias for logits/hidden_states required by vllm-omni runner.
-        """
-        return self.logits
-
-
 class BagelVisionMLP(nn.Module):
     """MLP connector for vision features."""
 
@@ -576,7 +541,7 @@ class BagelForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
-        return BagelModelOutput(logits=hidden_states, multimodal_outputs=None)
+        return hidden_states
 
     def compute_logits(
         self,
