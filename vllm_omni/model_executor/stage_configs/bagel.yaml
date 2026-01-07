@@ -21,6 +21,8 @@ stage_args:
       tensor_parallel_size: 1
       omni_config:
         need_send_cache: true
+        kv_transfer_criteria:
+          type: prefill_finished #or special token generated
     final_output: true
     final_output_type: text
     is_comprehension: true
