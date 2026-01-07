@@ -57,11 +57,6 @@ _OMNI_MODELS = {
         "bagel",
         "BagelForConditionalGeneration",
     ),
-    "Qwen2ForCausalLM": (
-        "bagel",
-        "qwen2_bagel",
-        "Qwen2ForCausalLM",
-    ),
 }
 
 ## Register omni models to vLLM registry
