@@ -15,9 +15,8 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend
-from vllm_omni.diffusion.data import get_current_omni_diffusion_config
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
-from vllm_omni.utils.platform_utils import is_npu
+from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
 
@@ -59,7 +58,7 @@ class Attention(nn.Module):
         self.ring_runner = None
 
         try:
-            config = get_current_omni_diffusion_config()
+            config = get_forward_context().omni_diffusion_config
             self.backend_pref = config.attention_backend
             if config.parallel_config.ring_degree > 1:
                 self.use_ring = True
@@ -111,19 +110,6 @@ class Attention(nn.Module):
                 f"attention_backend='{self.backend_pref}' to 'sdpa' for dtype={query.dtype}."
             )
             self.backend_pref = "sdpa"
-
-        if is_npu():
-            return self.attention(
-                query,
-                key,
-                value,
-                num_heads=query.shape[-2],
-                input_layout="BSND",
-                scale=self.softmax_scale,
-                softmax_lse_flag=True,
-                pre_tokens=65535,
-                next_tokens=65535,
-            )[0]
 
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
