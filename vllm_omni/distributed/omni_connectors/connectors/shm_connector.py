@@ -42,7 +42,7 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             if size > self.threshold:
                 # Use Shared Memory
-                shm_name = f"omni_{request_id}"
+                shm_name = f"omni_{from_stage}_to_{to_stage}_{request_id}"
                 meta = shm_write_bytes(payload, name=shm_name)
                 # meta contains {'name': ..., 'size': ...}
                 metadata = {"shm": meta, "size": size}
@@ -82,7 +82,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         if not metadata:
             # Try to infer metadata from request_id for KV cache transfer scenarios
             # where metadata is not passed out-of-band.
-            shm_name = f"omni_{request_id}"
+            shm_name = f"omni_{from_stage}_to_{to_stage}_{request_id}"
 
             # We need the size to read from SHM using stage_utils.shm_read_bytes
             try:
