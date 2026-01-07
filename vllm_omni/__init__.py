@@ -19,7 +19,6 @@ from vllm.model_executor.models import ModelRegistry
 
 from vllm_omni.model_executor.models.bagel.bagel import BagelForConditionalGeneration
 from vllm_omni.model_executor.models.bagel.configuration_bagel import BagelConfig
-from vllm_omni.model_executor.models.bagel.qwen2_bagel import Qwen2ForCausalLM
 
 from .config import OmniModelConfig
 from .entrypoints.async_omni import AsyncOmni
@@ -50,7 +49,6 @@ vllm.config.VllmConfig.with_hf_config = _patched_with_hf_config
 
 
 ModelRegistry.register_model("BagelForConditionalGeneration", BagelForConditionalGeneration)
-ModelRegistry.register_model("Qwen2ForCausalLM", Qwen2ForCausalLM)
 
 try:
     from . import patch  # noqa: F401

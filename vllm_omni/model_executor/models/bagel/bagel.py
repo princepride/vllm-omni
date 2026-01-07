@@ -16,7 +16,8 @@ from typing import Any, Literal, TypeAlias
 import torch
 import torch.nn as nn
 from pydantic import Field
-from vllm.config import VllmConfig
+from transformers import Qwen2Config
+from vllm.config import CacheConfig, VllmConfig
 
 # from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
@@ -32,11 +33,22 @@ from vllm.model_executor.models.interfaces import (
     SupportsMultiModal,
     SupportsPP,
 )
+from vllm.model_executor.models.qwen2 import (
+    Qwen2Attention as VllmQwen2Attention,
+)
+from vllm.model_executor.models.qwen2 import (
+    Qwen2DecoderLayer as VllmQwen2DecoderLayer,
+)
+from vllm.model_executor.models.qwen2 import (
+    Qwen2ForCausalLM as VllmQwen2ForCausalLM,
+)
+from vllm.model_executor.models.qwen2 import (
+    Qwen2Model as VllmQwen2Model,
+)
 from vllm.model_executor.models.siglip import SiglipVisionModel
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
-    init_vllm_registered_model,
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -57,6 +69,7 @@ from vllm.utils.tensor_schema import TensorSchema
 
 # from vllm.transformers_utils.processors.bagel import BagelProcessor
 from .bagel_processor import BagelProcessor
+from .rope import get_rope
 
 logger = init_logger(__name__)
 
@@ -324,6 +337,271 @@ class BagelMultiModalProcessor(BaseMultiModalProcessor[BagelProcessingInfo]):
         }
 
 
+class Qwen2BagelAttention(VllmQwen2Attention):
+    """Qwen2 Attention with QK normalization support for BAGEL."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_parameters: dict[str, Any],
+        max_position: int = 4096 * 32,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        attn_type: str = "DECODER",
+        dual_chunk_attention_config: dict[str, Any] | None = None,
+        qk_norm: bool = False,
+        rms_norm_eps: float = 1e-6,
+    ) -> None:
+        # Initialize parent class
+        super().__init__(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            rope_parameters=rope_parameters,
+            max_position=max_position,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=prefix,
+            attn_type=attn_type,
+        )
+
+        # Add QK normalization support
+        from vllm.model_executor.layers.layernorm import RMSNorm
+
+        self.qk_norm = qk_norm
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+
+        # Override rotary embedding to use custom rope
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position=max_position,
+            rope_parameters=rope_parameters,
+            dual_chunk_attention_config=dual_chunk_attention_config,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # Apply QK normalization if enabled (before RoPE)
+        if self.qk_norm:
+            # Reshape to apply per-head normalization
+            total_tokens = q.shape[0]
+            q = q.view(total_tokens, self.num_heads, self.head_dim)
+            k = k.view(total_tokens, self.num_kv_heads, self.head_dim)
+
+            # Apply normalization
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+            # Reshape back
+            q = q.view(total_tokens, self.q_size)
+            k = k.view(total_tokens, self.kv_size)
+
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+
+class Qwen2BagelMLP(nn.Module):
+    """MLP module for Qwen2Bagel."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        from vllm.model_executor.layers.activation import SiluAndMul
+        from vllm.model_executor.layers.linear import (
+            MergedColumnParallelLinear,
+            RowParallelLinear,
+        )
+
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        if hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {hidden_act}")
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class Qwen2BagelDecoderLayer(VllmQwen2DecoderLayer):
+    """Qwen2 Decoder Layer with QK normalization support for BAGEL."""
+
+    def __init__(
+        self,
+        config: Qwen2Config,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        # We need to override __init__ to use Qwen2BagelAttention
+        nn.Module.__init__(self)  # Skip parent's __init__
+
+        self.hidden_size = config.hidden_size
+
+        # Import dependencies needed for attention initialization
+        from vllm.attention.backends.abstract import AttentionType
+        from vllm.model_executor.layers.layernorm import RMSNorm
+        from vllm.transformers_utils.config import set_default_rope_theta
+
+        set_default_rope_theta(config, default_theta=1000000)
+        dual_chunk_attention_config = getattr(config, "dual_chunk_attention_config", None)
+
+        # Determine attention type
+        if getattr(config, "is_causal", True):
+            attn_type = AttentionType.DECODER
+        else:
+            attn_type = AttentionType.ENCODER_ONLY
+
+        # Check if QK normalization is enabled
+        qk_norm = getattr(config, "qk_norm", False)
+
+        # Use Qwen2BagelAttention instead of standard Qwen2Attention
+        self.self_attn = Qwen2BagelAttention(
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            max_position=config.max_position_embeddings,
+            num_kv_heads=config.num_key_value_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            rope_parameters=config.rope_parameters,
+            prefix=f"{prefix}.self_attn",
+            attn_type=attn_type,
+            dual_chunk_attention_config=dual_chunk_attention_config,
+            qk_norm=qk_norm,
+            rms_norm_eps=config.rms_norm_eps,
+        )
+
+        # MLP - use custom MLP class
+        self.mlp = Qwen2BagelMLP(
+            hidden_size=self.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+
+        # Layer norms
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+
+class Qwen2BagelModel(VllmQwen2Model):
+    """Qwen2 Model with QK normalization support for BAGEL."""
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        hf_config_override: Qwen2Config | None = None,
+    ):
+        # Temporarily set hf_config_override if provided (for nested models like BAGEL)
+        original_hf_config = None
+        if hf_config_override is not None:
+            original_hf_config = vllm_config.model_config.hf_config
+            vllm_config.model_config.hf_config = hf_config_override
+
+        try:
+            # Initialize with custom decoder layer
+            super().__init__(
+                vllm_config=vllm_config,
+                prefix=prefix,
+                decoder_layer_type=Qwen2BagelDecoderLayer,
+            )
+        finally:
+            # Restore original hf_config
+            if original_hf_config is not None:
+                vllm_config.model_config.hf_config = original_hf_config
+
+
+class Qwen2BagelForCausalLM(VllmQwen2ForCausalLM):
+    """Qwen2 for Causal LM with QK normalization support for BAGEL."""
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        hf_config_override: Qwen2Config | None = None,
+    ):
+        # We need to override to use Qwen2BagelModel
+        nn.Module.__init__(self)  # Skip parent's __init__
+
+        from vllm.distributed import get_pp_group
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+        from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+        from vllm.model_executor.models.utils import PPMissingLayer
+
+        # Allow override of hf_config for nested models like BAGEL
+        if hf_config_override is not None:
+            config = hf_config_override
+        else:
+            config = vllm_config.model_config.hf_config.get_text_config()
+        quant_config = vllm_config.quant_config
+
+        self.config = config
+        self.quant_config = quant_config
+
+        # Use Qwen2BagelModel instead of standard Qwen2Model
+        self.model = Qwen2BagelModel(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+            hf_config_override=hf_config_override,
+        )
+
+        if get_pp_group().is_last_rank:
+            if config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "lm_head"),
+                )
+        else:
+            self.lm_head = PPMissingLayer()
+
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+
+        # Copy attributes for SupportsLoRA, SupportsPP, SupportsEagle3
+        self.packed_modules_mapping = VllmQwen2ForCausalLM.packed_modules_mapping
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     BagelMultiModalProcessor,
     info=BagelProcessingInfo,
@@ -364,14 +642,10 @@ class BagelForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA,
         self.config = config
         self.multimodal_config = multimodal_config
 
-        # Initialize language model (Qwen2)
-        # Pass the llm_config from BagelConfig to initialize Qwen2 properly
-        self.language_model = init_vllm_registered_model(
+        self.language_model = Qwen2BagelForCausalLM(
             vllm_config=vllm_config,
-            hf_config=config.llm_config,
             prefix=maybe_prefix(prefix, "language_model"),
-            # architectures=["Qwen2BagelForCausalLM"],
-            architectures=["Qwen2ForCausalLM"],
+            hf_config_override=config.llm_config,
         )
 
         # Initialize vision model (SigLIP) if visual understanding is enabled
