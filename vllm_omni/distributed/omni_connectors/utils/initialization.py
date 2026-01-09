@@ -36,63 +36,30 @@ def initialize_connectors_from_config(
         return None, {}
 
     # create connectors from config
-    connectors = create_connectors_from_config(transfer_config.connectors, default_shm_threshold=default_shm_threshold)
+    connectors = create_connectors_from_config(transfer_config.connectors)
     return transfer_config, connectors
 
 
 def create_connectors_from_config(
     connectors_config: dict[tuple[str, str], ConnectorSpec],
-    default_shm_threshold: int = 65536,
 ) -> dict[tuple[str, str], OmniConnectorBase]:
     """
     Create connectors from config.
 
     Args:
         connectors_config: A dictionary of connector configurations.
-        default_shm_threshold: Default shared memory threshold for fallback.
 
     Returns:
         A dictionary of connectors.
     """
-    import os
-
-    forced_connector_type = os.environ.get("OMNI_CONNECTOR_TYPE", None)
-    if forced_connector_type:
-        logger.info(f"Forcing connector type to: {forced_connector_type}")
-
     connectors = {}
     for edge_key, connector_spec in connectors_config.items():
-        # Override connector type if env var is set
-        if forced_connector_type:
-            connector_spec.name = forced_connector_type
-
         try:
             connector = OmniConnectorFactory.create_connector(connector_spec)
             connectors[edge_key] = connector
             logger.info(f"Created connector for {edge_key[0]} -> {edge_key[1]}: {type(connector).__name__}")
         except Exception as e:
-            logger.warning(
-                f"Failed to initialize connector {connector_spec.name} for edge {edge_key}: {e}. "
-                "Attempting fallback to SharedMemoryConnector."
-            )
-            # Fallback to SharedMemoryConnector
-            try:
-                # Inherit extra config (e.g. shm_threshold_bytes) if possible
-                fallback_extra = connector_spec.extra.copy()
-                if "shm_threshold_bytes" not in fallback_extra:
-                    fallback_extra["shm_threshold_bytes"] = default_shm_threshold
-
-                fallback_spec = ConnectorSpec(
-                    name="SharedMemoryConnector",
-                    extra=fallback_extra,
-                )
-                connector = OmniConnectorFactory.create_connector(fallback_spec)
-                connectors[edge_key] = connector
-                logger.info(f"Fallback: Created SharedMemoryConnector for {edge_key[0]} -> {edge_key[1]}")
-            except Exception as fallback_e:
-                raise RuntimeError(
-                    f"Failed to initialize connector for edge {edge_key}: {e}. Fallback also failed: {fallback_e}"
-                ) from e
+            raise RuntimeError(f"Failed to initialize connector for edge {edge_key}: {e}") from e
 
     return connectors
 
