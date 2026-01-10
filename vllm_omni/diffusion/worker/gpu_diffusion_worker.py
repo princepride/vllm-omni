@@ -208,6 +208,8 @@ class GPUDiffusionWorker:
         destroy_distributed_env()
 
 
+
+
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
