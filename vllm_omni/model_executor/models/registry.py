@@ -63,6 +63,11 @@ _OMNI_MODELS = {
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
     ),
+    "HunyuanImage3ForCausalMM": (
+        "hunyuan_image3",
+        "hunyuan_image3",
+        "HunyuanImage3ForConditionalGeneration",
+    ),
 }
 
 
