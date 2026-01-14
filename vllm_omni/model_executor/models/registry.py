@@ -59,12 +59,6 @@ _OMNI_MODELS = {
     ),
 }
 
-## Register omni models to vLLM registry
-# for model_arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
-#    ModelRegistry.register_model(
-#        model_arch,
-#        f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}",
-#    )
 
 _VLLM_OMNI_MODELS = {
     **_VLLM_MODELS,

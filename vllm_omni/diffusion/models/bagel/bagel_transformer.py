@@ -687,6 +687,9 @@ class BagelConfig(PretrainedConfig):
         """Return the hidden size of the language model."""
         return self.llm_config.hidden_size
 
+    def get_text_config(self):
+        return self
+
 
 class Bagel(torch.nn.Module):
     config_class = BagelConfig
