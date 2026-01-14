@@ -798,6 +798,7 @@ class BagelForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA,
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        sampling_metadata: Any | None = None,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 

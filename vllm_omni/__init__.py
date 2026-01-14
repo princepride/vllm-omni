@@ -12,6 +12,13 @@ Architecture:
   processing
 """
 
+try:
+    from . import patch  # noqa: F401
+except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+    if exc.name != "vllm":
+        raise
+    # Allow importing vllm_omni without vllm (e.g., documentation builds)
+    patch = None  # type: ignore
 from transformers import AutoConfig
 from vllm.model_executor.models import ModelRegistry
 
@@ -28,8 +35,6 @@ from .version import __version__, __version_tuple__  # isort:skip
 
 
 AutoConfig.register("bagel", BagelConfig)
-
-
 ModelRegistry.register_model("BagelForConditionalGeneration", BagelForConditionalGeneration)
 
 try:

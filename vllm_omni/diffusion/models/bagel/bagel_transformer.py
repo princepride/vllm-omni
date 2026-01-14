@@ -690,6 +690,11 @@ class BagelConfig(PretrainedConfig):
     def get_text_config(self):
         return self
 
+    def __getattr__(self, name):
+        if "llm_config" not in self.__dict__:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        return getattr(self.llm_config, name)
+
 
 class Bagel(torch.nn.Module):
     config_class = BagelConfig
