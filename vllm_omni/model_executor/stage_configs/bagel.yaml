@@ -2,6 +2,7 @@
 
 stage_args:
   - stage_id: 0
+    stage_type: llm
     runtime:
       devices: "0"  # Adjust as needed
       max_batch_size: 1
