@@ -155,7 +155,17 @@ class GPUDiffusionWorker:
         return True
 
     def wake_up(self, tags: list[str] | None = None) -> bool:
-        """Wake up the worker from sleep mode."""
+        """
+        Wake up the worker from sleep mode. See the sleep function
+        method for more details.
+
+        Args:
+            tags: An optional list of tags to reallocate the worker memory
+                for specific memory allocations. Values must be in
+                `("weights")`. If None, all memory is reallocated.
+                wake_up should be called with all tags (or None) before the
+                worker is used again.
+        """
         from vllm.device_allocator.cumem import CuMemAllocator
 
         allocator = CuMemAllocator.get_instance()
