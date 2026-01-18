@@ -722,11 +722,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
             if from_s and to_s:
                 return str(from_s), str(to_s)
 
-        # Default: prefill -> decode
-        import os
-
-        from_stage = os.getenv("VLLM_STAGE", "prefill")
-        return from_stage, "decode" if from_stage == "prefill" else "prefill"
+        raise ValueError(
+            "KV transfer stages not configured. Please set 'omni_from_stage' and 'omni_to_stage' in omni_kv_config."
+        )
 
     def _resolve_global_request_id(self, req_id: str) -> str:
         """Resolve global request ID from request state."""
