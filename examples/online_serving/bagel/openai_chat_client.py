@@ -43,7 +43,7 @@ def generate_image(
     """
 
     # Construct Message Content
-    content = [{"type": "text", "text": prompt}]
+    content = [{"type": "text", "text": f"<|im_start|>{prompt}<|im_end|>"}]
 
     if image_url:
         # Check if local file

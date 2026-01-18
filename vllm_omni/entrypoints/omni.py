@@ -33,10 +33,11 @@ from vllm_omni.distributed.ray_utils.utils import (
 )
 from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
 from vllm_omni.entrypoints.omni_stage import OmniStage
-from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType, _to_dict
+from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
+    inject_omni_kv_config,
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
@@ -75,39 +76,6 @@ def omni_snapshot_download(model_id) -> str:
         return snapshot_download(model_id)
     else:
         return _dummy_snapshot_download(model_id)
-
-
-def _inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
-    """Inject connector configuration into stage engine arguments."""
-    # Prepare omni_kv_config dict
-    omni_conf_dict = {}
-    try:
-        # Access engine_args safely (might be OmegaConf or dict)
-        existing_args = stage.engine_args
-        if hasattr(existing_args, "get"):
-            _oc = existing_args.get("omni_kv_config", None)
-            if _oc:
-                if hasattr(_oc, "items"):  # dict-like
-                    omni_conf_dict = dict(_oc)
-                else:  # object?
-                    omni_conf_dict = _to_dict(_oc)
-    except Exception:
-        omni_conf_dict = {}
-
-    # Inject connector info
-    omni_conf_dict["connector_config"] = omni_conn_cfg
-    omni_conf_dict["omni_from_stage"] = omni_from
-    omni_conf_dict["omni_to_stage"] = omni_to
-
-    # Write back to engine_args
-    try:
-        if hasattr(stage.engine_args, "__setitem__"):
-            stage.engine_args["omni_kv_config"] = omni_conf_dict
-        else:
-            setattr(stage.engine_args, "omni_kv_config", omni_conf_dict)
-    except Exception as e:
-        # Fallback for OmegaConf or similar if direct set fails?
-        logger.error(f"Failed to inject omni connector config into stage: {e}")
 
 
 class OmniBase:
@@ -320,7 +288,7 @@ class OmniBase:
                     self.omni_transfer_config, stage_id
                 )
                 if omni_conn_cfg:
-                    _inject_omni_kv_config(stage, omni_conn_cfg, omni_from, omni_to)  # type: ignore
+                    inject_omni_kv_config(stage, omni_conn_cfg, omni_from, omni_to)  # type: ignore
 
             except Exception as e:
                 logger.debug("[Omni] Failed to inject omni connector config into stage-%s: %s", stage_id, e)
