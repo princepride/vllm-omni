@@ -14,9 +14,6 @@ import time
 from collections.abc import Iterable
 from contextlib import nullcontext
 
-from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
-
 import torch
 from torch.profiler import record_function
 from vllm.config import LoadConfig
@@ -30,6 +27,8 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.offload import apply_offload_hooks
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 logger = init_logger(__name__)
 
@@ -132,7 +131,6 @@ class GPUDiffusionModelRunner:
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
-
 
         if self.cache_backend is not None:
             self.cache_backend.enable(self.pipeline)
