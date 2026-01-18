@@ -602,10 +602,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         return extracted_ids
 
     def _extract_kv_cache(self, req_id: str, block_ids: list[int], seq_len: int) -> KVCacheTransferData | None:
-        """Extract KV cache from GPU blocks for a single request.
-
-        Assumes 5D tensor format: [2, num_blocks, block_size, n_heads, head_dim]
-        """
+        """Extract KV cache from GPU blocks for a single request."""
         num_layers = len(self.kv_caches)
         key_cache = [None] * num_layers
         value_cache = [None] * num_layers
