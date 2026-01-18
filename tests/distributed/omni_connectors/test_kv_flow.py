@@ -50,12 +50,12 @@ class TestKVFlow(unittest.TestCase):
             self.skipTest("vLLM not installed")
 
         # 1. Setup KV Cache (List of tuples (K, V))
-        # Shape: [num_blocks, num_heads, head_dim//x, block_size, x]
+        # Shape: [num_blocks, block_size, num_heads, head_dim] matching 4D expectation
         num_blocks = 10
         kv_caches = []
         for _ in range(self.num_layers):
-            k_cache = torch.randn(num_blocks, self.num_heads, self.head_dim // self.x, self.block_size, self.x)
-            v_cache = torch.randn(num_blocks, self.num_heads, self.head_dim // self.x, self.block_size, self.x)
+            k_cache = torch.randn(num_blocks, self.block_size, self.num_heads, self.head_dim)
+            v_cache = torch.randn(num_blocks, self.block_size, self.num_heads, self.head_dim)
             kv_caches.append((k_cache, v_cache))
 
         # 2. Setup Input Batch Mock
@@ -68,21 +68,23 @@ class TestKVFlow(unittest.TestCase):
         runner = TestableGPUARModelRunner(kv_caches, mock_input_batch)
 
         # 4. Run Extraction
-        # We call the method directly
-        result = runner._extract_kv_cache_for_requests({self.req_id}, self.seq_len)
+        # We call the method directly with the expected dictionary format
+        req_data = {self.req_id: {"seq_len": self.seq_len, "block_ids": block_ids}}
+        result = runner._extract_kv_cache_for_requests(req_data)
 
         # 5. Verify Result
         self.assertIn(self.req_id, result)
         data = result[self.req_id]
 
-        # Check keys "0_k", "0_v", "1_k", "1_v" exist
-        self.assertEqual(len(data.layer_blocks), self.num_layers * 2)
-        self.assertIn("0_k", data.layer_blocks)
-        self.assertIn("0_v", data.layer_blocks)
+        # Check keys "key_cache" and "value_cache" exist (length 2)
+        self.assertEqual(len(data.layer_blocks), 2)
+        self.assertIn("key_cache", data.layer_blocks)
+        self.assertIn("value_cache", data.layer_blocks)
 
         # Check Tensor Shape: [seq_len, num_heads, head_dim]
+        # data.layer_blocks["key_cache"] is a list of tensors
         expected_shape = (self.seq_len, self.num_heads, self.head_dim)
-        self.assertEqual(data.layer_blocks["0_k"].shape, expected_shape)
+        self.assertEqual(data.layer_blocks["key_cache"][0].shape, expected_shape)
 
         return data  # Return for use in next test
 
@@ -93,11 +95,14 @@ class TestKVFlow(unittest.TestCase):
 
         # 1. Get Data from Sender Test (simulate transfer)
         # Re-create data manually to be independent
-        layer_blocks = {}
+        key_cache = []
+        value_cache = []
         expected_shape = (self.seq_len, self.num_heads, self.head_dim)
         for i in range(self.num_layers):
-            layer_blocks[f"{i}_k"] = torch.randn(expected_shape)
-            layer_blocks[f"{i}_v"] = torch.randn(expected_shape)
+            key_cache.append(torch.randn(expected_shape))
+            value_cache.append(torch.randn(expected_shape))
+
+        layer_blocks = {"key_cache": key_cache, "value_cache": value_cache}
 
         transfer_data = MagicMock()  # Mock KVCacheTransferData
         transfer_data.layer_blocks = layer_blocks
@@ -105,7 +110,9 @@ class TestKVFlow(unittest.TestCase):
 
         # 2. Setup Request with Injected Data
         req = OmniDiffusionRequest(prompt="test")
-        req.past_key_values = layer_blocks
+        from types import SimpleNamespace
+
+        req.past_key_values = SimpleNamespace(**layer_blocks)
         req.kv_metadata = transfer_data.metadata
 
         # 3. Setup Pipeline
@@ -135,30 +142,26 @@ class TestKVFlow(unittest.TestCase):
 
         # Verification of Injection Logic (Simulation)
         current_cache = RealNaiveCache(self.num_layers)
-        # gen_context = {"past_key_values": current_cache}
 
         # --- Logic from Source Code ---
         injected_kv = req.past_key_values
-        if isinstance(current_cache, RealNaiveCache) and isinstance(injected_kv, dict):
-            for key_name, tensor in injected_kv.items():
-                try:
-                    parts = key_name.split("_")
-                    if len(parts) < 2:
-                        continue
-                    layer_idx = int(parts[0])
-                    cache_type = parts[1]
-                    if tensor.device != pipeline.device:
-                        tensor = tensor.to(pipeline.device)
-                    if layer_idx in current_cache.key_cache:
-                        if cache_type == "k":
-                            current_cache.key_cache[layer_idx] = tensor
-                        elif cache_type == "v":
-                            current_cache.value_cache[layer_idx] = tensor
-                except Exception as e:
-                    print(f"Error processing layer {layer_idx} {cache_type} tensor: {e}")
+        if isinstance(current_cache, RealNaiveCache) and hasattr(injected_kv, "key_cache"):
+            # Assuming injected_kv is SimpleNamespace or object with list attrs
+            for layer_idx in range(len(injected_kv.key_cache)):
+                if injected_kv.key_cache[layer_idx] is not None:
+                    k_tensor = injected_kv.key_cache[layer_idx]
+                    v_tensor = injected_kv.value_cache[layer_idx]
 
-        self.assertTrue(torch.allclose(current_cache.key_cache[0], layer_blocks["0_k"]))
-        self.assertTrue(torch.allclose(current_cache.value_cache[1], layer_blocks["1_v"]))
+                    if k_tensor.device != pipeline.device:
+                        k_tensor = k_tensor.to(pipeline.device)
+                    if v_tensor.device != pipeline.device:
+                        v_tensor = v_tensor.to(pipeline.device)
+
+                    current_cache.key_cache[layer_idx] = k_tensor
+                    current_cache.value_cache[layer_idx] = v_tensor
+
+        self.assertTrue(torch.allclose(current_cache.key_cache[0], layer_blocks["key_cache"][0]))
+        self.assertTrue(torch.allclose(current_cache.value_cache[1], layer_blocks["value_cache"][1]))
 
     def test_integration(self):
         """Simulate the flow from Sender -> Connector (Dict) -> Receiver."""

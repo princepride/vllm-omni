@@ -80,13 +80,24 @@ class AsyncOmniDiffusion:
         if engine_input_source is not None:
             self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
 
-        # Load model class name and transformer config
-        config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
-        od_config.model_class_name = config_dict.get("_class_name", None)
-        od_config.update_multimodal_support()
+        try:
+            config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
+            od_config.model_class_name = config_dict.get("_class_name", None)
+            od_config.update_multimodal_support()
 
-        tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
-        od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+            tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
+            od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+        except (AttributeError, OSError, ValueError):
+            cfg = get_hf_file_to_dict("config.json", od_config.model)
+            if cfg is None:
+                raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
+
+            model_type = cfg.get("model_type")
+            architectures = cfg.get("architectures") or []
+            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                od_config.model_class_name = "BagelPipeline"
+                od_config.tf_model_config = TransformerConfig()
+                od_config.update_multimodal_support()
 
         # Initialize engine
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)

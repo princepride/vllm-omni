@@ -41,6 +41,7 @@ def parse_args():
     parser.add_argument("--worker-backend", type=str, default="process", choices=["process", "ray"])
     parser.add_argument("--ray-address", type=str, default=None)
     parser.add_argument("--stage-configs-path", type=str, default=None)
+    parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
 
     args = parser.parse_args()
     return args
@@ -80,6 +81,7 @@ def main():
             "prompt": args.prompts,
             "seed": 52,
             "need_kv_receive": False,
+            "num_inference_steps": args.steps,
         }
 
         if args.image_path:
@@ -145,6 +147,9 @@ def main():
         params_list = copy.deepcopy(omni.default_sampling_params_list)
         if args.modality == "text2img":
             params_list[0]["max_tokens"] = 1
+            if len(params_list) > 1:
+                params_list[1]["num_inference_steps"] = args.steps
+
         omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 
     for i, req_output in enumerate(omni_outputs):
