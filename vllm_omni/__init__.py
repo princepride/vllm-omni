@@ -19,10 +19,11 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         raise
     # Allow importing vllm_omni without vllm (e.g., documentation builds)
     patch = None  # type: ignore
-from transformers import AutoConfig
+
 from vllm.model_executor.models import ModelRegistry
 
-from vllm_omni.diffusion.models.bagel.bagel_transformer import BagelConfig
+# Ensure BagelConfig is registered
+import vllm_omni.transformers_utils.configs  # noqa: F401
 from vllm_omni.model_executor.models.bagel.bagel import BagelForConditionalGeneration
 
 from .config import OmniModelConfig
@@ -34,16 +35,7 @@ from .entrypoints.omni import Omni
 from .version import __version__, __version_tuple__  # isort:skip
 
 
-AutoConfig.register("bagel", BagelConfig)
 ModelRegistry.register_model("BagelForConditionalGeneration", BagelForConditionalGeneration)
-
-try:
-    from . import patch  # noqa: F401
-except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-    if exc.name != "vllm":
-        raise
-    # Allow importing vllm_omni without vllm (e.g., documentation builds)
-    patch = None  # type: ignore
 
 
 __all__ = [
