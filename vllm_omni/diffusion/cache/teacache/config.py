@@ -28,11 +28,11 @@ _MODEL_COEFFICIENTS = {
     # Bagel transformer coefficients
     # Using Qwen's coefficients as reasonable default given shared architecture
     "Bagel": [
-        -4.50000000e02,
-        2.80000000e02,
-        -4.50000000e01,
-        3.20000000e00,
-        -2.00000000e-02,
+        4.98651651e02,
+        -2.83781631e02,
+        5.58554382e01,
+        -3.82021401e00,
+        2.64230861e-01,
     ],
 }
 

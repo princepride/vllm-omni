@@ -42,6 +42,11 @@ def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     transformer._forward_flow = transformer.forward
     pipeline.transformer = transformer
 
+    logger.info(
+        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        f"transformer_class={teacache_config.transformer_type}"
+    )
+
 
 CUSTOM_TEACACHE_ENABLERS = {"BagelPipeline": enable_bagel_teacache}
 
@@ -109,10 +114,13 @@ class TeaCacheBackend(CacheBackend):
             # Apply hook to transformer
             apply_teacache_hook(transformer, teacache_config)
 
+            logger.info(
+                f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+                f"transformer_class={teacache_config.transformer_type}"
+            )
+
         # Mark as enabled
         self.enabled = True
-
-        logger.info(f"TeaCache enabled successfully on {pipeline_type}")
 
     def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """
