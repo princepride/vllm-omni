@@ -202,6 +202,10 @@ class GPUDiffusionModelRunner:
             # Check if we should receive KV cache based on config
             need_recv_cache = omni_kv_config.get("need_recv_cache", False)
             if need_recv_cache:
+                # Default timeout 30 seconds to prevent infinite hanging
+                timeout = omni_kv_config.get("recv_timeout", 30.0)
+                start_time = time.time()
+
                 while True:
                     result = self.connector.get(
                         from_stage=from_stage,
@@ -210,7 +214,12 @@ class GPUDiffusionModelRunner:
                     )
                     if result:
                         break
-                    # loop forever for testing
+
+                    if time.time() - start_time > timeout:
+                        logger.error(f"Timeout waiting for KV cache for request {req.request_id} after {timeout}s")
+                        result = None
+                        break
+
                     time.sleep(0.5)
             else:
                 logger.info(f"Skip receiving KV cache for {req.request_id} (need_recv_cache=False)")

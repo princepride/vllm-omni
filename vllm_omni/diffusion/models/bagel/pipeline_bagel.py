@@ -26,9 +26,10 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.transformers_utils.configs import BagelConfig
 
 from .autoencoder import AutoEncoder, AutoEncoderParams
-from .bagel_transformer import Bagel, BagelConfig, NaiveCache, Qwen2MoTConfig, Qwen2MoTForCausalLM
+from .bagel_transformer import Bagel, NaiveCache, Qwen2MoTConfig, Qwen2MoTForCausalLM
 
 logger = init_logger(__name__)
 
@@ -348,7 +349,11 @@ class BagelPipeline(nn.Module):
                             gen_input_vae[k] = v.to(self.device)
 
                     # VAE needs bfloat16 to match model strings usually, specifically encode
-                    with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        enabled=self.device.type != "cpu",
+                        dtype=self.od_config.dtype,
+                    ):
                         gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
                             self.vae, gen_context["past_key_values"], **gen_input_vae
                         )
@@ -368,7 +373,11 @@ class BagelPipeline(nn.Module):
                         if torch.is_tensor(v):
                             gen_input_img[k] = v.to(self.device)
 
-                    with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        enabled=self.device.type != "cpu",
+                        dtype=self.od_config.dtype,
+                    ):
                         gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
                             gen_context["past_key_values"], **gen_input_img
                         )
@@ -394,7 +403,11 @@ class BagelPipeline(nn.Module):
             for k, v in generation_input.items():
                 if torch.is_tensor(v):
                     generation_input[k] = v.to(self.device)
-            with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
+            with torch.autocast(
+                device_type=self.device.type,
+                enabled=self.device.type != "cpu",
+                dtype=self.od_config.dtype,
+            ):
                 gen_context["past_key_values"] = self.bagel.forward_cache_update_text(
                     gen_context["past_key_values"], **generation_input
                 )
@@ -439,7 +452,11 @@ class BagelPipeline(nn.Module):
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
-        with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
+        with torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        ):
             latents = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 num_timesteps=gen_params.num_timesteps,

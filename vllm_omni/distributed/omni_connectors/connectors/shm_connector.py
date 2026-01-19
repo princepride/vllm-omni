@@ -138,39 +138,6 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector get failed for req {request_id}: {e}")
             return None
 
-            if "shm" in metadata:
-                meta = metadata["shm"]
-                # shm_read_bytes handles reading and unlinking
-                data_bytes = shm_read_bytes(meta)
-                obj = self.deserialize_obj(data_bytes)
-                size = metadata.get("size", len(data_bytes))
-            elif "inline_bytes" in metadata:
-                # Deserialize bytes back to object
-                payload = metadata["inline_bytes"]
-                obj = self.deserialize_obj(payload)
-                size = metadata.get("size", len(payload))
-            elif "inline" in metadata:
-                obj = metadata["inline"]
-                size = metadata.get("size", 0)
-                if size == 0:
-                    # Fallback if size wasn't recorded
-                    try:
-                        size = len(self.serialize_obj(obj))
-                    except Exception:
-                        pass
-            else:
-                logger.error(
-                    f"Unknown metadata format in SharedMemoryConnector for req {request_id}: {list(metadata.keys())}"
-                )
-                return None
-
-            self._metrics["gets"] += 1
-            return obj, size
-
-        except Exception as e:
-            logger.error(f"SharedMemoryConnector get failed for req {request_id}: {e}")
-            return None
-
     def cleanup(self, request_id: str) -> None:
         # SHM segments are automatically unlinked during 'get' (shm_read_bytes).
         # If 'get' is never called (e.g. error flow), the SHM segment might leak.
