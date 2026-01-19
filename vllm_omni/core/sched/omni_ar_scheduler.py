@@ -95,15 +95,10 @@ class OmniARScheduler(VLLMScheduler):
         if criteria_type == "prefill_finished":
             if request.num_computed_tokens >= request.num_prompt_tokens:
                 logger.debug(f"[Omni] Request {request.request_id} triggered prefill_finished transfer (Non-Stop)")
-
-                # 1. Mark state to prevent duplicate triggers
                 self.transfer_triggered_requests.add(request.request_id)
-
-                # 2. Trigger Transfer manually WITHOUT stopping the request
-                # This queues the request for the next schedule() cycle to pick up
                 self._mark_request_for_kv_transfer(request.request_id, request.num_computed_tokens)
 
-                # 3. Return False means "Do NOT stop the request" -> Continue Decoding
+                # Return False means "Do NOT stop the request" -> Continue Decoding
                 return False
 
         elif criteria_type == "special_token":
@@ -123,7 +118,6 @@ class OmniARScheduler(VLLMScheduler):
                     tokens_to_exclude = len(new_token_ids) - (idx + 1)
                     snapshot_len = request.num_computed_tokens - tokens_to_exclude
                 except ValueError:
-                    # Should not happen given 'in' check above
                     snapshot_len = request.num_computed_tokens
 
                 # Trigger Transfer
@@ -134,8 +128,6 @@ class OmniARScheduler(VLLMScheduler):
 
         return False
 
-    # Ensure scheduled_new_reqs carry omni-specific payloads
-    # (e.g., additional_information)
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
         scheduler_output = super().schedule()
         try:
@@ -301,12 +293,7 @@ class OmniARScheduler(VLLMScheduler):
 
                     routed_experts = self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
 
-                # [Omni] Use modified _free_request which handles KV transfer check internally
                 kv_transfer_params = self._free_request(request)
-
-                # If the request was marked for transfer inside _free_request,
-                # self.requests_needing_kv_transfer will have it.
-
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 else:
@@ -379,8 +366,7 @@ class OmniARScheduler(VLLMScheduler):
                     )
                 )
 
-        # [Omni] Cleanup state for requests that are fully finished (removed from running/waiting)
-        # and NOT waiting for transfer free.
+        # [Omni] Cleanup state for finished requests
         for req in stopped_running_reqs:
             if req.request_id not in self.waiting_for_transfer_free:
                 if req.request_id in self.transfer_triggered_requests:
@@ -440,7 +426,6 @@ class OmniARScheduler(VLLMScheduler):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
-        # [Omni] Handle finished transfers reported by Model Runner
         # This is where we free blocks that were held for transfer
         try:
             kv_extracted_ids = getattr(model_runner_output, "kv_extracted_req_ids", None)
@@ -455,17 +440,9 @@ class OmniARScheduler(VLLMScheduler):
                         # Now it's safe to free blocks
                         req = self.requests.get(req_id)
                         if req:
-                            # Use _free_blocks from parent logic
-                            # Since we don't have direct access to it without calling super()._free_blocks
-                            # (which doesn't exist separately in all versions,
-                            # usually it's just in _free_request or self.kv_cache_manager.free).
-                            # We can call self.kv_cache_manager.free(req) directly and remove from requests.
                             self.kv_cache_manager.free(req)
-                            # Remove from requests dict - effectively what _free_blocks does
                             if req_id in self.requests:
                                 del self.requests[req_id]
-
-                            # [Omni] Cleanup lifecycle state
                             if req_id in self.transfer_triggered_requests:
                                 self.transfer_triggered_requests.remove(req_id)
                             if req_id in self.active_kv_transfers:
@@ -481,37 +458,21 @@ class OmniARScheduler(VLLMScheduler):
     def _free_request(self, request: Request) -> dict[str, Any] | None:
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
         """Mark a request as finished and free its resources."""
-        # This overrides VLLMScheduler._free_request completely to add delayed freeing logic.
 
         # 1. Standard cleanup parts from base _free_request
-        # We need to replicate base behavior but add our hook
-
-        # From base: invoke connector finished
         delay_free_blocks = False
         kv_xfer_params = None
         if self.connector is not None:
-            # This assumes base class has _connector_finished or we need to copy that too if it's private
-            # Since we inherit, we should have access if it's protected/public.
-            # VLLMScheduler has _connector_finished
             delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
-
-        # [Omni] Cleanup per-request state
-        # Since vLLM doesn't have a clear 'on_request_deleted' hook in scheduler,
-        # we will add manual cleanup in update_from_output
-
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
         # 2. Omni Specific: Check if we need to transfer KV
         if self._should_transfer_kv_for_request(request_id):
-            # [Fix]: If we already transferred (prefill or special token),
-            # we assume we don't need to transfer again at end of request.
-            # UNLESS the transfer is still active, in which case we must wait.
-
             already_triggered = request_id in self.transfer_triggered_requests
             is_active = request_id in self.active_kv_transfers
 
@@ -528,15 +489,10 @@ class OmniARScheduler(VLLMScheduler):
                         f"[Omni] Request {request_id} finished and transfer no longer ACTIVE (extracted/acked). "
                         "Freeing immediately."
                     )
-                    # Fall through to standard freeing logic below
             else:
                 self.waiting_for_transfer_free.add(request_id)
-                # Store req_id and seq_len
                 self._mark_request_for_kv_transfer(request_id, request.num_computed_tokens)
-                # FORCE delay freeing blocks regardless of connector status
-                # We return early so _free_blocks is not called
-
-                # [Omni] Return KV transfer metadata so it propagates to RequestOutput
+                # Return KV transfer metadata so it propagates to RequestOutput
                 if request_id in self.requests_needing_kv_transfer:
                     transfer_data = self.requests_needing_kv_transfer[request_id]
                     kv_xfer_params = {
