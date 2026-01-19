@@ -68,7 +68,7 @@ from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema
 
-from .bagel_processor import BagelProcessor
+from vllm_omni.transformers_utils.processors import BagelProcessor
 
 logger = init_logger(__name__)
 
