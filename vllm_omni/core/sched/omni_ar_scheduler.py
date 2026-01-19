@@ -81,8 +81,6 @@ class OmniARScheduler(VLLMScheduler):
         if not self.kv_transfer_criteria:
             return False
 
-        # Avoid checking if transfer is already pending/processed
-        # Note: We use transfer_triggered_requests to allow 'continue after transfer'
         if request.request_id in self.waiting_for_transfer_free:
             return False
 
@@ -257,7 +255,6 @@ class OmniARScheduler(VLLMScheduler):
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
 
-            # [Omni] Check KV transfer trigger criteria
             # If criteria returns True, it means we must STOP the request (e.g. legacy behavior, not used now)
             # If criteria returns False, it might have triggered a background transfer
             # (e.g. prefill finished / special token) but continues decoding
