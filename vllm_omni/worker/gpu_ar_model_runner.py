@@ -764,8 +764,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 success, size, metadata = connector.put(
                     from_stage=from_stage, to_stage=to_stage, request_id=request_id, data=data
                 )
-                # TODO(wzliu): Remove this sleep after fixing async storage issue
-                time.sleep(20)
                 if success:
                     return success, size, metadata
                 logger.warning(f"Transfer attempt {attempt + 1} failed for {request_id}")
