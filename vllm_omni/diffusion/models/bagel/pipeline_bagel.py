@@ -20,13 +20,13 @@ from torch import nn
 from transformers import AutoTokenizer, SiglipImageProcessor, SiglipVisionConfig, SiglipVisionModel
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
-from vllm_omni.transformers_utils.configs import BagelConfig
 
 from .autoencoder import AutoEncoder, AutoEncoderParams
 from .bagel_transformer import Bagel, NaiveCache, Qwen2MoTConfig, Qwen2MoTForCausalLM
