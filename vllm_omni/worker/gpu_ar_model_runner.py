@@ -310,9 +310,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(
-                    sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-                )
+                # Try with sampling_metadata first; fall back to without for models that don't support it
+                try:
+                    logits = self.model.compute_logits(
+                        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                    )
+                except TypeError:
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -329,9 +333,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(
-                        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-                    )
+                    # Try with sampling_metadata first; fall back to without for models that don't support it
+                    try:
+                        logits = self.model.compute_logits(
+                            sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                        )
+                    except TypeError:
+                        logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:

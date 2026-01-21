@@ -48,11 +48,6 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
-    "BagelForConditionalGeneration": (
-        "bagel",
-        "bagel",
-        "BagelForConditionalGeneration",
-    ),
 }
 
 
