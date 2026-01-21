@@ -32,6 +32,7 @@ class KVCacheTransferData:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+
 class OmniARScheduler(VLLMScheduler):
     """
     OmniARScheduler: Scheduler for vLLM-Omni multimodal processing.
