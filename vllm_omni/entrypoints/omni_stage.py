@@ -682,6 +682,7 @@ def _stage_worker(
     try:
         if stage_type == "diffusion":
             engine_args.pop("model_stage", None)
+            engine_args.pop("model", None)
             stage_engine = OmniDiffusion(
                 model=model,
                 stage_id=stage_id,
