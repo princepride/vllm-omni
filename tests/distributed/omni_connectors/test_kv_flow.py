@@ -8,7 +8,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 
-class TestableGPUARModelRunner(GPUARModelRunner):
+class MockGPUARModelRunner(GPUARModelRunner):
     """Subclass to bypass heavy initialization."""
 
     def __init__(self, kv_caches, input_batch):
@@ -21,7 +21,7 @@ class TestableGPUARModelRunner(GPUARModelRunner):
         self.logger = MagicMock()
 
 
-class TestableBagelPipeline(BagelPipeline):
+class MockBagelPipeline(BagelPipeline):
     """Subclass to bypass heavy initialization."""
 
     def __init__(self):
@@ -56,7 +56,9 @@ class TestKVFlow(unittest.TestCase):
         for _ in range(self.num_layers):
             k_cache = torch.randn(num_blocks, self.block_size, self.num_heads, self.head_dim)
             v_cache = torch.randn(num_blocks, self.block_size, self.num_heads, self.head_dim)
-            kv_caches.append((k_cache, v_cache))
+            # Stack K and V to create [2, num_blocks, block_size, n_heads, head_dim]
+            layer_cache = torch.stack([k_cache, v_cache], dim=0)
+            kv_caches.append(layer_cache)
 
         # 2. Setup Input Batch Mock
         block_ids = [1, 3, 5]
@@ -65,28 +67,26 @@ class TestKVFlow(unittest.TestCase):
         mock_input_batch.block_table.get_row.return_value = block_ids
 
         # 3. Instantiate Runner
-        runner = TestableGPUARModelRunner(kv_caches, mock_input_batch)
+        runner = MockGPUARModelRunner(kv_caches, mock_input_batch)
 
         # 4. Run Extraction
-        # We call the method directly with the expected dictionary format
-        req_data = {self.req_id: {"seq_len": self.seq_len, "block_ids": block_ids}}
-        result = runner._extract_kv_cache_for_requests(req_data)
+        # calling _extract_kv_cache directly: (req_id, block_ids, seq_len)
+        result = runner._extract_kv_cache(self.req_id, block_ids, self.seq_len)
 
         # 5. Verify Result
-        self.assertIn(self.req_id, result)
-        data = result[self.req_id]
+        self.assertIsNotNone(result)
+        self.assertEqual(result.request_id, self.req_id)
 
         # Check keys "key_cache" and "value_cache" exist (length 2)
-        self.assertEqual(len(data.layer_blocks), 2)
-        self.assertIn("key_cache", data.layer_blocks)
-        self.assertIn("value_cache", data.layer_blocks)
+        self.assertEqual(len(result.layer_blocks["key_cache"]), 2)
+        self.assertEqual(len(result.layer_blocks["value_cache"]), 2)
 
         # Check Tensor Shape: [seq_len, num_heads, head_dim]
-        # data.layer_blocks["key_cache"] is a list of tensors
+        # result.layer_blocks["key_cache"] is a list of tensors
         expected_shape = (self.seq_len, self.num_heads, self.head_dim)
-        self.assertEqual(data.layer_blocks["key_cache"][0].shape, expected_shape)
+        self.assertEqual(result.layer_blocks["key_cache"][0].shape, expected_shape)
 
-        return data  # Return for use in next test
+        return result  # Return for use in next test
 
     def test_receiver_injection_logic(self):
         """Test injection logic in BagelPipeline."""
@@ -116,7 +116,7 @@ class TestKVFlow(unittest.TestCase):
         req.kv_metadata = transfer_data.metadata
 
         # 3. Setup Pipeline
-        pipeline = TestableBagelPipeline()
+        pipeline = MockBagelPipeline()
 
         # Mock Bagel's NaiveCache
         class RealNaiveCache:  # Minimal impl
@@ -169,16 +169,11 @@ class TestKVFlow(unittest.TestCase):
             self.skipTest("vLLM not installed")
 
         # 1. Sender (Extraction)
-        runner_test = self.test_sender_extraction_logic()  # Get KVCacheTransferData
+        runner_test_result = self.test_sender_extraction_logic()  # Get KVCacheTransferData
 
         # 2. Connector (Serialize/Deserialize Simulation)
-        # In reality, it goes through memory/network. Here we assume direct object passing
-        # or simple dict conversion.
-        data_dict = (
-            runner_test.to_dict()
-            if hasattr(runner_test, "to_dict")
-            else {"layer_blocks": runner_test.layer_blocks, "metadata": runner_test.metadata}
-        )
+        # KVCacheTransferData has to_dict
+        data_dict = runner_test_result.to_dict()
 
         # 3. Receiver (Request Setup)
         req = OmniDiffusionRequest(prompt="integration_test")
