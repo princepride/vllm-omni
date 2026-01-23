@@ -33,6 +33,14 @@ _MODEL_COEFFICIENTS = {
         5.58554382e01,
         -3.82021401e00,
         2.64230861e-01,
+    # Z-Image transformer coefficients
+    # Copied from Qwen-Image, need to be tuned specifically for Z-Image in future
+    "ZImageTransformer2DModel": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
     ],
 }
 
