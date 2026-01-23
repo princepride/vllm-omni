@@ -288,12 +288,12 @@ def extract_bagel_context(
         past_key_values: KV cache
         packed_key_value_indexes: KV cache indexes
         **kwargs: Additional keyword arguments
-        
+
     Returns:
         CacheContext with all information needed for generic caching
     """
-        
-# 1. Embed text
+
+    # 1. Embed text
     packed_text_embedding = module.language_model.model.embed_tokens(packed_text_ids)
     packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), module.hidden_size))
     packed_sequence[packed_text_indexes] = packed_text_embedding
@@ -353,7 +353,8 @@ def extract_bagel_context(
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
     )
-  
+
+
 def extract_zimage_context(
     module: nn.Module,
     x: list[torch.Tensor],
