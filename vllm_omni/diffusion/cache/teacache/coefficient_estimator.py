@@ -55,7 +55,7 @@ class BagelAdapter:
     """Adapter for Bagel model."""
 
     @staticmethod
-    def load_pipeline(model_path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> Any:
+    def load_pipeline(model_path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> BagelPipeline:
         od_config = OmniDiffusionConfig.from_kwargs(model=model_path, dtype=dtype)
         od_config.model_class_name = "BagelPipeline"
 

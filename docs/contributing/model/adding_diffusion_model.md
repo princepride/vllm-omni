@@ -243,7 +243,31 @@ coeffs = estimator.estimate(poly_order=4)
 print(f"Coefficients: {coeffs}")
 ```
 
-### 5.4 Add Coefficients to Config
+### 5.4 Interpreting Coefficient Estimation Results
+
+The estimator outputs statistics and polynomial coefficients. Here's how to interpret them:
+
+**Example Output:**
+```
+Data statistics:
+Count: 48
+Input Diffs (x): min=1.1089e-02, max=5.2555e-02, mean=2.8435e-02
+Output Diffs (y): min=2.8242e-02, max=2.9792e-01, mean=7.0312e-02
+Coefficients: [1333131.29, -168644.23, 7950.51, -163.75, 1.26]
+```
+
+**What to Check:**
+- **Count**: Number of timestep pairs analyzed. Should be at least 30-50 for reliable estimation. Low count suggests insufficient prompts or inference steps.
+- **Input/Output Ranges**: Verify output differences correlate with input differences. If ranges seem unusual, check your prompt diversity.
+- **Coefficient Magnitude**: Extremely large values (>1e8) may indicate numerical instability - try collecting more diverse data.
+
+**Troubleshooting:**
+- If results seem unreliable, try:
+  - Increasing number of prompts (100+ recommended)
+  - Using more diverse prompts from multiple datasets
+  - Adjusting `num_inference_steps` (try 20, 50, 100)
+
+### 5.5 Add Coefficients to Config
 
 Add the estimated coefficients to `vllm_omni/diffusion/cache/teacache/config.py`:
 
