@@ -22,7 +22,7 @@ logger = init_logger(__name__)
 
 @dataclass
 class OmniKVCacheConfig:
-    """Configuration for OmniKVCacheManager."""
+    """Configuration for OmniKVTransferManager."""
 
     connector_config: dict[str, Any] | None = None
     from_stage: str | None = None
@@ -61,7 +61,7 @@ class RequestIdResolver(Protocol):
     def __call__(self, req_id: str) -> str: ...
 
 
-class OmniKVCacheManager:
+class OmniKVTransferManager:
     """Unified management for OmniConnector and KV cache transfer."""
 
     def __init__(self, config: OmniKVCacheConfig):
@@ -85,7 +85,7 @@ class OmniKVCacheManager:
 
             c_extra = {k: v for k, v in cfg.items() if k != "type"}
             self._connector = OmniConnectorFactory.create_connector(ConnectorSpec(name=c_type, extra=c_extra))
-            logger.info(f"OmniKVCacheManager: Created connector {c_type}")
+            logger.info(f"OmniKVTransferManager: Created connector {c_type}")
             return self._connector
         except Exception as e:
             logger.error(f"Failed to create OmniConnector: {e}")
@@ -273,11 +273,11 @@ class OmniKVCacheManager:
         return False, 0, None
 
     @staticmethod
-    def from_omni_kv_config(omni_kv_config: dict[str, Any] | None) -> OmniKVCacheManager:
+    def from_omni_kv_config(omni_kv_config: dict[str, Any] | None) -> OmniKVTransferManager:
         if not omni_kv_config:
-            return OmniKVCacheManager(OmniKVCacheConfig())
+            return OmniKVTransferManager(OmniKVCacheConfig())
 
-        return OmniKVCacheManager(
+        return OmniKVTransferManager(
             OmniKVCacheConfig(
                 connector_config=omni_kv_config.get("connector_config"),
                 from_stage=omni_kv_config.get("omni_from_stage"),
@@ -291,15 +291,15 @@ class OmniKVCacheManager:
         )
 
     @staticmethod
-    def from_model_config(model_config: Any) -> OmniKVCacheManager:
+    def from_model_config(model_config: Any) -> OmniKVTransferManager:
         omni_kv = getattr(model_config, "omni_kv_config", None)
         if isinstance(omni_kv, dict):
-            return OmniKVCacheManager.from_omni_kv_config(omni_kv)
-        return OmniKVCacheManager(OmniKVCacheConfig())
+            return OmniKVTransferManager.from_omni_kv_config(omni_kv)
+        return OmniKVTransferManager(OmniKVCacheConfig())
 
     @staticmethod
-    def from_od_config(od_config: Any) -> OmniKVCacheManager:
+    def from_od_config(od_config: Any) -> OmniKVTransferManager:
         omni_kv = getattr(od_config, "omni_kv_config", None)
         if isinstance(omni_kv, dict):
-            return OmniKVCacheManager.from_omni_kv_config(omni_kv)
-        return OmniKVCacheManager(OmniKVCacheConfig())
+            return OmniKVTransferManager.from_omni_kv_config(omni_kv)
+        return OmniKVTransferManager(OmniKVCacheConfig())

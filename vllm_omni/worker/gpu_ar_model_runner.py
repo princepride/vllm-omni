@@ -35,7 +35,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
-from vllm_omni.distributed.omni_connectors.kv_cache_manager import OmniKVCacheManager
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
@@ -71,7 +71,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         self.hidden_size = self.model_config.hf_text_config.hidden_size
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (lazy creation of connector)
-        self.kv_cache_manager: OmniKVCacheManager | None = None
+        self.kv_cache_manager: OmniKVTransferManager | None = None
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -588,7 +588,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         # Lazy initialization of kv_cache_manager
         if self.kv_cache_manager is None:
-            self.kv_cache_manager = OmniKVCacheManager.from_model_config(self.model_config)
+            self.kv_cache_manager = OmniKVTransferManager.from_model_config(self.model_config)
 
         # Delegate to kv_cache_manager
         return self.kv_cache_manager.handle_finished_requests_kv_transfer(

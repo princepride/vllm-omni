@@ -27,7 +27,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.offload import apply_offload_hooks
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.distributed.omni_connectors.kv_cache_manager import OmniKVCacheManager
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 
 logger = init_logger(__name__)
 
@@ -62,7 +62,7 @@ class GPUDiffusionModelRunner:
         self.cache_backend = None
 
         # Initialize KV cache manager for connector management
-        self.kv_cache_manager = OmniKVCacheManager.from_od_config(od_config)
+        self.kv_cache_manager = OmniKVTransferManager.from_od_config(od_config)
 
     def load_model(
         self,
@@ -136,7 +136,7 @@ class GPUDiffusionModelRunner:
         logger.info("Model runner: Initialization complete.")
 
     def _receive_kv_cache_for_request(self, req: OmniDiffusionRequest) -> None:
-        """Receive KV cache for a request via OmniKVCacheManager."""
+        """Receive KV cache for a request via OmniKVTransferManager."""
         if not req.request_id:
             logger.warning("Request has no ID, cannot receive KV cache")
             return
