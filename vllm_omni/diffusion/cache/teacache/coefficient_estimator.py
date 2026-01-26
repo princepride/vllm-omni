@@ -103,11 +103,13 @@ _MODEL_ADAPTERS: dict[str, type] = {
     "Bagel": BagelAdapter,
 }
 
+_EPSILON = 1e-6
+
 
 def calculate_relative_l1(tensor_current: np.ndarray, tensor_next: np.ndarray) -> float:
     """Calculate relative L1 distance (Eq. 4 from TeaCache paper)."""
     diff = np.abs(tensor_current - tensor_next).sum()
-    norm = np.abs(tensor_current).sum() + 1e-6
+    norm = np.abs(tensor_current).sum() + _EPSILON
     return diff / norm
 
 
@@ -145,6 +147,15 @@ class TeaCacheCoefficientEstimator:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
+        # Add validation here ⬇️
+        if model_type not in _MODEL_ADAPTERS:
+            available_types = list(_MODEL_ADAPTERS.keys())
+            raise ValueError(
+                f"Unsupported model_type: '{model_type}'. "
+                f"Available types: {available_types}. "
+                f"To add support for a new model, add an entry to _MODEL_ADAPTERS."
+            )
+
         adapter = _MODEL_ADAPTERS.get(model_type, DefaultAdapter)
         self.pipeline = adapter.load_pipeline(model_path, device, dtype)
         self.transformer, self.transformer_type = adapter.get_transformer(self.pipeline)
@@ -167,4 +178,20 @@ class TeaCacheCoefficientEstimator:
             self.collected_data.append(trajectory)
 
     def estimate(self, poly_order: int = 4) -> list[float]:
+        """Estimate polynomial coefficients from collected data.
+
+        Args:
+            poly_order: Order of polynomial fit (default: 4)
+
+        Returns:
+            List of polynomial coefficients [a_n, a_{n-1}, ..., a_1, a_0]
+
+        Raises:
+            RuntimeError: If no data has been collected
+        """
+        if not self.collected_data:
+            raise RuntimeError(
+                "No data collected for coefficient estimation. "
+                "Call collect_from_prompt() at least once before calling estimate()."
+            )
         return estimate_teacache_coefficients(self.collected_data, poly_order)
