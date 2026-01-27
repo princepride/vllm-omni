@@ -71,7 +71,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         self.hidden_size = self.model_config.hf_text_config.hidden_size
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (lazy creation of connector)
-        self.kv_cache_manager: OmniKVTransferManager | None = None
+        self.kv_transfer_manager = OmniKVTransferManager.from_model_config(self.model_config)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -96,7 +96,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
-        self.kv_extracted_req_ids = self._handle_finished_requests_kv_transfer(scheduler_output)
+        self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
+            finished_reqs=getattr(scheduler_output, "finished_requests_needing_kv_transfer", {}),
+            kv_caches=self.kv_caches,
+            block_size=self.cache_config.block_size,
+            cache_dtype=str(self.cache_config.cache_dtype),
+            request_id_resolver=self._resolve_global_request_id,
+        )
 
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -576,28 +582,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
             )
 
         return async_output
-
-    def _handle_finished_requests_kv_transfer(self, scheduler_output: SchedulerOutput) -> list[str]:
-        """Handle KV cache transfer for finished requests.
-
-        Returns list of request IDs that were processed (for Scheduler to free blocks).
-        """
-        finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
-        if not finished_reqs:
-            return []
-
-        # Lazy initialization of kv_cache_manager
-        if self.kv_cache_manager is None:
-            self.kv_cache_manager = OmniKVTransferManager.from_model_config(self.model_config)
-
-        # Delegate to kv_cache_manager
-        return self.kv_cache_manager.handle_finished_requests_kv_transfer(
-            finished_reqs=finished_reqs,
-            kv_caches=self.kv_caches,
-            block_size=self.cache_config.block_size,
-            cache_dtype=str(self.cache_config.cache_dtype),
-            request_id_resolver=self._resolve_global_request_id,
-        )
 
     def _resolve_global_request_id(self, req_id: str) -> str:
         """Resolve global request ID from request state."""

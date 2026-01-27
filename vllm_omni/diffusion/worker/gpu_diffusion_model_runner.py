@@ -62,7 +62,7 @@ class GPUDiffusionModelRunner:
         self.cache_backend = None
 
         # Initialize KV cache manager for connector management
-        self.kv_cache_manager = OmniKVTransferManager.from_od_config(od_config)
+        self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
     def load_model(
         self,
@@ -135,54 +135,6 @@ class GPUDiffusionModelRunner:
 
         logger.info("Model runner: Initialization complete.")
 
-    def _receive_kv_cache_for_request(self, req: OmniDiffusionRequest) -> None:
-        """Receive KV cache for a request via OmniKVTransferManager."""
-        if not req.request_id:
-            logger.warning("Request has no ID, cannot receive KV cache")
-            return
-
-        try:
-            logger.info(f"Attempting to receive KV cache for request {req.request_id}")
-
-            result = self.kv_cache_manager.receive_kv_cache(req.request_id)
-
-            if result:
-                data, size = result
-                logger.info(f"Successfully received KV cache for {req.request_id}, {size} bytes")
-                self._apply_kv_cache_to_request(req, data)
-            else:
-                logger.warning(f"No KV cache received for {req.request_id} (timeout or empty)")
-
-        except Exception as e:
-            logger.error(f"Error receiving KV cache for {req.request_id}: {e}")
-            import traceback
-
-            traceback.print_exc()
-
-    def _apply_kv_cache_to_request(self, req: OmniDiffusionRequest, data: dict) -> None:
-        """Apply received KV cache data to the request.
-
-        Args:
-            req: The diffusion request.
-            data: The received KV cache data dictionary.
-        """
-        # Assume data structure matches KVCacheTransferData.to_dict()
-        if isinstance(data, dict) and "layer_blocks" in data:
-            # Get layer blocks and ensure they are on the correct device
-            layer_blocks = data["layer_blocks"]
-
-            # Move tensors to GPU if needed (OmniSerializer should handle tensor reconstruction)
-            for cache_list in [layer_blocks["key_cache"], layer_blocks["value_cache"]]:
-                for i, tensor in enumerate(cache_list):
-                    if isinstance(tensor, torch.Tensor) and tensor.device != self.pipeline.device:
-                        cache_list[i] = tensor.to(self.pipeline.device).contiguous()
-            from types import SimpleNamespace
-
-            req.past_key_values = SimpleNamespace(**layer_blocks)
-
-        if "metadata" in data:
-            req.kv_metadata = data["metadata"]
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights into the pipeline."""
         return self.pipeline.load_weights(weights)
@@ -206,9 +158,8 @@ class GPUDiffusionModelRunner:
         req = reqs[0]
 
         # [Omni] KV Cache Receiving Logic - use kv_cache_manager
-        connector = self.kv_cache_manager.get_connector()
-        if getattr(req, "need_kv_receive", False) and connector is not None:
-            self._receive_kv_cache_for_request(req)
+        if getattr(req, "need_kv_receive", False):
+            self.kv_transfer_manager.receive_kv_cache(req, target_device=self.pipeline.device)
 
         if req.generator is None and req.seed is not None:
             req.generator = torch.Generator(device=self.device).manual_seed(req.seed)

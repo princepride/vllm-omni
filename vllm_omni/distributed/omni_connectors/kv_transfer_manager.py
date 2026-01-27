@@ -83,10 +83,6 @@ class OmniKVTransferManager:
         )
 
     @classmethod
-    def from_omni_kv_config(cls, cfg: dict | None) -> "OmniKVTransferManager":
-        return cls._create(cfg)
-
-    @classmethod
     def from_model_config(cls, config: Any) -> "OmniKVTransferManager":
         return cls._create(getattr(config, "omni_kv_config", None))
 
@@ -183,27 +179,55 @@ class OmniKVTransferManager:
         logger.error(f"KV cache send FAILED: {req_id}")
         return False
 
-    def receive_kv_cache(self, request_id: str, timeout: float | None = None) -> tuple[dict[str, Any], int] | None:
+    @torch.inference_mode()
+    def receive_kv_cache(self, req: Any, target_device: torch.device | None = None) -> bool:
+        """Receive KV cache and populate request object."""
         if not self.config.need_recv_cache or not self.connector:
-            return None
+            return False
+
+        if not (request_id := getattr(req, "request_id", None)):
+            logger.warning("Request has no ID, cannot receive KV cache")
+            return False
 
         src, dst = self.recv_stages
         if not src or not dst:
-            return None
+            return False
 
         key = f"kv_cache_{request_id}"
-        timeout = timeout or self.config.recv_timeout
+        timeout = self.config.recv_timeout
         start = time.time()
 
         logger.info(f"Waiting for KV cache {request_id}...")
-        while time.time() - start < timeout:
-            try:
+        try:
+            while time.time() - start < timeout:
                 if res := self.connector.get(from_stage=src, to_stage=dst, request_id=key):
-                    logger.info(f"Received KV cache for {request_id}, {res[1]} bytes")
-                    return res
-            except Exception:
-                pass
-            time.sleep(0.5)
+                    data, size = res
+                    logger.info(f"Received KV cache for {request_id}, {size} bytes")
 
-        logger.error(f"Timeout waiting for KV cache for {request_id}")
-        return None
+                    if isinstance(data, dict) and "layer_blocks" in data:
+                        layer_blocks = data["layer_blocks"]
+                        if target_device is not None:
+                            # Move tensors to GPU if needed
+                            for cache_list in [layer_blocks.get("key_cache", []), layer_blocks.get("value_cache", [])]:
+                                for i, tensor in enumerate(cache_list):
+                                    if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
+                                        cache_list[i] = tensor.to(target_device).contiguous()
+
+                        from types import SimpleNamespace
+
+                        req.past_key_values = SimpleNamespace(**layer_blocks)
+
+                    if "metadata" in data:
+                        req.kv_metadata = data["metadata"]
+
+                    return True
+                time.sleep(0.1)
+
+            logger.warning(f"Timeout waiting for KV cache for {request_id}")
+        except Exception as e:
+            logger.error(f"Error receiving KV cache for {request_id}: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+        return False
