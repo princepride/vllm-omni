@@ -14,11 +14,13 @@ class MockConnector:
         self.store = {}
 
     def put(self, from_stage, to_stage, request_id, data):
+        # The manager now passes full key as request_id (e.g., omni_stage1_to_stage2_kv_cache_req_test_1)
         key = f"{from_stage}->{to_stage}:{request_id}"
         self.store[key] = data
-        return True, None
+        return True, len(str(data)), None  # (success, size, metadata)
 
-    def get(self, from_stage, to_stage, request_id):
+    def get(self, from_stage, to_stage, request_id, metadata=None):
+        # The manager now passes full key as request_id
         key = f"{from_stage}->{to_stage}:{request_id}"
         if key in self.store:
             return self.store[key], len(str(self.store[key]))
@@ -71,8 +73,9 @@ class TestKVFlow(unittest.TestCase):
         self.assertIn(self.req_id, processed)
 
         # Check if data was put into connector
-        # Expected key format in mock: "stage1->stage2:kv_cache_req_test_1"
-        expected_key = f"stage1->stage2:kv_cache_{self.req_id}"
+        # Manager builds full key: omni_{from}_to_{to}_kv_cache_{req_id}
+        full_request_id = f"omni_stage1_to_stage2_kv_cache_{self.req_id}"
+        expected_key = f"stage1->stage2:{full_request_id}"
         self.assertIn(expected_key, mock_connector.store)
 
         data = mock_connector.store[expected_key]
@@ -116,8 +119,9 @@ class TestKVFlow(unittest.TestCase):
         manager._connector = mock_connector
 
         # Pre-populate connector with data
-        # key format: "stage1->stage2:kv_cache_{req_id}"
-        store_key = f"stage1->stage2:kv_cache_{self.req_id}"
+        # Manager builds full key: omni_{from}_to_{to}_kv_cache_{req_id}
+        full_request_id = f"omni_stage1_to_stage2_kv_cache_{self.req_id}"
+        store_key = f"stage1->stage2:{full_request_id}"
         mock_connector.store[store_key] = data_to_receive
 
         req = OmniDiffusionRequest(prompt="test_recv", request_id=self.req_id)
