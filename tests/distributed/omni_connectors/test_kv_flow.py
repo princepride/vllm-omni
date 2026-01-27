@@ -1,36 +1,28 @@
 import unittest
-from unittest.mock import MagicMock, patch
 
 import torch
 
-from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    OmniKVCacheConfig,
+    OmniKVTransferManager,
+)
 
 
-class MockGPUARModelRunner(GPUARModelRunner):
-    """Subclass to bypass heavy initialization."""
-
-    def __init__(self, kv_caches, input_batch):
-        self.kv_caches = kv_caches
-        self.input_batch = input_batch
-        self.device = "cpu"
-        self.cache_config = MagicMock()
-        self.cache_config.block_size = 16
-        self.cache_config.cache_dtype = "auto"
-        self.logger = MagicMock()
-
-
-class MockBagelPipeline(BagelPipeline):
-    """Subclass to bypass heavy initialization."""
-
+class MockConnector:
     def __init__(self):
-        self.device = "cpu"
-        self.od_config = MagicMock()
-        self.bagel = MagicMock()
-        self.tokenizer = MagicMock()
-        self.language_model = MagicMock()
-        self.new_token_ids = {}
+        self.store = {}
+
+    def put(self, from_stage, to_stage, request_id, data):
+        key = f"{from_stage}->{to_stage}:{request_id}"
+        self.store[key] = data
+        return True, None
+
+    def get(self, from_stage, to_stage, request_id):
+        key = f"{from_stage}->{to_stage}:{request_id}"
+        if key in self.store:
+            return self.store[key], len(str(self.store[key]))
+        return None
 
 
 class TestKVFlow(unittest.TestCase):
@@ -40,17 +32,23 @@ class TestKVFlow(unittest.TestCase):
         self.num_heads = 4
         self.head_dim = 16
         self.block_size = 8
-        self.x = 8  # PagedAttention factor
         self.seq_len = 20
         self.req_id = "req_test_1"
 
-    def test_sender_extraction_logic(self):
-        """Test extraction logic in GPUARModelRunner."""
-        if GPUARModelRunner is object:
-            self.skipTest("vLLM not installed")
+        # Test config
+        self.config = OmniKVCacheConfig(
+            connector_config={"type": "mock"},
+            from_stage="stage1",
+            to_stage="stage2",
+            stage_id="stage2",  # Acting as receiver for some tests
+            need_recv_cache=True,
+            need_send_cache=True,
+            recv_timeout=1.0,  # Short timeout for tests
+        )
 
-        # 1. Setup KV Cache (List of tuples (K, V))
-        # Shape: [num_blocks, block_size, num_heads, head_dim] matching 4D expectation
+    def test_manager_extraction(self):
+        """Test extraction and sending logic in OmniKVTransferManager."""
+
         num_blocks = 10
         kv_caches = []
         for _ in range(self.num_layers):
@@ -60,129 +58,120 @@ class TestKVFlow(unittest.TestCase):
             layer_cache = torch.stack([k_cache, v_cache], dim=0)
             kv_caches.append(layer_cache)
 
-        # 2. Setup Input Batch Mock
         block_ids = [1, 3, 5]
-        mock_input_batch = MagicMock()
-        mock_input_batch.req_id_to_index = {self.req_id: 0}
-        mock_input_batch.block_table.get_row.return_value = block_ids
+        finished_reqs = {self.req_id: {"block_ids": block_ids, "seq_len": self.seq_len}}
 
-        # 3. Instantiate Runner
-        runner = MockGPUARModelRunner(kv_caches, mock_input_batch)
+        manager = OmniKVTransferManager(self.config)
+        # Mock the connector factory or injection
+        mock_connector = MockConnector()
+        manager._connector = mock_connector
 
-        # 4. Run Extraction
-        # calling _extract_kv_cache directly: (req_id, block_ids, seq_len)
-        result = runner._extract_kv_cache(self.req_id, block_ids, self.seq_len)
+        processed = manager.handle_finished_requests_kv_transfer(finished_reqs, kv_caches, self.block_size, "float32")
 
-        # 5. Verify Result
-        self.assertIsNotNone(result)
-        self.assertEqual(result.request_id, self.req_id)
+        self.assertIn(self.req_id, processed)
 
-        # Check keys "key_cache" and "value_cache" exist (length 2)
-        self.assertEqual(len(result.layer_blocks["key_cache"]), 2)
-        self.assertEqual(len(result.layer_blocks["value_cache"]), 2)
+        # Check if data was put into connector
+        # Expected key format in mock: "stage1->stage2:kv_cache_req_test_1"
+        expected_key = f"stage1->stage2:kv_cache_{self.req_id}"
+        self.assertIn(expected_key, mock_connector.store)
 
-        # Check Tensor Shape: [seq_len, num_heads, head_dim]
-        # result.layer_blocks["key_cache"] is a list of tensors
+        data = mock_connector.store[expected_key]
+        self.assertEqual(data["request_id"], self.req_id)
+        self.assertIn("layer_blocks", data)
+        self.assertEqual(len(data["layer_blocks"]["key_cache"]), self.num_layers)
+
+        # Verify shape of extracted tensor: [seq_len, heads, dim]
+        # Note: Manager detaches and moves to CPU
         expected_shape = (self.seq_len, self.num_heads, self.head_dim)
-        self.assertEqual(result.layer_blocks["key_cache"][0].shape, expected_shape)
+        self.assertEqual(data["layer_blocks"]["key_cache"][0].shape, expected_shape)
 
-        return result  # Return for use in next test
+        return data  # Return for potential use
 
-    def test_receiver_injection_logic(self):
-        """Test injection logic in BagelPipeline."""
-        if BagelPipeline is object:
-            self.skipTest("vLLM not installed")
+    def test_manager_reception(self):
+        """Test reception and injection logic in OmniKVTransferManager."""
 
-        # 1. Get Data from Sender Test (simulate transfer)
-        # Re-create data manually to be independent
-        key_cache = []
-        value_cache = []
         expected_shape = (self.seq_len, self.num_heads, self.head_dim)
-        for i in range(self.num_layers):
-            key_cache.append(torch.randn(expected_shape))
-            value_cache.append(torch.randn(expected_shape))
+        key_cache = [torch.randn(expected_shape) for _ in range(self.num_layers)]
+        value_cache = [torch.randn(expected_shape) for _ in range(self.num_layers)]
 
         layer_blocks = {"key_cache": key_cache, "value_cache": value_cache}
+        metadata = {
+            "block_size": self.block_size,
+            "num_layers": self.num_layers,
+            "dtype": "float32",
+            "seq_len": self.seq_len,
+        }
 
-        transfer_data = MagicMock()  # Mock KVCacheTransferData
-        transfer_data.layer_blocks = layer_blocks
-        transfer_data.metadata = {"kv_lens": [self.seq_len], "ropes": [0]}
+        data_to_receive = {
+            "request_id": self.req_id,
+            "layer_blocks": layer_blocks,
+            "metadata": metadata,
+            "block_ids": [],
+        }
 
-        # 2. Setup Request with Injected Data
-        req = OmniDiffusionRequest(prompt="test")
-        from types import SimpleNamespace
+        # In setUp, from_stage="stage1", stage_id="stage2". recv_stages=("stage1", "stage2")
 
-        req.past_key_values = SimpleNamespace(**layer_blocks)
-        req.kv_metadata = transfer_data.metadata
+        manager = OmniKVTransferManager(self.config)
+        mock_connector = MockConnector()
+        manager._connector = mock_connector
 
-        # 3. Setup Pipeline
-        pipeline = MockBagelPipeline()
+        # Pre-populate connector with data
+        # key format: "stage1->stage2:kv_cache_{req_id}"
+        store_key = f"stage1->stage2:kv_cache_{self.req_id}"
+        mock_connector.store[store_key] = data_to_receive
 
-        # Mock Bagel's NaiveCache
-        class RealNaiveCache:  # Minimal impl
-            def __init__(self, n):
-                self.key_cache = {i: None for i in range(n)}
-                self.value_cache = {i: None for i in range(n)}
+        req = OmniDiffusionRequest(prompt="test_recv", request_id=self.req_id)
+        success = manager.receive_kv_cache(req, target_device=torch.device("cpu"))
 
-        pipeline.bagel.config.llm_config.num_hidden_layers = self.num_layers
+        self.assertTrue(success)
+        self.assertTrue(hasattr(req, "past_key_values"))
+        self.assertTrue(hasattr(req, "kv_metadata"))
 
-        captured_context = {}
+        self.assertEqual(len(req.past_key_values.key_cache), self.num_layers)
+        self.assertTrue(torch.allclose(req.past_key_values.key_cache[0], key_cache[0]))
+        self.assertEqual(req.kv_metadata["seq_len"], self.seq_len)
 
-        def mock_prepare_prompts(curr_kvlens, curr_rope, **kwargs):
-            # Capture the state passed to prepare_prompts
-            captured_context["kv_lens"] = curr_kvlens
-            captured_context["ropes"] = curr_rope
-            return {}, [0], [0]
+    def test_integration_flow(self):
+        """Simulate extraction -> connector -> reception."""
 
-        pipeline.bagel.prepare_prompts = MagicMock(side_effect=mock_prepare_prompts)
-        with patch("vllm_omni.diffusion.models.bagel.pipeline_bagel.NaiveCache") as MockNaiveCacheCls:
-            # Setup the instance returned by the constructor
-            mock_cache_instance = RealNaiveCache(self.num_layers)
-            MockNaiveCacheCls.return_value = mock_cache_instance
+        sender_config = OmniKVCacheConfig(
+            connector_config={"type": "mock"}, from_stage="sender", to_stage="receiver", need_send_cache=True
+        )
+        sender_manager = OmniKVTransferManager(sender_config)
+        connector = MockConnector()
+        sender_manager._connector = connector  # Shared connector
 
-        # Verification of Injection Logic (Simulation)
-        current_cache = RealNaiveCache(self.num_layers)
+        # Create Data
+        num_blocks = 5
+        kv_caches = []
+        for _ in range(self.num_layers):
+            layer = torch.randn(2, num_blocks, self.block_size, self.num_heads, self.head_dim)
+            kv_caches.append(layer)
 
-        # --- Logic from Source Code ---
-        injected_kv = req.past_key_values
-        if isinstance(current_cache, RealNaiveCache) and hasattr(injected_kv, "key_cache"):
-            # Assuming injected_kv is SimpleNamespace or object with list attrs
-            for layer_idx in range(len(injected_kv.key_cache)):
-                if injected_kv.key_cache[layer_idx] is not None:
-                    k_tensor = injected_kv.key_cache[layer_idx]
-                    v_tensor = injected_kv.value_cache[layer_idx]
+        finished_reqs = {self.req_id: {"block_ids": [0, 1], "seq_len": 10}}
 
-                    if k_tensor.device != pipeline.device:
-                        k_tensor = k_tensor.to(pipeline.device)
-                    if v_tensor.device != pipeline.device:
-                        v_tensor = v_tensor.to(pipeline.device)
+        # Send
+        sender_manager.handle_finished_requests_kv_transfer(finished_reqs, kv_caches, self.block_size, "float32")
 
-                    current_cache.key_cache[layer_idx] = k_tensor
-                    current_cache.value_cache[layer_idx] = v_tensor
+        receiver_config = OmniKVCacheConfig(
+            connector_config={"type": "mock"},
+            from_stage="sender",
+            stage_id="receiver",
+            need_recv_cache=True,
+            recv_timeout=1.0,
+        )
+        receiver_manager = OmniKVTransferManager(receiver_config)
+        receiver_manager._connector = connector  # Share the same mock connector instance
 
-        self.assertTrue(torch.allclose(current_cache.key_cache[0], layer_blocks["key_cache"][0]))
-        self.assertTrue(torch.allclose(current_cache.value_cache[1], layer_blocks["value_cache"][1]))
+        req = OmniDiffusionRequest(prompt="test_integ", request_id=self.req_id)
 
-    def test_integration(self):
-        """Simulate the flow from Sender -> Connector (Dict) -> Receiver."""
-        if GPUARModelRunner is object or BagelPipeline is object:
-            self.skipTest("vLLM not installed")
+        # Receive
+        success = receiver_manager.receive_kv_cache(req)
 
-        # 1. Sender (Extraction)
-        runner_test_result = self.test_sender_extraction_logic()  # Get KVCacheTransferData
-
-        # 2. Connector (Serialize/Deserialize Simulation)
-        # KVCacheTransferData has to_dict
-        data_dict = runner_test_result.to_dict()
-
-        # 3. Receiver (Request Setup)
-        req = OmniDiffusionRequest(prompt="integration_test")
-        req.past_key_values = data_dict["layer_blocks"]
-        req.kv_metadata = data_dict["metadata"]
-
-        # 4. Receiver (Injection Simulation)
-        # Use the logic verification again
-        pass
+        # Verify
+        self.assertTrue(success)
+        self.assertIsNotNone(req.past_key_values)
+        self.assertEqual(req.kv_metadata["seq_len"], 10)
 
 
 if __name__ == "__main__":
