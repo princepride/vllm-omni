@@ -177,6 +177,20 @@ class TestKVFlow(unittest.TestCase):
         self.assertIsNotNone(req.past_key_values)
         self.assertEqual(req.kv_metadata["seq_len"], 10)
 
+    def test_manager_extraction_no_connector(self):
+        """Test extraction when connector is unavailable (should still return IDs)."""
+        manager = OmniKVTransferManager(self.config)
+        # Force connector to be None
+        manager._connector = None
+        manager.config.connector_config = None
+        finished_reqs = {self.req_id: {"block_ids": [1, 2], "seq_len": 10}}
+
+        processed = manager.handle_finished_requests_kv_transfer(
+            finished_reqs, kv_caches=[], block_size=self.block_size, cache_dtype="float32"
+        )
+
+        self.assertIn(self.req_id, processed)
+
 
 if __name__ == "__main__":
     unittest.main()

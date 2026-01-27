@@ -170,8 +170,12 @@ class OmniKVTransferManager:
         Returns:
             List of request IDs that were processed
         """
-        if not finished_reqs or not self.connector:
+        if not finished_reqs:
             return []
+
+        if not self.connector:
+            logger.warning("No connector available, skipping KV transfer but freeing resources")
+            return list(finished_reqs.keys())
 
         logger.debug(f"Processing KV transfer for {len(finished_reqs)} requests")
 
