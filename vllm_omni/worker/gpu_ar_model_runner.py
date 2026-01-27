@@ -287,7 +287,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 aux_hidden_states = None
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
-
             if multimodal_outputs is not None:
                 keys_or_type = (
                     list(multimodal_outputs.keys())
