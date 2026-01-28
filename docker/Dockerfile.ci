@@ -20,18 +20,22 @@ COPY . .
 #   - VLLM_WHEEL_URL (explicit wheel)
 ARG VLLM_NIGHTLY_INDEX_URL=
 ARG VLLM_WHEEL_URL=
+ARG VLLM_GIT_REF=706f123b23b75097da9a3f51ce538bd784fdc75b
 
 RUN set -eux; \
     PY="$(python3 -c 'import sys; print(sys.executable)')"; \
-    uv pip uninstall --python "$PY" -y vllm || true; \
+    uv pip uninstall --python "$PY" vllm || true; \
     if [ -n "$VLLM_WHEEL_URL" ]; then \
       uv pip install --python "$PY" --no-cache-dir "$VLLM_WHEEL_URL"; \
     elif [ -n "$VLLM_NIGHTLY_INDEX_URL" ]; then \
       uv pip install --python "$PY" --no-cache-dir -U --pre \
         --extra-index-url "$VLLM_NIGHTLY_INDEX_URL" \
         vllm; \
+    elif [ -n "$VLLM_GIT_REF" ]; then \
+      uv pip install --python "$PY" --no-cache-dir \
+        "vllm @ git+https://github.com/vllm-project/vllm.git@${VLLM_GIT_REF}"; \
     else \
-      echo "ERROR: set VLLM_WHEEL_URL or VLLM_NIGHTLY_INDEX_URL"; \
+      echo "ERROR: set VLLM_WHEEL_URL, VLLM_NIGHTLY_INDEX_URL, or VLLM_GIT_REF"; \
       exit 1; \
     fi; \
     python3 -c "import vllm; print('vllm installed:', getattr(vllm,'__version__','<unknown>'))"
