@@ -70,8 +70,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
-        # Initialize KV cache manager (lazy creation of connector)
-        self.kv_transfer_manager = OmniKVTransferManager.from_model_config(self.model_config)
+        # Initialize KV cache manager (preserve vllm_config fallback behavior)
+        self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size

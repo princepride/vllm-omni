@@ -88,8 +88,6 @@ class TestKVFlow(unittest.TestCase):
         expected_shape = (self.seq_len, self.num_heads, self.head_dim)
         self.assertEqual(data["layer_blocks"]["key_cache"][0].shape, expected_shape)
 
-        return data  # Return for potential use
-
     def test_manager_reception(self):
         """Test reception and injection logic in OmniKVTransferManager."""
 

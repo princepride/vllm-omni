@@ -79,7 +79,7 @@ class OmniKVTransferManager:
     @classmethod
     def _create(cls, cfg: dict | None) -> "OmniKVTransferManager":
         """Create manager from raw config dict."""
-        if not cfg:
+        if not cfg or not isinstance(cfg, dict):
             return cls(OmniKVCacheConfig())
         return cls(
             OmniKVCacheConfig(
@@ -129,6 +129,10 @@ class OmniKVTransferManager:
     @property
     def connector(self):
         """Lazy initialization of connector."""
+        # If a previous initialization attempt failed, don't retry on every access.
+        if self._connector is False:
+            return None
+
         if self._connector is None:
             cfg = self.config.connector_config
             if cfg and (c_type := cfg.get("type")):
@@ -141,7 +145,10 @@ class OmniKVTransferManager:
                     import traceback
 
                     traceback.print_exc()
-        return self._connector
+                    # Cache failure sentinel to avoid repeated initialization attempts in hot paths.
+                    self._connector = False
+
+        return self._connector if self._connector else None
 
     def get_connector(self):
         """Get connector (compatibility wrapper for existing code)."""
@@ -172,6 +179,9 @@ class OmniKVTransferManager:
         """
         if not finished_reqs:
             return []
+
+        if not self.config.need_send_cache:
+            return list(finished_reqs.keys())
 
         if not self.connector:
             logger.warning("No connector available, skipping KV transfer but freeing resources")
@@ -274,8 +284,7 @@ class OmniKVTransferManager:
         """
         from_stage, to_stage = self.send_stages
         if not from_stage or not to_stage:
-            logger.warning("Transfer stages not configured, skipping transfer")
-            return
+            raise ValueError("Transfer stages (omni_from_stage, omni_to_stage) not configured")
 
         # Prepare data and transfer with retry
         data_dict = kv_data.to_dict()
