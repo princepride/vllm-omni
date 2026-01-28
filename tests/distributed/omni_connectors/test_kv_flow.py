@@ -14,15 +14,15 @@ class MockConnector:
     def __init__(self):
         self.store = {}
 
-    def put(self, from_stage, to_stage, request_id, data):
-        # The manager now passes full key as request_id (e.g., omni_stage1_to_stage2_kv_cache_req_test_1)
-        key = f"{from_stage}->{to_stage}:{request_id}"
+    def put(self, from_stage, to_stage, put_key, data):
+        # The manager now passes full key as put_key
+        key = f"{from_stage}->{to_stage}:{put_key}"
         self.store[key] = data
         return True, len(str(data)), None  # (success, size, metadata)
 
-    def get(self, from_stage, to_stage, request_id, metadata=None):
-        # The manager now passes full key as request_id
-        key = f"{from_stage}->{to_stage}:{request_id}"
+    def get(self, from_stage, to_stage, get_key, metadata=None):
+        # The manager now passes full key as get_key
+        key = f"{from_stage}->{to_stage}:{get_key}"
         if key in self.store:
             return self.store[key], len(str(self.store[key]))
         return None

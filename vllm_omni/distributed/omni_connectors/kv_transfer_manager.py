@@ -319,10 +319,10 @@ class OmniKVTransferManager:
         """
         for attempt in range(max_retries):
             try:
-                # Build the full key for connector (connector uses request_id param)
+                # Build the full key for connector
                 full_request_id = f"omni_{from_stage}_to_{to_stage}_{request_id}"
                 success, size, metadata = self.connector.put(
-                    from_stage=from_stage, to_stage=to_stage, request_id=full_request_id, data=data
+                    from_stage=from_stage, to_stage=to_stage, put_key=full_request_id, data=data
                 )
                 if success:
                     return success, size, metadata
@@ -373,12 +373,12 @@ class OmniKVTransferManager:
 
         try:
             while True:
-                # Build the full key for connector (connector uses request_id param)
+                # Build the full key for connector
                 full_request_id = f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"
                 result = self.connector.get(
                     from_stage=from_stage,
                     to_stage=to_stage,
-                    request_id=full_request_id,
+                    get_key=full_request_id,
                 )
                 if result:
                     data, size = result

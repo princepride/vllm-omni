@@ -46,18 +46,11 @@ class SharedMemoryConnector(OmniConnectorBase):
         to_stage: str,
         put_key: str | None = None,
         data: Any = None,
-        *,
-        request_id: str | None = None,
     ) -> tuple[bool, int, dict[str, Any] | None]:
-        # Support both put_key and request_id for compatibility
-        if request_id is not None:
-            put_key = request_id
-
         # Validate that we have a usable key for the SHM segment and metadata
         if not put_key:
             logger.error(
-                "SharedMemoryConnector.put called without a valid 'put_key' or 'request_id'; "
-                "cannot resolve shared memory key."
+                "SharedMemoryConnector.put called without a valid 'put_key'; cannot resolve shared memory key."
             )
             return False, 0, None
 
@@ -99,20 +92,12 @@ class SharedMemoryConnector(OmniConnectorBase):
         to_stage: str,
         get_key: str | None = None,
         metadata=None,
-        *,
-        request_id: str | None = None,
     ) -> tuple[Any, int] | None:
         from multiprocessing import shared_memory as shm_pkg
 
-        # Support both get_key and request_id for compatibility
-        if request_id is not None:
-            get_key = request_id
-
         # Validate that we have a resolved key before proceeding
         if not get_key:
-            logger.error(
-                "SharedMemoryConnector.get called without get_key or request_id; unable to resolve shared memory name."
-            )
+            logger.error("SharedMemoryConnector.get called without get_key; unable to resolve shared memory name.")
             return None, 0
 
         # Wait for shared memory to be available (with retry logic)

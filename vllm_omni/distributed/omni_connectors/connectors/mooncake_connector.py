@@ -78,15 +78,9 @@ class MooncakeConnector(OmniConnectorBase):
         to_stage: str,
         put_key: str | None = None,
         data: Any = None,
-        *,
-        request_id: str | None = None,
     ) -> tuple[bool, int, dict[str, Any] | None]:
-        # Support both put_key and request_id for compatibility
-        if request_id is not None:
-            put_key = request_id
-
         if not put_key:
-            logger.error("MooncakeConnector.put called without a valid 'put_key' or 'request_id'")
+            logger.error("MooncakeConnector.put called without a valid 'put_key'")
             return False, 0, None
 
         if not self.store:
@@ -121,15 +115,9 @@ class MooncakeConnector(OmniConnectorBase):
         to_stage: str,
         get_key: str | None = None,
         metadata: dict[str, Any] | None = None,
-        *,
-        request_id: str | None = None,
     ) -> tuple[Any, int] | None:
-        # Support both get_key and request_id for compatibility
-        if request_id is not None:
-            get_key = request_id
-
         if not get_key:
-            logger.error("MooncakeConnector.get called without a valid 'get_key' or 'request_id'")
+            logger.error("MooncakeConnector.get called without a valid 'get_key'")
             return None
 
         if not self.store:
