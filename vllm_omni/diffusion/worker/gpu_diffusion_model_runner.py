@@ -32,7 +32,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 logger = init_logger(__name__)
 
 
-class GPUDiffusionModelRunner:
+class DiffusionModelRunner:
     """
     Model runner that handles model loading and execution for diffusion models.
 
