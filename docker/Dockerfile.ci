@@ -11,7 +11,7 @@ RUN apt-get update && \
   rm -rf /var/lib/apt/lists/*
 
 # Install vLLM wheel for the specific commit
-RUN uv pip install --system -U vllm --extra-index-url https://wheels.vllm.ai/706f123b23b75097da9a3f51ce538bd784fdc75b
+RUN uv pip install --system --upgrade --force-reinstall vllm --extra-index-url https://wheels.vllm.ai/706f123b23b75097da9a3f51ce538bd784fdc75b
 # Install vllm-omni into the same uv-managed Python environment used by the base image.
 RUN uv pip install --system --no-cache-dir ".[dev]"
 RUN ln -sf /usr/bin/python3 /usr/bin/python
