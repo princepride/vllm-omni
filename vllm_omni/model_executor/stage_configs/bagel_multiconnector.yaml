@@ -81,8 +81,8 @@ runtime:
       name: MooncakeConnector
       extra:
         host: "127.0.0.1"
-        metadata_server: "http://127.0.0.1:8080/metadata"
-        master: "127.0.0.1:50051"
+        metadata_server: "http://10.90.67.86:8080/metadata"
+        master: "10.90.67.86:50051"
         segment: 512000000    # 512MB
         localbuf: 64000000     # 64MB
         proto: "tcp"

@@ -40,20 +40,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             "inline_writes": 0,
         }
 
-    def put(
-        self,
-        from_stage: str,
-        to_stage: str,
-        put_key: str | None = None,
-        data: Any = None,
-    ) -> tuple[bool, int, dict[str, Any] | None]:
-        # Validate that we have a usable key for the SHM segment and metadata
-        if not put_key:
-            logger.error(
-                "SharedMemoryConnector.put called without a valid 'put_key'; cannot resolve shared memory key."
-            )
-            return False, 0, None
-
+    def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         try:
             # Always serialize first to check size (and for SHM writing)
             # Note: For extremely large objects in "inline" mode (e.g. Ray),
@@ -86,19 +73,8 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
 
-    def get(
-        self,
-        from_stage: str,
-        to_stage: str,
-        get_key: str | None = None,
-        metadata=None,
-    ) -> tuple[Any, int] | None:
+    def get(self, from_stage: str, to_stage: str, get_key: str, metadata=None) -> tuple[Any, int] | None:
         from multiprocessing import shared_memory as shm_pkg
-
-        # Validate that we have a resolved key before proceeding
-        if not get_key:
-            logger.error("SharedMemoryConnector.get called without get_key; unable to resolve shared memory name.")
-            return None, 0
 
         # Wait for shared memory to be available (with retry logic)
         max_retries = 30
