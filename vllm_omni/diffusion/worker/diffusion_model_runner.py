@@ -20,6 +20,7 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
+from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -154,10 +155,6 @@ class DiffusionModelRunner:
         if len(req.prompts) == 0:
             raise ValueError("Cannot execute model with empty request list")
 
-        # TODO: dealing with first req for now
-        # req = reqs[0]
-
-        # [Omni] KV Cache Receiving Logic - use kv_cache_manager
         # The manager handles the check for need_recv_cache internally
         self.kv_transfer_manager.receive_kv_cache(req, target_device=getattr(self.pipeline, "device", None))
 
@@ -165,11 +162,19 @@ class DiffusionModelRunner:
             req.sampling_params.generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
 
         # Refresh cache context if needed
-        if self.cache_backend is not None and self.cache_backend.is_enabled():
+        if (
+            not getattr(req, "skip_cache_refresh", False)
+            and self.cache_backend is not None
+            and self.cache_backend.is_enabled()
+        ):
             self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
 
         with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
             with record_function("pipeline_forward"):
                 output = self.pipeline.forward(req)
+
+            # NOTE:
+            if self.od_config.cache_backend == "cache_dit" and self.od_config.enable_cache_dit_summary:
+                cache_summary(self.pipeline, details=True)
 
         return output
