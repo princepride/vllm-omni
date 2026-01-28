@@ -140,18 +140,18 @@ class GPUDiffusionModelRunner:
         return self.pipeline.load_weights(weights)
 
     @torch.inference_mode()
-    def execute_model(self, reqs: list[OmniDiffusionRequest]) -> DiffusionOutput:
+    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
 
         Args:
-            reqs: List of diffusion requests to process.
+            req: A diffusion request containing a list of prompts to process.
 
         Returns:
             DiffusionOutput with generated results.
         """
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        if not reqs or len(reqs) == 0:
+        if len(req.prompts) == 0:
             raise ValueError("Cannot execute model with empty request list")
 
         # TODO: dealing with first req for now
@@ -161,12 +161,12 @@ class GPUDiffusionModelRunner:
         if getattr(req, "need_kv_receive", False):
             self.kv_transfer_manager.receive_kv_cache(req, target_device=self.pipeline.device)
 
-        if req.generator is None and req.seed is not None:
-            req.generator = torch.Generator(device=self.device).manual_seed(req.seed)
+        if req.sampling_params.generator is None and req.sampling_params.seed is not None:
+            req.sampling_params.generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
 
         # Refresh cache context if needed
         if self.cache_backend is not None and self.cache_backend.is_enabled():
-            self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
+            self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
 
         with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
             with record_function("pipeline_forward"):
