@@ -421,7 +421,13 @@ class OmniKVTransferManager:
             layer_blocks = data["layer_blocks"]
             from types import SimpleNamespace
 
-            req.past_key_values = SimpleNamespace(**layer_blocks)
+            kv_obj = SimpleNamespace(**layer_blocks)
+            req.past_key_values = kv_obj
+
+            # [Omni] Also attach to sampling_params for BagelPipeline compatibility
+            # BagelPipeline checks req.sampling_params.past_key_values
+            if hasattr(req, "sampling_params") and req.sampling_params is not None:
+                req.sampling_params.past_key_values = kv_obj
 
         if "metadata" in data:
             req.kv_metadata = data["metadata"]
@@ -437,7 +443,12 @@ class OmniKVTransferManager:
         Returns:
             True if successful, False otherwise
         """
-        if not (request_id := getattr(req, "request_id", None)):
+        request_id = getattr(req, "request_id", None)
+        if not request_id and hasattr(req, "request_ids") and req.request_ids:
+            # Adaptation for new OmniDiffusionRequest which has list of prompts/ids
+            request_id = req.request_ids[0]
+
+        if not request_id:
             logger.warning("Request has no ID, cannot receive KV cache")
             return False
 

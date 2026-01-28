@@ -7,6 +7,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVCacheConfig,
     OmniKVTransferManager,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
 class MockConnector:
@@ -152,7 +153,13 @@ def test_manager_reception(kv_config, mock_connector, common_constants):
     store_key = f"stage1->stage2:{full_request_id}"
     mock_connector.store[store_key] = data_to_receive
 
-    req = OmniDiffusionRequest(prompt="test_recv", request_id=req_id)
+    req = OmniDiffusionRequest(
+        prompts=["test_recv"],
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_ids=[req_id],
+    )
+    # req.need_kv_receive = True # Implicitly handled by receive_kv_cache check? No, manager doesn't check it, runner does.
+    # But receive_kv_cache in manager checks request_id. Which we need to fix in manager next.
     success = manager.receive_kv_cache(req, target_device=torch.device("cpu"))
 
     assert success
@@ -206,7 +213,11 @@ def test_integration_flow(common_constants):
     receiver_manager = OmniKVTransferManager(receiver_config)
     receiver_manager._connector = connector  # Share the same mock connector instance
 
-    req = OmniDiffusionRequest(prompt="test_integ", request_id=req_id)
+    req = OmniDiffusionRequest(
+        prompts=["test_integ"],
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_ids=[req_id],
+    )
 
     # Receive
     success = receiver_manager.receive_kv_cache(req)

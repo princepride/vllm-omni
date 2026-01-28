@@ -72,7 +72,23 @@ class MooncakeConnector(OmniConnectorBase):
 
     # Use base class serialization methods for consistency
 
-    def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+    def put(
+        self,
+        from_stage: str,
+        to_stage: str,
+        put_key: str | None = None,
+        data: Any = None,
+        *,
+        request_id: str | None = None,
+    ) -> tuple[bool, int, dict[str, Any] | None]:
+        # Support both put_key and request_id for compatibility
+        if request_id is not None:
+            put_key = request_id
+
+        if not put_key:
+            logger.error("MooncakeConnector.put called without a valid 'put_key' or 'request_id'")
+            return False, 0, None
+
         if not self.store:
             logger.error("Store not initialized")
             return False, 0, None
@@ -100,8 +116,22 @@ class MooncakeConnector(OmniConnectorBase):
             return False, 0, None
 
     def get(
-        self, from_stage: str, to_stage: str, get_key: str, metadata: dict[str, Any] | None = None
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        *,
+        request_id: str | None = None,
     ) -> tuple[Any, int] | None:
+        # Support both get_key and request_id for compatibility
+        if request_id is not None:
+            get_key = request_id
+
+        if not get_key:
+            logger.error("MooncakeConnector.get called without a valid 'get_key' or 'request_id'")
+            return None
+
         if not self.store:
             logger.error("Store not initialized")
             return None

@@ -155,11 +155,11 @@ class GPUDiffusionModelRunner:
             raise ValueError("Cannot execute model with empty request list")
 
         # TODO: dealing with first req for now
-        req = reqs[0]
+        # req = reqs[0]
 
         # [Omni] KV Cache Receiving Logic - use kv_cache_manager
-        if getattr(req, "need_kv_receive", False):
-            self.kv_transfer_manager.receive_kv_cache(req, target_device=self.pipeline.device)
+        # The manager handles the check for need_recv_cache internally
+        self.kv_transfer_manager.receive_kv_cache(req, target_device=self.pipeline.device)
 
         if req.sampling_params.generator is None and req.sampling_params.seed is not None:
             req.sampling_params.generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
