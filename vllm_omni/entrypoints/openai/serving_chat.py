@@ -24,11 +24,8 @@ from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
     ConversationMessage,
-    apply_hf_chat_template,
-    apply_mistral_chat_template,
     get_history_tool_calls_cnt,
     make_tool_call_id,
-    resolve_chat_template_content_format,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -64,6 +61,15 @@ from vllm.entrypoints.utils import should_include_usage
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
+from vllm.renderers.hf import (
+    resolve_chat_template_content_format,
+)
+from vllm.renderers.hf import (
+    safe_apply_chat_template as apply_hf_chat_template,
+)
+from vllm.renderers.mistral import (
+    safe_apply_chat_template as apply_mistral_chat_template,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.mistral import (
@@ -390,6 +396,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tokenizer=tokenizer,
                 conversation=conversation,
                 model_config=model_config,
+                tokenize=False,
                 **_chat_template_kwargs,
             )
 
