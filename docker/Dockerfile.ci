@@ -11,7 +11,10 @@ RUN apt-get update && \
   rm -rf /var/lib/apt/lists/*
 
 # Install vLLM wheel for the specific commit
-RUN uv pip install --system --upgrade --force-reinstall vllm --extra-index-url https://wheels.vllm.ai/706f123b23b75097da9a3f51ce538bd784fdc75b
+# 正确的格式应该是直接下载 wheel 文件，而不是使用 extra-index-url
+RUN pip install https://wheels.vllm.ai/nightly/706f123b23b75097da9a3f51ce538bd784fdc75b/vllm-1.0.0.dev-cp310-cp310-manylinux1_x86_64.whl \
+    || pip install vllm --pre --extra-index-url https://wheels.vllm.ai/nightly
+
 # Install vllm-omni into the same uv-managed Python environment used by the base image.
 RUN uv pip install --system --no-cache-dir ".[dev]"
 RUN ln -sf /usr/bin/python3 /usr/bin/python
