@@ -351,13 +351,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         model_config = self.model_config
         tokenizer = renderer.get_tokenizer() if renderer is not None else None
 
-        resolved_content_format = resolve_chat_template_content_format(
-            chat_template,
-            tool_dicts,
-            chat_template_content_format,
-            tokenizer,
-            model_config=model_config,
-        )
+        if tokenizer is None or isinstance(tokenizer, MistralTokenizer):
+            resolved_content_format = (
+                chat_template_content_format if chat_template_content_format != "auto" else "string"
+            )
+        else:
+            resolved_content_format = resolve_chat_template_content_format(
+                chat_template,
+                tool_dicts,
+                chat_template_content_format,
+                tokenizer,
+                model_config=model_config,
+            )
         conversation, mm_data_future, mm_uuids = parse_chat_messages_futures(
             messages,
             model_config,
@@ -392,12 +397,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 **_chat_template_kwargs,
             )
         else:
+            hf_chat_template_kwargs = dict(_chat_template_kwargs)
+            hf_chat_template_kwargs.pop("tools", None)
+            hf_chat_template_kwargs.pop("chat_template", None)
             request_prompt = apply_hf_chat_template(
+                model_config=model_config,
                 tokenizer=tokenizer,
                 conversation=conversation,
-                model_config=model_config,
+                tools=tool_dicts,
+                chat_template=chat_template,
                 tokenize=False,
-                **_chat_template_kwargs,
+                **hf_chat_template_kwargs,
             )
 
         mm_data = await mm_data_future
