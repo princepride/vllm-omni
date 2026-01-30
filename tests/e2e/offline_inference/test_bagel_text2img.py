@@ -23,10 +23,10 @@ import socket
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 from PIL import Image
 
 from tests.utils import hardware_test
@@ -219,106 +219,31 @@ def _cleanup_mooncake_processes(timeout_secs: int = 5) -> None:
     time.sleep(1)
 
 
-def _build_mooncake_config(
-    host: str,
-    rpc_port: int,
-    http_port: int,
-    segment_size: int = 512000000,
-    localbuf_size: int = 64000000,
-) -> dict:
-    """Build Mooncake connector configuration.
+def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
+    """Load Mooncake config from YAML and substitute placeholders.
 
     Args:
         host: Mooncake host address.
         rpc_port: RPC port for Mooncake master.
         http_port: HTTP metadata server port.
-        segment_size: Segment size for Mooncake.
-        localbuf_size: Local buffer size for Mooncake.
 
     Returns:
-        Configuration dictionary for Mooncake-enabled Omni.
+        Path to the temporary config file with substituted values.
     """
-    return {
-        "stage_args": [
-            {
-                "stage_id": 0,
-                "stage_type": "llm",
-                "runtime": {"devices": "0", "max_batch_size": 1},
-                "engine_args": {
-                    "model_stage": "thinker",
-                    "model_arch": "BagelForConditionalGeneration",
-                    "worker_type": "ar",
-                    "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler",
-                    "gpu_memory_utilization": 0.35,
-                    "enforce_eager": True,
-                    "trust_remote_code": True,
-                    "engine_output_type": "text",
-                    "distributed_executor_backend": "mp",
-                    "enable_prefix_caching": False,
-                    "max_num_batched_tokens": 32768,
-                    "tensor_parallel_size": 1,
-                    "omni_kv_config": {
-                        "need_send_cache": True,
-                        "kv_transfer_criteria": {"type": "prefill_finished"},
-                    },
-                },
-                "final_output": True,
-                "final_output_type": "text",
-                "is_comprehension": True,
-                "default_sampling_params": {
-                    "temperature": 0.4,
-                    "top_p": 0.9,
-                    "top_k": 1,
-                    "max_tokens": 2048,
-                    "seed": 52,
-                    "detokenize": True,
-                    "repetition_penalty": 1.05,
-                },
-                "output_connectors": {"to_stage_1": "mooncake_connector"},
-            },
-            {
-                "stage_id": 1,
-                "stage_type": "diffusion",
-                "runtime": {"devices": "0", "max_batch_size": 1},
-                "engine_args": {
-                    "model_stage": "dit",
-                    "gpu_memory_utilization": 0.55,
-                    "enforce_eager": True,
-                    "trust_remote_code": True,
-                    "engine_output_type": "image",
-                    "distributed_executor_backend": "mp",
-                    "enable_prefix_caching": False,
-                    "max_num_batched_tokens": 32768,
-                    "tensor_parallel_size": 1,
-                    "omni_kv_config": {"need_recv_cache": True},
-                },
-                "engine_input_source": [0],
-                "final_output": True,
-                "final_output_type": "image",
-                "is_comprehension": False,
-                "default_sampling_params": {"seed": 52},
-                "input_connectors": {"from_stage_0": "mooncake_connector"},
-            },
-        ],
-        "runtime": {
-            "enabled": True,
-            "defaults": {"window_size": -1, "max_inflight": 1},
-            "connectors": {
-                "mooncake_connector": {
-                    "name": "MooncakeConnector",
-                    "extra": {
-                        "host": host,
-                        "metadata_server": f"http://{host}:{http_port}/metadata",
-                        "master": f"{host}:{rpc_port}",
-                        "segment": segment_size,
-                        "localbuf": localbuf_size,
-                        "proto": "tcp",
-                    },
-                },
-            },
-            "edges": [{"from": 0, "to": 1, "window_size": -1}],
-        },
-    }
+    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_mooncake_ci.yaml")
+    with open(config_path) as f:
+        config_content = f.read()
+
+    # Substitute placeholders
+    config_content = config_content.replace("${MOONCAKE_HOST}", host)
+    config_content = config_content.replace("${MOONCAKE_RPC_PORT}", str(rpc_port))
+    config_content = config_content.replace("${MOONCAKE_HTTP_PORT}", str(http_port))
+
+    # Write to temp file
+    temp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+    temp_file.write(config_content)
+    temp_file.close()
+    return temp_file.name
 
 
 @pytest.mark.core_model
@@ -356,15 +281,13 @@ def test_bagel_text2img_mooncake_connector():
         assert _wait_for_port(MOONCAKE_HOST, MOONCAKE_RPC_PORT), "mooncake_master failed to start"
 
         # Create temp config and initialize Omni
-        mooncake_config = _build_mooncake_config(
+        temp_config_file = _load_mooncake_config(
             host=MOONCAKE_HOST,
             rpc_port=MOONCAKE_RPC_PORT,
             http_port=MOONCAKE_HTTP_PORT,
         )
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as temp_config_file:
-            yaml.dump(mooncake_config, temp_config_file)
 
-        omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=temp_config_file.name)
+        omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=temp_config_file)
 
         generated_image = _generate_bagel_image(omni)
         _validate_pixels(generated_image)
@@ -374,7 +297,7 @@ def test_bagel_text2img_mooncake_connector():
             omni.close()
         if temp_config_file:
             try:
-                os.unlink(temp_config_file.name)
+                os.unlink(temp_config_file)
             except OSError:
                 pass
         if mooncake_master_proc:
