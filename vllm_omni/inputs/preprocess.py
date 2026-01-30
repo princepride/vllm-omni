@@ -7,12 +7,9 @@ from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalInputs, MultiModalUUIDDict
 
 from vllm_omni.inputs.data import (
-    OmniEmbedsInputs,
-    OmniEmbedsPrompt,
     OmniTextPrompt,
     OmniTokenInputs,
     OmniTokensPrompt,
-    embeds_inputs_omni,
     token_inputs_omni,
 )
 from vllm_omni.inputs.parse import parse_singleton_prompt_omni
@@ -126,8 +123,6 @@ class OmniInputPreprocessor(InputPreprocessor):
         """
         parsed = parse_singleton_prompt_omni(prompt)
 
-        if parsed["type"] == "embeds":
-            return self._process_embeds(parsed["content"])
         if parsed["type"] == "tokens":
             return self._process_tokens(
                 parsed["content"],
@@ -147,14 +142,3 @@ class OmniInputPreprocessor(InputPreprocessor):
             )
 
         assert_never(parsed)
-
-    def _process_embeds(self, parsed_content: OmniEmbedsPrompt) -> OmniEmbedsInputs:
-        inputs = super()._process_embeds(parsed_content)
-        additional_information = parsed_content.get("additional_information")
-        if additional_information is not None:
-            inputs = embeds_inputs_omni(
-                prompt_embeds=inputs["prompt_embeds"],
-                cache_salt=inputs.get("cache_salt"),
-                additional_information=additional_information,
-            )
-        return inputs
