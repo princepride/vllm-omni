@@ -274,7 +274,7 @@ steps:
     depends_on: image-build
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/model_executor/models/bagel/test_bagel_text2img.py
+      - pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py
     agents:
       queue: "mithril-h100-pool"
     plugins:
