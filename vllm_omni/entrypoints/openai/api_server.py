@@ -26,6 +26,7 @@ from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
+from vllm.entrypoints.openai.api_server import load_log_config
 from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -46,7 +47,6 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
-from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.openai.translations.serving import (
     OpenAIServingTranscription,
     OpenAIServingTranslation,
@@ -184,7 +184,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
     # Load logging config for uvicorn if specified
-    log_config = get_uvicorn_log_config(args)
+    log_config = load_log_config(getattr(args, "log_config_file", None))
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
@@ -200,8 +200,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         if not supported_tasks:
             supported_tasks = ("generate",)
 
-        app = build_openai_app(args, supported_tasks)
+        app = build_openai_app(args)
+        # OMNI: Remove upstream routes that we override with omni-specific handlers
         _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
+        _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
         app.include_router(router)
 
         await omni_init_app_state(engine_client, app.state, args)
@@ -457,10 +459,10 @@ async def omni_init_app_state(
                 tokenizer = await engine_client.get_tokenizer()
                 if tokenizer is not None:
                     # Initialize input_processor
+                    # OMNI: OmniInputProcessor creates tokenizer internally from vllm_config
                     if not hasattr(engine_client, "input_processor") or engine_client.input_processor is None:
                         engine_client.input_processor = OmniInputProcessor(
                             vllm_config=vllm_config,
-                            tokenizer=tokenizer,
                         )
                         logger.info("Initialized input_processor for AsyncOmni")
 
