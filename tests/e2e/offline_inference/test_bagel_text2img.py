@@ -94,13 +94,23 @@ def test_bagel_text2img_shared_memory_connector():
         omni.close()
 
 
+def _find_free_port() -> int:
+    """Find and return a free ephemeral port by binding to port 0."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
+
+
 def test_bagel_text2img_mooncake_connector():
     """Test Bagel text2img with Mooncake connector for inter-stage communication."""
 
     MOONCAKE_HOST = "127.0.0.1"
-    MOONCAKE_RPC_PORT = 50051
-    MOONCAKE_HTTP_PORT = 8080
-    MOONCAKE_METRICS_PORT = 9003
+    # Use dynamically allocated ephemeral ports to avoid conflicts
+    MOONCAKE_RPC_PORT = _find_free_port()
+    MOONCAKE_HTTP_PORT = _find_free_port()
+    MOONCAKE_METRICS_PORT = _find_free_port()
 
     def wait_for_port(host: str, port: int, timeout: int = 30) -> bool:
         """Wait for a port to become available."""
