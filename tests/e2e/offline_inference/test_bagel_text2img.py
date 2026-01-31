@@ -160,7 +160,8 @@ def _generate_bagel_image(omni: Omni, prompt: str = DEFAULT_PROMPT) -> Image.Ima
 @hardware_test(res={"cuda": "H100"})
 def test_bagel_text2img_shared_memory_connector():
     """Test Bagel text2img with shared memory connector."""
-    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT")
+    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path)
 
     try:
         generated_image = _generate_bagel_image(omni)
