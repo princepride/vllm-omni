@@ -12,7 +12,7 @@ stage_args:
       model_arch: BagelForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.65
+      gpu_memory_utilization: 0.62
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: text
@@ -76,7 +76,7 @@ runtime:
         host: "${MOONCAKE_HOST}"
         metadata_server: "http://${MOONCAKE_HOST}:${MOONCAKE_HTTP_PORT}/metadata"
         master: "${MOONCAKE_HOST}:${MOONCAKE_RPC_PORT}"
-        segment: 512000000
+        segment: 64000000
         localbuf: 64000000
         proto: tcp
   edges:
