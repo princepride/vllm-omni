@@ -7,6 +7,7 @@ import os
 # Image generation API imports
 import random
 import time
+import uuid
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -761,6 +762,25 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
 
+@router.get(
+    "/v1/audio/voices",
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+async def list_voices(raw_request: Request):
+    """List available TTS voices/speakers from the loaded model."""
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(message="The model does not support Speech API")
+
+    speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
+    return JSONResponse(content={"voices": speakers})
+
+
 # Health and Model endpoints for diffusion mode
 
 
@@ -995,7 +1015,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             # might produce blurry images in some environments.
             gen_params.seed = random.randint(0, 2**32 - 1)
 
-        request_id = f"img_gen_{int(time.time())}"
+        request_id = f"img_gen_{uuid.uuid4().hex}"
 
         logger.info(f"Generating {request.n} image(s) {size_str}")
 
