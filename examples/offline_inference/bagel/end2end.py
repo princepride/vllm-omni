@@ -155,10 +155,11 @@ def main():
                     final_prompt_text = f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
                     prompt_dict = {
                         "prompt": final_prompt_text,
-                        "multi_modal_data": {"image": loaded_image},
+                        "multi_modal_data": {"img2img": loaded_image},
                         "modalities": ["image"],
                     }
                     formatted_prompts.append(prompt_dict)
+
             else:
                 # text2img
                 final_prompt_text = f"<|im_start|>{p}<|im_end|>"
