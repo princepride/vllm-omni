@@ -53,10 +53,10 @@ _OMNI_MODELS = {
         "qwen3_tts",
         "Qwen3TTSModelForGeneration",
     ),
-    "OmniBagelForConditionalGeneration": (
+    "BagelForConditionalGeneration": (
         "bagel",
-        "omni_bagel",
-        "OmniBagelForConditionalGeneration",
+        "bagel",
+        "BagelForConditionalGeneration",
     ),
 }
 
