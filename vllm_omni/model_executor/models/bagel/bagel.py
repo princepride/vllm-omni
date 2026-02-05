@@ -1,9 +1,9 @@
 import torch
-from vllm.model_executor.models.bagel import BagelForConditionalGeneration as _BagelForConditionalGeneration
+from vllm.model_executor.models.bagel import BagelForConditionalGeneration
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 
 
-class BagelForConditionalGeneration(_BagelForConditionalGeneration):
+class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
     """
     Omni version of BagelForConditionalGeneration.
     Currently just inherits from the upstream vLLM version.

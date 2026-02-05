@@ -131,7 +131,7 @@ def main():
             }
         )
 
-        omni = Omni(model=model_name, **omni_kwargs)
+        omni = Omni(model=model_name, stage_init_timeout=300, **omni_kwargs)
 
         formatted_prompts = []
         for p in args.prompts:
