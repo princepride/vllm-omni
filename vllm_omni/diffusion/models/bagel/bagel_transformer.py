@@ -24,10 +24,13 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2RotaryEmbedding,
 )
 from transformers.utils import ModelOutput
+from vllm.logger import init_logger
 from vllm.transformers_utils.configs.bagel import BagelConfig
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+
+logger = init_logger(__name__)
 
 
 def patchify(imgs, p):
@@ -428,6 +431,26 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
         sin = sin.squeeze(0)
         packed_query_position_embeddings = (cos, sin)
 
+        # Log input shapes
+        if packed_query_sequence.numel() > 0:
+            num_vae = packed_vae_token_indexes.numel() if packed_vae_token_indexes is not None else 0
+            num_text = packed_text_indexes.numel() if packed_text_indexes is not None else 0
+            total_tokens = packed_query_sequence.shape[0]
+            num_vit = total_tokens - num_vae - num_text
+
+            logger.info(f"[Stage1 DiT] Forward packed_query_sequence shape: {packed_query_sequence.shape}")
+            logger.info(
+                f"[Stage1 DiT] Token counts - Total: {total_tokens}, VAE: {num_vae}, "
+                f"Text: {num_text}, ViT(inferred): {num_vit}"
+            )
+
+            if packed_vae_token_indexes is not None and packed_vae_token_indexes.numel() > 0:
+                logger.info(
+                    f"[Stage1 DiT] VAE indices range: "
+                    f"min={packed_vae_token_indexes.min()}, "
+                    f"max={packed_vae_token_indexes.max()}"
+                )
+
         extra_inputs = {}
         if self.use_moe:
             extra_inputs.update(mode=mode)
@@ -744,6 +767,11 @@ class Bagel(torch.nn.Module):
             is_causal=True,
             **extra_inputs,
         )
+        print(
+            f"[Diffusion forward_cache_update_text] "
+            f"packed_text_embedding: {packed_text_embedding.shape}, "
+            f"text_token_lens: {text_token_lens}"
+        )
         past_key_values = output.past_key_values
 
         return past_key_values
@@ -855,6 +883,17 @@ class Bagel(torch.nn.Module):
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
         packed_timestep_embeds = self.time_embedder(packed_timesteps)
         packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
+        print(
+            f"[Diffusion forward_cache_update_vae] "
+            f"padded_images: {padded_images.shape}, "
+            f"padded_latent: {padded_latent.shape}"
+        )
+        print(
+            f"[Diffusion forward_cache_update_vae] "
+            f"packed_latent (after vae2llm): {packed_latent.shape}, "
+            f"pos_embed: {packed_pos_embed.shape}, "
+            f"time_embed: {packed_timestep_embeds.shape}"
+        )
         if packed_latent.dtype != packed_sequence.dtype:
             packed_latent = packed_latent.to(packed_sequence.dtype)
         packed_sequence[packed_vae_token_indexes] = packed_latent
@@ -878,6 +917,11 @@ class Bagel(torch.nn.Module):
             update_past_key_values=True,
             is_causal=False,
             **extra_inputs,
+        )
+        print(
+            f"[Diffusion forward_cache_update_vae] "
+            f"packed_sequence (merged): {packed_sequence.shape}, "
+            f"packed_seqlens: {packed_seqlens}"
         )
         past_key_values = output.past_key_values
 
@@ -985,6 +1029,22 @@ class Bagel(torch.nn.Module):
         if self.use_moe:
             extra_inputs = {"mode": "und"}
 
+        print(
+            f"[Diffusion forward_cache_update_vit] "
+            f"packed_vit_tokens: {packed_vit_tokens.shape}, "
+            f"vit_token_seqlens: {vit_token_seqlens}"
+        )
+        print(
+            f"[Diffusion forward_cache_update_vit] "
+            f"packed_vit_token_embed (after connector+pos): "
+            f"{packed_vit_token_embed.shape}"
+        )
+        print(
+            f"[Diffusion forward_cache_update_vit] "
+            f"packed_sequence (merged): {packed_sequence.shape}, "
+            f"packed_seqlens: {packed_seqlens}"
+        )
+
         output = self.language_model.forward(
             packed_query_sequence=packed_sequence,
             query_lens=packed_seqlens,
@@ -1028,6 +1088,7 @@ class Bagel(torch.nn.Module):
             num_image_tokens = h * w
 
             packed_init_noises.append(torch.randn(num_image_tokens, self.latent_channel * self.latent_patch_size**2))
+
             packed_vae_token_indexes.extend(range(query_curr, query_curr + num_image_tokens))
             packed_seqlens.append(num_image_tokens + 2)
 

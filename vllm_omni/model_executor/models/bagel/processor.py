@@ -29,10 +29,18 @@ except ImportError:
 
 
 class OmniBagelProcessingInfo(BagelProcessingInfo):
-    """Extended processing info for Omni BAGEL with img2img support."""
+    """Extended processing info for Omni BAGEL with img2img support.
+
+    For img2img, we use TWO separate modalities:
+    - img2img_vae: VAE latent tokens
+    - img2img_vit: ViT image tokens
+
+    Each img2img input image becomes 2 virtual input items.
+    """
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        # Support both image (for img2text) and img2img modalities
+        # Support image (for img2text) and split img2img modalities
+        # img2img_vae and img2img_vit are separate modalities for the same input
         return {"image": None, "img2img": None}
 
     def get_mm_max_tokens_per_item(
@@ -44,25 +52,27 @@ class OmniBagelProcessingInfo(BagelProcessingInfo):
         # Max patches for ViT
         max_num_patches = hf_config.vit_max_num_patch_per_side**2
 
-        # For img2img, we need VAE tokens + ViT tokens
+        # For img2img, VAE and ViT are separate modalities
         # VAE tokens: (max_latent_size / latent_patch_size)^2
         latent_patch_size = getattr(hf_config, "latent_patch_size", 2)
-        max_latent_size = getattr(hf_config, "max_latent_size", 64)  # 64 matches checkpoint
+        max_latent_size = getattr(hf_config, "max_latent_size", 64)
         max_vae_tokens = (max_latent_size // latent_patch_size) ** 2
 
         return {
             "image": max_num_patches,
-            "img2img": max_vae_tokens + max_num_patches,  # VAE + ViT tokens
+            "img2img_vae": max_vae_tokens,  # VAE tokens only
+            "img2img_vit": max_num_patches,  # ViT tokens only
         }
 
 
 class OmniBagelDataParser(MultiModalDataParser):
-    """Custom data parser to support img2img modality."""
+    """Custom data parser to support img2img_vae and img2img_vit modalities."""
 
     def _get_subparsers(self):
         subparsers = super()._get_subparsers()
-        # img2img uses same parsing logic as image (returns Image object)
-        subparsers["img2img"] = self._parse_image_data
+        # Both img2img_vae and img2img_vit use image parsing logic
+        subparsers["img2img_vae"] = self._parse_image_data
+        subparsers["img2img_vit"] = self._parse_image_data
         return subparsers
 
 
@@ -70,11 +80,17 @@ class OmniBagelDummyInputsBuilder(BagelDummyInputsBuilder):
     """Extended dummy inputs builder for Omni BAGEL with img2img support."""
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        """Generate dummy text with placeholders for all modalities."""
+        """Generate dummy text with placeholders for all modalities.
+
+        For img2img, we have TWO placeholders per image:
+        - One for VAE (img2img_vae)
+        - One for ViT (img2img_vit)
+        """
         num_images = mm_counts.get("image", 0)
-        num_img2img = mm_counts.get("img2img", 0)
-        # Use a simple placeholder for each image/img2img
-        return "<|image_pad|>" * (num_images + num_img2img)
+        num_img2img_vae = mm_counts.get("img2img_vae", 0)
+        num_img2img_vit = mm_counts.get("img2img_vit", 0)
+        # Each placeholder type gets its own <|image_pad|>
+        return "<|image_pad|>" * (num_images + num_img2img_vae + num_img2img_vit)
 
     def get_dummy_mm_data(
         self,
@@ -82,26 +98,40 @@ class OmniBagelDummyInputsBuilder(BagelDummyInputsBuilder):
         mm_counts: Mapping[str, int],
         mm_options: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
-        """Generate dummy multimodal data for profiling."""
+        """Generate dummy multimodal data for profiling.
+
+        For img2img, we create dummy data for BOTH img2img_vae and img2img_vit modalities.
+        These share the same underlying image data.
+        """
 
         # Get standard image inputs from parent
         result = super().get_dummy_mm_data(seq_len, mm_counts, mm_options)
 
-        # Add img2img dummy inputs if requested
-        num_img2img = mm_counts.get("img2img", 0)
+        # Add img2img dummy inputs for both VAE and ViT modalities
+        # They share the same images, so count is the same
+        num_img2img_vae = mm_counts.get("img2img_vae", 0)
+        num_img2img_vit = mm_counts.get("img2img_vit", 0)
+
+        # Use the max of both (they should be equal in practice)
+        num_img2img = max(num_img2img_vae, num_img2img_vit)
+
         if num_img2img > 0:
             hf_config = self.info.get_hf_config()
             vit_config = hf_config.vit_config
             image_size = vit_config.image_size
 
-            img2img_overrides = mm_options.get("img2img") if mm_options else None
+            img2img_overrides = mm_options.get("img2img_vae") if mm_options else None
 
-            result["img2img"] = self._get_dummy_images(
+            dummy_images = self._get_dummy_images(
                 width=image_size,
                 height=image_size,
                 num_images=num_img2img,
                 overrides=img2img_overrides,
             )
+
+            # Both modalities share the same underlying images
+            result["img2img_vae"] = dummy_images
+            result["img2img_vit"] = dummy_images
 
         return result
 
@@ -127,22 +157,22 @@ class OmniBagelMultiModalProcessor(BagelMultiModalProcessor):
         """
         Extract processor data from multimodal items.
 
-        Override to keep img2img data separate from regular images.
-        When img2img items are parsed as ImageItems, their get_processor_data()
-        returns {"images": ...}, which would merge with regular images.
-        We need to preserve img2img under its own key.
+        Override to handle img2img_vae and img2img_vit modalities.
+        Both share the same underlying image data.
         """
         processor_data = dict[str, object]()
         passthrough_data = dict[str, object]()
 
         for modality, items in mm_items.items():
-            if modality == "img2img":
-                # Keep img2img separate - extract the data and use "img2img" key
-                item_data = items.get_processor_data()
-                # ImageItems.get_processor_data() returns {"images": ...}
-                if "images" in item_data:
-                    processor_data["img2img"] = item_data["images"]
-                passthrough_data.update(items.get_passthrough_data())
+            if modality in ("img2img_vae", "img2img_vit"):
+                # Keep img2img data separate - extract and use "img2img" key
+                # Both modalities share the same images, only process once
+                if "img2img" not in processor_data:
+                    item_data = items.get_processor_data()
+                    # ImageItems.get_processor_data() returns {"images": ...}
+                    if "images" in item_data:
+                        processor_data["img2img"] = item_data["images"]
+                    passthrough_data.update(items.get_passthrough_data())
             else:
                 processor_data.update(items.get_processor_data())
                 passthrough_data.update(items.get_passthrough_data())
@@ -157,12 +187,16 @@ class OmniBagelMultiModalProcessor(BagelMultiModalProcessor):
         tok_kwargs: Mapping[str, object],
     ) -> Any:  # Returns BatchFeature
         """
-        Custom implementation to handle img2img modality.
+        Custom implementation to handle img2img modalities.
 
-        Splits img2img data, processes it as 'images' to get pixel_values,
-        then renames to 'pixel_values_img2img'.
+        Processes img2img data and creates pixel_values for both VAE and ViT modalities.
+        - ViT: Uses standard HF processor (Siglip)
+        - VAE: Uses custom resize (1024x1024) and normalization ([-1, 1])
         """
         import sys
+
+        import numpy as np
+        import torch
 
         # Separate img2img data from other data
         img2img_data = mm_data.get("img2img")
@@ -172,29 +206,44 @@ class OmniBagelMultiModalProcessor(BagelMultiModalProcessor):
         features = super()._call_hf_processor(prompt, other_mm_data, mm_kwargs, tok_kwargs)
 
         if img2img_data is not None:
-            # Process img2img data using the same processor, but mapping to "images"
-            hf_processor = self.info.get_hf_processor(**mm_kwargs)
+            # --- VAE Processing (Custom) ---
+            # VAE expects: Resize to 1024x1024 -> ToTensor -> Normalize [-1, 1]
+            # Assuming img2img_data is a PIL Image or list of them
+            images = img2img_data if isinstance(img2img_data, list) else [img2img_data]
+            vae_pixel_values_list = []
 
-            # We call the processor with "images" argument
-            # vLLM's call_hf_processor wrapper handles the call
-            img2img_features = self.info.ctx.call_hf_processor(
-                hf_processor,
-                {"text": prompt, "images": img2img_data},
-                {**mm_kwargs, **tok_kwargs},
-            )
+            for img in images:
+                # Dynamic Resize: Long edge 1024, preserve aspect ratio, align to 16
+                MAX_SIZE = 1024
+                ALIGNMENT = 16
 
-            sys.stderr.write(f"[OmniBagel] img2img_features keys: {list(img2img_features.keys())}\n")
+                w, h = img.size
+                scale = MAX_SIZE / max(w, h)
+                new_w = int(w * scale)
+                new_h = int(h * scale)
 
-            # Extract and rename pixel_values
-            if "pixel_values" in img2img_features:
-                features["pixel_values_img2img"] = img2img_features["pixel_values"]
-                sys.stderr.write(
-                    f"[OmniBagel] Added pixel_values_img2img with shape: {features['pixel_values_img2img'].shape}\n"
-                )
-            else:
-                sys.stderr.write(
-                    f"[OmniBagel] pixel_values MISSING in img2img_features. Keys: {list(img2img_features.keys())}\n"
-                )
+                # Align to multiples of 16 (VAE stride 8 * patch size 2)
+                new_w = (new_w // ALIGNMENT) * ALIGNMENT
+                new_h = (new_h // ALIGNMENT) * ALIGNMENT
+
+                # Ensure at least one block
+                new_w = max(new_w, ALIGNMENT)
+                new_h = max(new_h, ALIGNMENT)
+
+                img_resized = img.resize((new_w, new_h))
+
+                # Convert to numpy/tensor and normalize to [-1, 1]
+                # PIL gives [0, 255]
+                img_arr = np.array(img_resized).astype(np.float32) / 255.0
+                img_arr = (img_arr - 0.5) * 2.0  # [0, 1] -> [-1, 1]
+                # HWC -> CHW
+                img_tensor = torch.from_numpy(img_arr).permute(2, 0, 1)
+                vae_pixel_values_list.append(img_tensor)
+
+            vae_pixel_values = torch.stack(vae_pixel_values_list)
+            features["pixel_values_img2img"] = vae_pixel_values
+
+            sys.stderr.write(f"[OmniBagel] Added pixel_values_img2img (VAE) shape: {vae_pixel_values.shape}\n")
 
         return features
 
@@ -204,7 +253,14 @@ class OmniBagelMultiModalProcessor(BagelMultiModalProcessor):
         hf_processor_mm_kwargs: Mapping[str, Any],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptReplacement]:
-        """Replace image placeholders with the correct number of tokens."""
+        """Replace image placeholders with the correct number of tokens.
+
+        For img2img, we use TWO separate modalities:
+        - img2img_vae: VAE latent tokens
+        - img2img_vit: ViT image tokens
+
+        Each modality has its own PromptReplacement.
+        """
         hf_config = self.info.get_hf_config()
         tokenizer = self.info.get_tokenizer()
 
@@ -217,20 +273,19 @@ class OmniBagelMultiModalProcessor(BagelMultiModalProcessor):
             num_tokens = hf_config.vit_max_num_patch_per_side**2
             return [image_token_id] * num_tokens
 
-        # For img2img: Check if VAE is enabled (enabled by default)
-        vae_enabled = getattr(hf_config, "load_vae_weights", True) and getattr(hf_config, "visual_gen", True)
+        # For img2img VAE: only VAE tokens
+        latent_patch_size = getattr(hf_config, "latent_patch_size", 2)
+        max_latent_size = getattr(hf_config, "max_latent_size", 64)
+        num_vae_tokens = (max_latent_size // latent_patch_size) ** 2
 
-        def get_replacement_img2img(item_idx: int):
-            num_vit_tokens = hf_config.vit_max_num_patch_per_side**2
-            if vae_enabled:
-                # VAE tokens + ViT tokens when VAE is enabled
-                latent_patch_size = getattr(hf_config, "latent_patch_size", 2)
-                max_latent_size = getattr(hf_config, "max_latent_size", 64)  # 64 matches checkpoint
-                num_vae_tokens = (max_latent_size // latent_patch_size) ** 2
-                return [image_token_id] * (num_vae_tokens + num_vit_tokens)
-            else:
-                # Only ViT tokens when VAE is disabled (fallback to img2text behavior)
-                return [image_token_id] * num_vit_tokens
+        def get_replacement_img2img_vae(item_idx: int):
+            return [image_token_id] * num_vae_tokens
+
+        # For img2img ViT: only ViT tokens
+        num_vit_tokens = hf_config.vit_max_num_patch_per_side**2
+
+        def get_replacement_img2img_vit(item_idx: int):
+            return [image_token_id] * num_vit_tokens
 
         replacements = [
             PromptReplacement(
@@ -240,16 +295,21 @@ class OmniBagelMultiModalProcessor(BagelMultiModalProcessor):
             ),
         ]
 
-        # Check if we have img2img inputs
-        if "img2img" in mm_items or "pixel_values_img2img" in hf_processor_mm_kwargs:
-            # Add img2img replacement
-            # We use a different placeholder token if available, otherwise same
-            img2img_token_id = tokenizer.get_vocab().get("<|img2img_pad|>", image_token_id)
+        # Check if we have img2img inputs (either modality)
+        if "img2img_vae" in mm_items or "img2img_vit" in mm_items or "pixel_values_img2img" in hf_processor_mm_kwargs:
+            # Add separate replacements for VAE and ViT
             replacements.append(
                 PromptReplacement(
-                    modality="img2img",
-                    target=[img2img_token_id],
-                    replacement=get_replacement_img2img,
+                    modality="img2img_vae",
+                    target=[image_token_id],
+                    replacement=get_replacement_img2img_vae,
+                )
+            )
+            replacements.append(
+                PromptReplacement(
+                    modality="img2img_vit",
+                    target=[image_token_id],
+                    replacement=get_replacement_img2img_vit,
                 )
             )
 
@@ -260,13 +320,22 @@ class OmniBagelMultiModalProcessor(BagelMultiModalProcessor):
         hf_inputs: Any,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        """Define field configs for both image and img2img modalities."""
+        """Define field configs for image and img2img modalities.
+
+        For img2img, we create TWO field entries from the same pixel_values_img2img:
+        - pixel_values_img2img -> img2img_vae
+        - pixel_values_img2img_vit -> img2img_vit (we duplicate the data)
+        """
         config = {
             "pixel_values": MultiModalFieldConfig.batched("image"),
         }
 
-        # Add img2img field if present
+        # Add img2img fields if present
+        # Both VAE and ViT modalities share the same underlying pixel data
         if "pixel_values_img2img" in hf_inputs:
-            config["pixel_values_img2img"] = MultiModalFieldConfig.batched("img2img")
+            # Use pixel_values_img2img for VAE modality
+            config["pixel_values_img2img"] = MultiModalFieldConfig.batched("img2img_vae")
+            # Duplicate for ViT modality - both will process the same images
+            config["pixel_values_img2img_vit"] = MultiModalFieldConfig.batched("img2img_vit")
 
         return config

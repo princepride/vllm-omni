@@ -152,10 +152,13 @@ def main():
             elif args.modality == "img2img":
                 if args.image_path:
                     loaded_image = Image.open(args.image_path).convert("RGB")
-                    final_prompt_text = f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                    # img2img_vae and img2img_vit each need their own placeholder
+                    final_prompt_text = (
+                        f"<|im_start|>user\n<|image_pad|><|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                    )
                     prompt_dict = {
                         "prompt": final_prompt_text,
-                        "multi_modal_data": {"img2img": loaded_image},
+                        "multi_modal_data": {"img2img_vae": loaded_image, "img2img_vit": loaded_image},
                         "modalities": ["image"],
                     }
                     formatted_prompts.append(prompt_dict)
@@ -167,11 +170,6 @@ def main():
                 formatted_prompts.append(prompt_dict)
 
         params_list = omni.default_sampling_params_list
-        if args.modality == "text2img":
-            params_list[0].max_tokens = 1  # type: ignore # The first stage is a SamplingParam (vllm)
-            if len(params_list) > 1:
-                params_list[1].num_inference_steps = args.steps  # type: ignore # The second stage is an OmniDiffusionSamplingParam
-
         omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 
     for i, req_output in enumerate(omni_outputs):

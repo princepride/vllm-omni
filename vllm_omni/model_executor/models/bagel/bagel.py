@@ -147,31 +147,40 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 logger.info("OmniBagelForConditionalGeneration: img2img disabled (visual_gen=False)")
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
-        """Parse multimodal inputs and separate by modality (img2text vs img2img)."""
+        """Parse multimodal inputs and separate by modality.
+
+        Supports:
+        - img2text: standard image understanding (ViT only)
+        - img2img_vae: VAE embeddings for img2img
+        - img2img_vit: ViT embeddings for img2img
+        """
         mm_input_by_modality = {}
 
         # Parse img2text (standard image understanding)
         if any(k in kwargs for k in ("pixel_values", "image_embeds")):
             mm_input_by_modality["img2text"] = self._parse_and_validate_image_input(**kwargs)
 
-        # Parse img2img - check for specific img2img keys
-        # We map pixel_values_img2img -> pixel_values for the validator
-        img2img_keys = {"pixel_values_img2img": "pixel_values", "image_embeds_img2img": "image_embeds"}
-        img2img_kwargs = {img2img_keys[k]: v for k, v in kwargs.items() if k in img2img_keys}
+        # Parse img2img_vae - maps pixel_values_img2img -> pixel_values
+        if "pixel_values_img2img" in kwargs:
+            vae_kwargs = kwargs.copy()
+            vae_kwargs["pixel_values"] = kwargs["pixel_values_img2img"]
+            mm_input_by_modality["img2img_vae"] = self._parse_and_validate_image_input(**vae_kwargs)
 
-        if img2img_kwargs:
-            combined_kwargs = kwargs.copy()
-            combined_kwargs.update(img2img_kwargs)
-            mm_input_by_modality["img2img"] = self._parse_and_validate_image_input(**combined_kwargs)
+        # Parse img2img_vit - maps pixel_values_img2img_vit -> pixel_values
+        if "pixel_values_img2img_vit" in kwargs:
+            vit_kwargs = kwargs.copy()
+            vit_kwargs["pixel_values"] = kwargs["pixel_values_img2img_vit"]
+            mm_input_by_modality["img2img_vit"] = self._parse_and_validate_image_input(**vit_kwargs)
 
         return mm_input_by_modality
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
         """
-        Compute multimodal embeddings for both img2text and img2img modalities.
+        Compute multimodal embeddings for all modalities.
 
         For img2text: Uses ViT + connector (standard image understanding)
-        For img2img: Uses VAE encoder + ViT, concatenating both embeddings
+        For img2img_vae: Uses VAE encoder (latent embeddings)
+        For img2img_vit: Uses ViT + connector (same as img2text)
         """
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
@@ -184,9 +193,12 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             if modality == "img2text":
                 image_embeddings = self._process_img2text_input(multimodal_input)
                 multimodal_embeddings += tuple(image_embeddings)
-            elif modality == "img2img":
-                img2img_embeddings = self._process_img2img_input(multimodal_input)
-                multimodal_embeddings += tuple(img2img_embeddings)
+            elif modality == "img2img_vae":
+                vae_embeddings = self._process_img2img_vae_input(multimodal_input)
+                multimodal_embeddings += tuple(vae_embeddings)
+            elif modality == "img2img_vit":
+                vit_embeddings = self._process_img2img_vit_input(multimodal_input)
+                multimodal_embeddings += tuple(vit_embeddings)
 
         return multimodal_embeddings
 
@@ -194,18 +206,21 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         """Process image for understanding task (ViT only)."""
         return self._process_image_input(multimodal_input)
 
-    def _process_img2img_input(self, multimodal_input) -> tuple[torch.Tensor, ...]:
+    def _process_img2img_vae_input(self, multimodal_input) -> tuple[torch.Tensor, ...]:
         """
-        Process image for img2img task (VAE + ViT combined).
+        Process image for img2img task - VAE embeddings only.
 
-        Returns embeddings in order: [VAE latent tokens, ViT tokens] per image.
-        This matches the diffusion pipeline's forward_cache_update_vae + forward_cache_update_vit.
+        Returns VAE latent embeddings for each image.
+        Each image -> one tensor of shape (num_vae_tokens, hidden_size)
         """
         if not self._img2img_enabled:
-            logger.warning("img2img not enabled, falling back to img2text processing")
-            return self._process_img2text_input(multimodal_input)
+            logger.warning("img2img not enabled, returning empty")
+            return ()
 
         pixel_values = multimodal_input["pixel_values"]
+        # Ensure pixel_values matches VAE dtype (e.g. bfloat16)
+        pixel_values = pixel_values.to(dtype=next(self.vae.parameters()).dtype)
+        logger.info(f"[Stage0 img2img_vae] Input pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
 
         # Handle potential extra batch dimension
         if pixel_values.ndim == 5:
@@ -219,6 +234,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         with torch.no_grad():
             # VAE expects input in range [-1, 1], pixel_values should already be normalized
             latent = self.vae.encode(pixel_values)  # (B, C, H, W)
+            logger.info(f"[Stage0 img2img_vae] VAE latent shape: {latent.shape}")
 
         # Patchify latent
         p = self.latent_patch_size
@@ -230,6 +246,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
         # Project to LLM hidden size
         vae_embeds = self.vae2llm(latent_patches)  # (B, num_patches, hidden_size)
+        logger.info(f"[Stage0 img2img_vae] VAE projected embeds shape: {vae_embeds.shape}")
 
         # Add position embeddings (2D grid positions)
         num_patches = h * w
@@ -250,19 +267,31 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
         vae_embeds = vae_embeds + pos_embeds + time_embeds
 
-        # ========== ViT Embeddings (reuse existing logic) ==========
-        vit_embeds_tuple = self._process_image_input(multimodal_input)
-
-        # ========== Concatenate VAE and ViT embeddings ==========
-        # For each image, concat: [VAE tokens, ViT tokens]
-        combined_embeddings = []
-        for i, vit_embed in enumerate(vit_embeds_tuple):
+        # Return VAE embeddings as separate items per image
+        vae_embeddings = []
+        for i in range(B):
             vae_embed = vae_embeds[i]  # (num_vae_tokens, hidden_size)
-            # Concatenate along sequence dimension
-            combined = torch.cat([vae_embed, vit_embed], dim=0)
-            combined_embeddings.append(combined)
+            vae_embeddings.append(vae_embed)
+            logger.info(f"[Stage0 img2img_vae] Image {i} final VAE embedding shape: {vae_embed.shape}")
 
-        return tuple(combined_embeddings)
+        logger.info(f"[Stage0 img2img_vae] Total VAE embeddings count: {len(vae_embeddings)}")
+        return tuple(vae_embeddings)
+
+    def _process_img2img_vit_input(self, multimodal_input) -> tuple[torch.Tensor, ...]:
+        """
+        Process image for img2img task - ViT embeddings only.
+
+        Returns ViT embeddings for each image (same as img2text processing).
+        Each image -> one tensor of shape (num_vit_tokens, hidden_size)
+        """
+        # ViT processing is the same as img2text
+        vit_embeddings = self._process_image_input(multimodal_input)
+
+        logger.info(f"[Stage0 img2img_vit] ViT embeds count: {len(vit_embeddings)}")
+        if len(vit_embeddings) > 0:
+            logger.info(f"[Stage0 img2img_vit] Image 0 ViT embedding shape: {vit_embeddings[0].shape}")
+
+        return vit_embeddings
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """
