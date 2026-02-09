@@ -153,7 +153,7 @@ def main():
                 if args.image_path:
                     loaded_image = Image.open(args.image_path).convert("RGB")
                     # final_prompt_text = f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
-                    final_prompt_text = f"<|fim_middle|>{p}"
+                    final_prompt_text = f"<|fim_middle|><|im_start|>{p}<|im_end|>"
                     prompt_dict = {
                         "prompt": final_prompt_text,
                         "multi_modal_data": {"img2img": loaded_image},

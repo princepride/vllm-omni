@@ -82,7 +82,7 @@ class OmniBagelProcessingInfo(BaseProcessingInfo):
     """Processing info for OmniBagelForConditionalGeneration."""
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None, "img2img": None}
+        return {"image": 1, "img2img": 1}
 
     def get_hf_processor(self, **kwargs: object):
         return self.ctx.get_hf_processor(OmniBagelProcessor, **kwargs)
@@ -171,24 +171,72 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ) -> "BatchFeature":
-        if "pixel_values_img2img" in mm_data:
-            # BagelProcessor expects 'images', not 'pixel_values_img2img'
-            # Rename it so the processor handles it correctly without passing to tokenizer as kwargs
+        has_image = "images" in mm_data
+        has_img2img = "pixel_values_img2img" in mm_data
+
+        # If we have both, we need to process separately and merge
+        if has_image and has_img2img:
+            outputs = BatchFeature()
+
+            # 1. Process standard images
+            img_data = dict(mm_data)
+            # Remove img2img data to avoid confusion, keep "images"
+            if "pixel_values_img2img" in img_data:
+                del img_data["pixel_values_img2img"]
+
+            # Force is_img2img=False for standard images
+            kwargs_img = dict(mm_kwargs)
+            kwargs_img["is_img2img"] = False
+
+            out_img = super()._call_hf_processor(prompt, img_data, kwargs_img, tok_kwargs)
+
+            if "pixel_values" in out_img:
+                outputs["pixel_values"] = out_img["pixel_values"]
+            for k, v in out_img.items():
+                if k != "pixel_values":
+                    outputs[k] = v
+
+            # 2. Process img2img
+            img2img_data = dict(mm_data)
+            # Remove standard images to avoid confusion
+            if "images" in img2img_data:
+                del img2img_data["images"]
+
+            # Rename for processor
+            img2img_data["images"] = img2img_data.pop("pixel_values_img2img")
+
+            kwargs_img2img = dict(mm_kwargs)
+            kwargs_img2img["is_img2img"] = True
+
+            out_img2img = super()._call_hf_processor(prompt, img2img_data, kwargs_img2img, tok_kwargs)
+
+            if "pixel_values" in out_img2img:
+                outputs["pixel_values_img2img"] = out_img2img["pixel_values"]
+
+            # Merge other keys (should be same for text)
+            for k, v in out_img2img.items():
+                if k not in outputs:
+                    outputs[k] = v
+
+            return outputs
+
+        elif has_img2img:
             mm_data = dict(mm_data)
             mm_data["images"] = mm_data.pop("pixel_values_img2img")
+            # If standard images were somehow present but not detected by "images" key check (unlikely), remove them?
+            # No, if has_image is false, "images" is not in mm_data.
 
-            # Pass flag to OmniBagelProcessor to skip resize
             mm_kwargs = dict(mm_kwargs)
             mm_kwargs["is_img2img"] = True
 
             outputs = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
 
-            # The processor returns 'pixel_values', rename back to 'pixel_values_img2img'
             if "pixel_values" in outputs:
                 outputs["pixel_values_img2img"] = outputs.pop("pixel_values")
 
             return outputs
 
+        # Standard image case or text only case
         return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
 
     def _hf_processor_applies_updates(
@@ -387,16 +435,32 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         packed_latent = torch.cat(packed_latent, dim=0)
 
         vae_position_ids = self.get_flattened_position_ids(
-            pixel_values.shape(1),
-            pixel_values.shape(2),
+            pixel_values.shape[2],
+            pixel_values.shape[3],
             self.latent_downsample,
             max_num_patches_per_side=self.max_latent_size,
         )
         packed_vae_position_ids.append(vae_position_ids)
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
-        packed_timestep_embeds = self.time_embedder(packed_timesteps)
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            packed_timestep_embeds = self.time_embedder(packed_timesteps.to(padded_latent))
         packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
-        return tuple(packed_latent, self._process_image_input(multimodal_input))
+        # Concatenate VAE latents and ViT embeddings along the sequence dimension
+        # Resize pixel_values for ViT
+        image_size = self.config.vit_config.image_size
+        vit_pixel_values = torch.nn.functional.interpolate(
+            pixel_values,
+            size=(image_size, image_size),
+            mode="bicubic",
+            align_corners=False,
+        )
+        vit_embeddings = self._process_image_input({"pixel_values": vit_pixel_values})
+        if isinstance(vit_embeddings, (list, tuple)):
+            vit_embeddings = vit_embeddings[0]
+
+        combined_embeddings = torch.cat([packed_latent, vit_embeddings], dim=0)
+        # Return as a list/tuple containing a single tensor for this single input item
+        return [combined_embeddings]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """
