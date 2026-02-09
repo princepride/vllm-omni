@@ -389,13 +389,8 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return None
-
-        # The result multimodal_embeddings is tuple of tensors, with each
-        # tensor correspoending to a multimodal data item (image or video).
         multimodal_embeddings: tuple[torch.Tensor, ...] = ()
 
-        # NOTE: It is important to iterate over the keys in this dictionary
-        # to preserve the order of the modalities.
         for modality in mm_input_by_modality:
             multimodal_input = mm_input_by_modality[modality]
             if modality == "img2text":
@@ -470,12 +465,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         to ensure all standard mappings (including ViT) are handled correctly.
         When VAE is enabled, we extend the loading logic to handle VAE weights.
         """
-        # if not self._img2img_enabled:
-        #     return super().load_weights(weights)
-
-        # Logic for when VAE is enabled
-        # We need to filter weights but KEEP VAE weights if present.
-        # And we must use the correct mapper for the base model.
 
         generation_keywords_to_skip = [
             "moe_gen",
@@ -512,29 +501,20 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                     tensor = tensor.reshape(out_channels, patch_size, patch_size, in_channels)
                     tensor = tensor.permute(0, 3, 1, 2).contiguous()
 
-            # Dynamic resizing for latent_pos_embed mismatch (e.g. 1024 vs 4096)
             if "latent_pos_embed.pos_embed" in mapped_name and tensor.ndim == 2:
                 npos, hdim = tensor.shape
                 current_param = self.latent_pos_embed.pos_embed
                 if current_param.shape != tensor.shape:
-                    # If shape mismatch, try resizing if it looks like a square grid change
                     side = isqrt(int(npos))
-                    # Verify it is a square grid and hidden dim matches
                     if side * side == int(npos) and hdim == current_param.shape[1]:
-                        # Resize in-place to keep the same Parameter object
                         current_param.data = current_param.data.new_empty((npos, hdim))
-
-                        # Update model bookkeeping
                         self.max_latent_size = int(side)
-                        # Also update the sub-module's attribute if it exists
                         if hasattr(self.latent_pos_embed, "max_num_patch_per_side"):
                             self.latent_pos_embed.max_num_patch_per_side = int(side)
 
             filtered_weights.append((mapped_name, tensor))
 
         # Use the parent's mapper for standard components
-        # VAE-related weights may not be in the main checkpoint (they're in ae.safetensors)
-        # Mark them as optional using ignore_unexpected_prefixes
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=["vit_pos_embed.pos_embed"],
