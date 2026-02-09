@@ -100,7 +100,7 @@ class BagelRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
-    def forward(self, x, position_ids):
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate cos/sin embeddings for given position ids.
 
         Args:
