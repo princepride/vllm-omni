@@ -364,6 +364,15 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         self.latent_pos_embed = PositionEmbedding(self.max_latent_size, hidden_size)
         self.time_embedder = TimestepEmbedder(hidden_size)
 
+    def get_kv_transfer_metadata(self, req_id: str) -> dict[str, Any] | None:
+        """Return custom metadata for KV transfer.
+
+        This method is called by KVTransferManager when transferring KV cache.
+        """
+        # [Omni] In the future, this should retrieve actual metadata from the model state based on req_id.
+        # For now, we return a fixed value for testing purposes as requested.
+        return {"ropes": [11]}
+
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
         mm_input_by_modality = {}
 

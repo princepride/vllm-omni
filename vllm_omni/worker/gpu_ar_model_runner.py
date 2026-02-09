@@ -100,6 +100,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             block_size=self.cache_config.block_size,
             cache_dtype=str(self.cache_config.cache_dtype),
             request_id_resolver=self._resolve_global_request_id,
+            model=self.model,
         )
 
         if self.vllm_config.model_config.enable_return_routed_experts:

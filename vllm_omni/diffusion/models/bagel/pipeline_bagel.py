@@ -319,7 +319,10 @@ class BagelPipeline(nn.Module):
             # Assuming injected_kv is compatible and has key_cache[0]
             seq_len = injected_kv.key_cache[0].shape[0]
             gen_context["kv_lens"] = [seq_len]
-            gen_context["ropes"] = [seq_len]
+            if req.sampling_params.kv_metadata and "ropes" in req.sampling_params.kv_metadata:
+                gen_context["ropes"] = req.sampling_params.kv_metadata["ropes"]
+            else:
+                gen_context["ropes"] = [seq_len]
 
         else:
             image_input = (
