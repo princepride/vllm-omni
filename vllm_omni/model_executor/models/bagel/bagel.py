@@ -29,6 +29,7 @@ from vllm.multimodal.processing import (
     BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptReplacement,
+    PromptUpdateDetails,
 )
 from vllm.transformers_utils.processors.bagel import BagelProcessor
 
@@ -282,13 +283,14 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
             # For BAGEL, calculate number of tokens based on max patch size
             num_vit_tokens = hf_config.vit_max_num_patch_per_side**2
             # Use the image token ID from tokenizer
-            return (
-                [img2img_vision_start]
+            return PromptUpdateDetails.select_token_id(
+                seq=[img2img_vision_start]
                 + [img2img_token_id] * num_vae_tokens
                 + [img2img_vision_end]
                 + [img2img_vision_start]
                 + [img2img_token_id] * num_vit_tokens
-                + [img2img_vision_end]
+                + [img2img_vision_end],
+                embed_token_id=img2img_token_id,
             )
 
         return [
