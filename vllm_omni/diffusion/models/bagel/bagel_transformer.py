@@ -8,6 +8,7 @@
 # available at https://github.com/huggingface/transformers/blob/main/LICENSE.
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,12 +19,16 @@ from torch.nn.attention.flex_attention import flex_attention
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention,
-    Qwen2MLP,
     Qwen2PreTrainedModel,
-    Qwen2RMSNorm,
-    Qwen2RotaryEmbedding,
 )
 from transformers.utils import ModelOutput
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs.bagel import BagelConfig
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
@@ -64,6 +69,70 @@ class MLPconnector(nn.Module):
 
     def forward(self, x):
         return self.fc2(self.act(self.fc1(x)))
+
+
+class BagelRotaryEmbedding(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        dim = config.hidden_size // config.num_attention_heads
+        inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        """Generate cos/sin embeddings for given position ids.
+
+        Args:
+            x: Input tensor (only used for dtype inference).
+            position_ids: Position indices, shape (batch_size, seq_len).
+
+        Returns:
+            cos, sin: Rotary embeddings, each of shape (batch_size, seq_len, dim).
+        """
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos()
+        sin = emb.sin()
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+class BagelMLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str = "silu",
+    ) -> None:
+        super().__init__()
+        self.gate_proj = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            gather_output=False,
+        )
+        self.up_proj = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            gather_output=False,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+        )
+        if hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported.")
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x):
+        gate, _ = self.gate_proj(x)
+        up, _ = self.up_proj(x)
+        x = self.act_fn(gate) * up
+        x, _ = self.down_proj(x)
+        return x
 
 
 torch._dynamo.config.cache_size_limit = 512
@@ -160,10 +229,10 @@ class BaseNavitOutputWithPast(ModelOutput):
 class PackedAttentionMoT(Qwen2Attention):
     def __init__(self, config, layer_idx: int | None = None):
         super().__init__(config, layer_idx)
-        self.q_norm = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.q_norm_moe_gen = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm_moe_gen = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm_moe_gen = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm_moe_gen = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -305,12 +374,12 @@ class Qwen2MoTDecoderLayer(nn.Module):
 
         self.self_attn = attn_module(config, layer_idx)
 
-        self.mlp = Qwen2MLP(config)
-        self.mlp_moe_gen = Qwen2MLP(config)
-        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm_moe_gen = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm_moe_gen = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = BagelMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
+        self.mlp_moe_gen = BagelMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -391,7 +460,7 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
         self.vocab_size = config.vocab_size
         self.use_moe = "Mo" in config.layer_module
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [
                 Qwen2MoTDecoderLayer(config, layer_idx, attn_module=PackedAttentionMoT)
@@ -399,10 +468,10 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
             ]
         )
 
-        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         if self.use_moe:
-            self.norm_moe_gen = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen2RotaryEmbedding(config=config)
+            self.norm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = BagelRotaryEmbedding(config=config)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -527,6 +596,27 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
         )
 
         return outputs
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights for vLLM parallel layers.
+
+        Parameter names (gate_proj, up_proj, down_proj, etc.) are kept
+        identical to the HF checkpoint, so no name remapping is needed.
+        vLLM parallel layers attach a ``weight_loader`` to each parameter
+        that handles TP sharding automatically.
+        """
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            param = params_dict.get(name)
+            if param is None:
+                continue
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
+        return loaded_params
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
