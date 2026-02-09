@@ -402,7 +402,7 @@ class BagelPipeline(nn.Module):
             )
             # Fail fast with a clear error instead of CUDA gather OOB.
             max_tid = int(generation_input["packed_text_ids"].max().item())
-            emb_n = int(self.language_model.model.embed_tokens.weight.shape[0])
+            emb_n = int(self.language_model.vocab_size)
             if max_tid >= emb_n:
                 raise ValueError(
                     "Tokenizer/model vocab mismatch: max token id "
@@ -438,7 +438,7 @@ class BagelPipeline(nn.Module):
         )
         # Fail fast for special tokens used by the image path as well.
         max_tid_img = int(generation_input["packed_text_ids"].max().item())
-        emb_n = int(self.language_model.model.embed_tokens.weight.shape[0])
+        emb_n = int(self.language_model.vocab_size)
         if max_tid_img >= emb_n:
             raise ValueError(
                 "Tokenizer/model vocab mismatch (image path): max token id "
@@ -482,6 +482,8 @@ class BagelPipeline(nn.Module):
         state = self.state_dict()
         allowed = set(state.keys())
         shapes = {k: tuple(v.shape) for k, v in state.items()}
+
+        tp_aware_params = {name for name, p in self.named_parameters() if hasattr(p, "weight_loader")}
 
         def _normalize_name(name: str) -> str:
             # Common wrappers/prefixes in checkpoints.
@@ -536,7 +538,7 @@ class BagelPipeline(nn.Module):
                 for cand in _iter_candidate_names(name):
                     if cand in allowed:
                         # Only accept if tensor shape matches target param/buffer shape.
-                        if tuple(tensor.shape) == shapes.get(cand):
+                        if tuple(tensor.shape) == shapes.get(cand) or cand in tp_aware_params:
                             picked = cand
                             break
                         else:
