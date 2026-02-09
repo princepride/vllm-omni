@@ -72,10 +72,31 @@ class MLPconnector(nn.Module):
 
 
 class BagelRotaryEmbedding(nn.Module):
+    """Standalone rotary embedding that generates cos/sin from position ids.
+
+    Replaces HuggingFace's Qwen2RotaryEmbedding while preserving full
+    ``rope_scaling`` support.  When ``config.rope_scaling`` is set (e.g.
+    linear, dynamic-NTK, YaRN, …), we delegate the ``inv_freq`` /
+    ``attention_scaling`` computation to HF's ``ROPE_INIT_FUNCTIONS`` so
+    that the frequency basis and scaling factor are identical to the
+    original checkpoint.  This module has no learnable parameters.
+    """
+
     def __init__(self, config):
         super().__init__()
-        dim = config.hidden_size // config.num_attention_heads
-        inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+
+        if config.rope_scaling is not None:
+            # Delegate to HF's rope-scaling helpers for non-default types.
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+            rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
+            rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+            inv_freq, self.attention_scaling = rope_init_fn(config, device=None)
+        else:
+            dim = config.hidden_size // config.num_attention_heads
+            inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            self.attention_scaling = 1.0
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     @torch.no_grad()
@@ -93,8 +114,8 @@ class BagelRotaryEmbedding(nn.Module):
         position_ids_expanded = position_ids[:, None, :].float()
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
         emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos()
-        sin = emb.sin()
+        cos = emb.cos() * self.attention_scaling
+        sin = emb.sin() * self.attention_scaling
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
