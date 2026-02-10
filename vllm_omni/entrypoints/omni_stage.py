@@ -49,6 +49,10 @@ from vllm_omni.entrypoints.stage_utils import (
     maybe_dump_to_shm,
     set_stage_devices,
 )
+from vllm_omni.entrypoints.zmq_utils import (
+    ZmqQueue,
+    create_zmq_queue,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams, OmniTokensPrompt
 from vllm_omni.metrics import count_tokens_from_outputs
 from vllm_omni.outputs import OmniRequestOutput
@@ -276,8 +280,8 @@ class OmniStage:
         except TypeError as error:
             raise TypeError(f"Invalid default_sampling_params for stage {self.stage_id}: {error}") from error
         # Runtime orchestration state (added)
-        self._in_q: mp.Queue | None = None
-        self._out_q: mp.Queue | None = None
+        self._in_q: mp.queues.Queue | ZmqQueue | str | None = None
+        self._out_q: mp.queues.Queue | ZmqQueue | str | None = None
         self._proc: mp.Process | None = None
         self._shm_threshold_bytes: int = 65536
         self._stage_init_timeout: int = stage_init_timeout
@@ -339,12 +343,16 @@ class OmniStage:
         self.engine_outputs = engine_outputs
 
     # ----------------- New Orchestration APIs -----------------
-    def attach_queues(self, in_q: mp.Queue, out_q: mp.Queue) -> None:
+    def attach_queues(
+        self,
+        in_q: mp.queues.Queue | ZmqQueue | str | None,
+        out_q: mp.queues.Queue | ZmqQueue | str | None,
+    ) -> None:
         """Attach input and output queues for IPC communication.
 
         Args:
-            in_q: Input queue for receiving tasks from orchestrator
-            out_q: Output queue for sending results to orchestrator
+            in_q: Input queue for receiving tasks from orchestrator (queue object or endpoint string)
+            out_q: Output queue for sending results to orchestrator (queue object or endpoint string)
         """
         self._in_q = in_q
         self._out_q = out_q
@@ -420,10 +428,15 @@ class OmniStage:
         else:
             self._shm_threshold_bytes = shm_threshold_bytes
 
+        ignore_runtime_config = kwargs.get("ignore_runtime_config", False)
+
         ctx = ctx or mp.get_context("spawn")
         # Prepare lightweight dict config for worker
         engine_args = _to_dict(self.engine_args)
-        runtime_cfg = _to_dict(getattr(self.stage_config, "runtime", {}))
+        if ignore_runtime_config:
+            runtime_cfg = {}
+        else:
+            runtime_cfg = _to_dict(getattr(self.stage_config, "runtime", {}))
         stage_payload: dict[str, Any] = {
             "stage_id": self.stage_id,
             "engine_args": engine_args,
@@ -432,6 +445,8 @@ class OmniStage:
             "connectors_config": connectors_config or {},
             "stage_type": self.stage_type,
             "engine_input_source": self.engine_input_source,
+            "final_output": self.final_output,
+            "final_output_type": self.final_output_type,
         }
         try:
             old_env = os.environ.get("VLLM_LOGGING_PREFIX")
@@ -443,9 +458,10 @@ class OmniStage:
                         _stage_worker_async_entry,
                         ray_placement_group,
                         self.stage_id,
-                        self,
                         model=model,
                         stage_payload=stage_payload,
+                        in_q=self._in_q,
+                        out_q=self._out_q,
                         batch_timeout=batch_timeout,
                         stage_init_timeout=self._stage_init_timeout,
                     )
@@ -466,9 +482,10 @@ class OmniStage:
                     self._proc = ctx.Process(
                         target=_stage_worker_async_entry,
                         args=(
-                            self,
                             model,
                             stage_payload,
+                            self._in_q.endpoint if isinstance(self._in_q, ZmqQueue) else self._in_q,
+                            self._out_q.endpoint if isinstance(self._out_q, ZmqQueue) else self._out_q,
                             batch_timeout,
                             self._stage_init_timeout,
                         ),
@@ -479,8 +496,8 @@ class OmniStage:
                         args=(
                             model,
                             stage_payload,
-                            self._in_q,
-                            self._out_q,
+                            self._in_q.endpoint if isinstance(self._in_q, ZmqQueue) else self._in_q,
+                            self._out_q.endpoint if isinstance(self._out_q, ZmqQueue) else self._out_q,
                             batch_timeout,
                             self._stage_init_timeout,
                         ),
@@ -504,6 +521,13 @@ class OmniStage:
                 self._in_q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
                 logger.warning("Failed to send shutdown to in_q: %s", e)
+            close_fn = getattr(self._in_q, "close", None)
+            if callable(close_fn):
+                close_fn()
+        if self._out_q is not None:
+            close_fn = getattr(self._out_q, "close", None)
+            if callable(close_fn):
+                close_fn()
 
         if hasattr(self, "_ray_actor") and self._ray_actor:
             kill_ray_actor(self._ray_actor)
@@ -626,8 +650,8 @@ class OmniStage:
 def _stage_worker(
     model: str,
     stage_payload: dict[str, Any],
-    in_q: mp.Queue,
-    out_q: mp.Queue,
+    in_q: mp.queues.Queue | ZmqQueue | str,
+    out_q: mp.queues.Queue | ZmqQueue | str,
     batch_timeout: int = 10,
     stage_init_timeout: int = 300,
 ) -> None:
@@ -637,6 +661,8 @@ def _stage_worker(
     import multiprocessing as _mp
     import os as _os
     import time as _time
+
+    import zmq
 
     from vllm_omni.plugins import load_omni_general_plugins
 
@@ -663,6 +689,15 @@ def _stage_worker(
 
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
+
+    # Resolve ZMQ queue endpoints if needed
+    zmq_ctx = None
+    if isinstance(in_q, str) or isinstance(out_q, str):
+        zmq_ctx = zmq.Context()
+        if isinstance(in_q, str):
+            in_q = create_zmq_queue(zmq_ctx, in_q, zmq.PULL)
+        if isinstance(out_q, str):
+            out_q = create_zmq_queue(zmq_ctx, out_q, zmq.PUSH)
 
     # Aggregates for running average
     _agg_total_tokens = 0
@@ -998,19 +1033,21 @@ def _stage_worker(
 
 
 def _stage_worker_async_entry(
-    omni_stage: OmniStage,
     model: str,
     stage_payload: dict[str, Any],
+    in_q: mp.queues.Queue | ZmqQueue | str,
+    out_q: mp.queues.Queue | ZmqQueue | str,
     batch_timeout: int = 10,
     stage_init_timeout: int = 300,
 ) -> None:
-    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, batch_timeout, stage_init_timeout))
+    asyncio.run(_stage_worker_async(model, stage_payload, in_q, out_q, batch_timeout, stage_init_timeout))
 
 
 async def _stage_worker_async(
-    omni_stage: OmniStage,
     model: str,
     stage_payload: dict[str, Any],
+    in_q: mp.queues.Queue | ZmqQueue | str,
+    out_q: mp.queues.Queue | ZmqQueue | str,
     batch_timeout: int = 10,
     stage_init_timeout: int = 300,
 ) -> None:
@@ -1019,6 +1056,8 @@ async def _stage_worker_async(
     import multiprocessing as _mp
     import os as _os
     import time as _time
+
+    import zmq
 
     from vllm_omni.plugins import load_omni_general_plugins
 
@@ -1039,12 +1078,20 @@ async def _stage_worker_async(
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type = stage_payload.get("stage_type", "llm")
+    final_output = stage_payload.get("final_output", False)
+    final_output_type = stage_payload.get("final_output_type", None)
 
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
 
-    in_q = omni_stage._in_q
-    out_q = omni_stage._out_q
+    # Resolve ZMQ queue endpoints if needed
+    zmq_ctx = None
+    if isinstance(in_q, str) or isinstance(out_q, str):
+        zmq_ctx = zmq.Context()
+        if isinstance(in_q, str):
+            in_q = create_zmq_queue(zmq_ctx, in_q, zmq.PULL)
+        if isinstance(out_q, str):
+            out_q = create_zmq_queue(zmq_ctx, out_q, zmq.PUSH)
 
     # Aggregates for running average
     _agg_total_tokens = 0
@@ -1117,14 +1164,13 @@ async def _stage_worker_async(
                 usage_context=usage_context,
                 engine_args=omni_engine_args,
             )
-    omni_stage.set_async_engine(stage_engine)
-    if hasattr(omni_stage.async_engine, "log_stats") and omni_stage.async_engine.log_stats:
+    if hasattr(stage_engine, "log_stats") and stage_engine.log_stats:
 
         async def _force_log():
             try:
                 while True:
                     await asyncio.sleep(10.0)
-                    await omni_stage.async_engine.do_log_stats()
+                    await stage_engine.do_log_stats()
             except asyncio.CancelledError:
                 pass
 
@@ -1321,7 +1367,7 @@ async def _stage_worker_async(
             batch_request_ids, batch_request_outputs, _gen_ms_list, batch_metrics
         ):
             try:
-                r_outputs = [output_strip(output, omni_stage)]
+                r_outputs = [output_strip(output, final_output, final_output_type)]
                 use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
                 if use_shm:
                     out_q.put(
@@ -1407,7 +1453,7 @@ def make_stage_stats(_agg_total_tokens: int, _agg_total_gen_time_ms: float):
     return StageStats(total_token=_agg_total_tokens, total_gen_time_ms=_agg_total_gen_time_ms)
 
 
-def output_strip(r_output: RequestOutput | OmniRequestOutput, omni_stage: OmniStage):
+def output_strip(r_output: RequestOutput | OmniRequestOutput, final_output: bool, final_output_type: str | None):
     """
     Strip unnecessary multimodal outputs from stages results,
     in order to:
@@ -1416,7 +1462,7 @@ def output_strip(r_output: RequestOutput | OmniRequestOutput, omni_stage: OmniSt
     """
 
     # check multimodal data is required by stage output config.
-    if omni_stage.final_output and omni_stage.final_output_type != "text":
+    if final_output and final_output_type != "text":
         return r_output
 
     # If the request has already finished, should not be altered.
