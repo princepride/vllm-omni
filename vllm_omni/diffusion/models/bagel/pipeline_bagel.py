@@ -485,6 +485,26 @@ class BagelPipeline(nn.Module):
 
         tp_aware_params = {name for name, p in self.named_parameters() if hasattr(p, "weight_loader")}
 
+        # Expand allowed/tp_aware_params with stacked param source names.
+        # QKVParallelLinear merges q_proj+k_proj+v_proj into qkv_proj; the
+        # checkpoint stores the original separate names.  We must recognise
+        # those names so _filtered_weights does not drop them.
+        _stacked_expansions = [
+            (".qkv_proj", ".q_proj"),
+            (".qkv_proj", ".k_proj"),
+            (".qkv_proj", ".v_proj"),
+            (".qkv_proj_moe_gen", ".q_proj_moe_gen"),
+            (".qkv_proj_moe_gen", ".k_proj_moe_gen"),
+            (".qkv_proj_moe_gen", ".v_proj_moe_gen"),
+        ]
+        stacked_source_names: set[str] = set()
+        for name in list(allowed):
+            for target_suffix, source_suffix in _stacked_expansions:
+                if target_suffix in name:
+                    stacked_source_names.add(name.replace(target_suffix, source_suffix))
+        allowed.update(stacked_source_names)
+        tp_aware_params.update(stacked_source_names)
+
         def _normalize_name(name: str) -> str:
             # Common wrappers/prefixes in checkpoints.
             for pfx in ("module.", "model."):

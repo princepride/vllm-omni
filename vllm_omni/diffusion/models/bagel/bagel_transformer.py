@@ -18,13 +18,14 @@ from torch import nn
 from torch.nn.attention.flex_attention import flex_attention
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
-    Qwen2Attention,
     Qwen2PreTrainedModel,
 )
 from transformers.utils import ModelOutput
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -58,17 +59,19 @@ def patchify(imgs, p):
 class MLPconnector(nn.Module):
     def __init__(self, input_dim, output_dim, activation="gelu_pytorch_tanh"):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, output_dim)
+        self.fc1 = ColumnParallelLinear(input_dim, output_dim, bias=True, gather_output=False)
         if activation == "gelu":
             self.act = nn.GELU()
         elif activation == "gelu_pytorch_tanh":
             self.act = nn.GELU(approximate="tanh")
         else:
             self.act = nn.ReLU()
-        self.fc2 = nn.Linear(output_dim, output_dim)
+        self.fc2 = RowParallelLinear(output_dim, output_dim, bias=True, input_is_parallel=True)
 
     def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
+        x_parallel, _ = self.fc1(x)
+        x_parallel = self.act(x_parallel)
+        return self.fc2(x_parallel)[0]
 
 
 class BagelRotaryEmbedding(nn.Module):
@@ -248,24 +251,69 @@ class BaseNavitOutputWithPast(ModelOutput):
     past_key_values: NaiveCache | None = None
 
 
-class PackedAttentionMoT(Qwen2Attention):
+class PackedAttentionMoT(nn.Module):
+    """Packed attention with Mixture-of-Tokens routing for understanding/generation.
+
+    Uses vLLM's QKVParallelLinear and RowParallelLinear for tensor parallelism
+    support, following the same pattern as vLLM's Qwen2Attention.
+
+    The q/k/v projections are stacked into a single QKVParallelLinear:
+      - qkv_proj      : stacks q_proj + k_proj + v_proj  (understanding + gen text)
+      - qkv_proj_moe_gen : stacks q_proj_moe_gen + k_proj_moe_gen + v_proj_moe_gen (gen vae)
+    """
+
     def __init__(self, config, layer_idx: int | None = None):
-        super().__init__(config, layer_idx)
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = config.num_attention_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = config.num_key_value_heads
+        if self.total_num_kv_heads >= tp_size:
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = self.hidden_size // self.total_num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+
+        # Understanding mode projections (stacked q/k/v)
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=True,
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+        )
+
+        # Generation mode MoE projections (stacked q/k/v)
+        self.qkv_proj_moe_gen = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=True,
+        )
+        self.o_proj_moe_gen = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+        )
+
+        # QK normalization
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.q_norm_moe_gen = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm_moe_gen = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
-
-        head_dim = self.head_dim
-        self.q_proj_moe_gen = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj_moe_gen = nn.Linear(config.hidden_size, config.num_key_value_heads * head_dim, bias=True)
-        self.v_proj_moe_gen = nn.Linear(config.hidden_size, config.num_key_value_heads * head_dim, bias=True)
-        self.o_proj_moe_gen = nn.Linear(config.num_attention_heads * head_dim, config.hidden_size, bias=False)
 
         self.rotary_op = RotaryEmbedding(is_neox_style=True)
 
@@ -285,38 +333,43 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_text_indexes=None,
     ):
         if mode == "und":
-            packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
-            packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
-            packed_value_states = self.v_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
+            qkv, _ = self.qkv_proj(packed_query_sequence)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            packed_query_states = q.view(-1, self.num_heads, self.head_dim)
+            packed_key_states = k.view(-1, self.num_kv_heads, self.head_dim)
+            packed_value_states = v.view(-1, self.num_kv_heads, self.head_dim)
             packed_query_states = self.q_norm(packed_query_states)
             packed_key_states = self.k_norm(packed_key_states)
         elif mode == "gen":
             packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
-            packed_query_states = packed_query_sequence.new_zeros(
-                (packed_query_sequence.shape[0], self.num_heads * self.head_dim)
-            )
-            packed_key_states = packed_query_sequence.new_zeros(
-                (packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-            )
-            packed_value_states = packed_query_sequence.new_zeros(
-                (packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-            )
 
             packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
             packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
 
-            packed_query_states[packed_text_indexes] = self.q_proj(packed_text_query_sequence)
-            packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(packed_vae_query_sequence)
+            # Project text tokens through base qkv
+            text_qkv, _ = self.qkv_proj(packed_text_query_sequence)
+            text_q, text_k, text_v = text_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-            packed_key_states[packed_text_indexes] = self.k_proj(packed_text_query_sequence)
-            packed_key_states[packed_vae_token_indexes] = self.k_proj_moe_gen(packed_vae_query_sequence)
+            # Project vae tokens through moe_gen qkv
+            vae_qkv, _ = self.qkv_proj_moe_gen(packed_vae_query_sequence)
+            vae_q, vae_k, vae_v = vae_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-            packed_value_states[packed_text_indexes] = self.v_proj(packed_text_query_sequence)
-            packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(packed_vae_query_sequence)
+            # Merge into packed tensors
+            total_len = packed_query_sequence.shape[0]
+            packed_query_states = packed_query_sequence.new_zeros((total_len, self.q_size))
+            packed_key_states = packed_query_sequence.new_zeros((total_len, self.kv_size))
+            packed_value_states = packed_query_sequence.new_zeros((total_len, self.kv_size))
+
+            packed_query_states[packed_text_indexes] = text_q
+            packed_query_states[packed_vae_token_indexes] = vae_q
+            packed_key_states[packed_text_indexes] = text_k
+            packed_key_states[packed_vae_token_indexes] = vae_k
+            packed_value_states[packed_text_indexes] = text_v
+            packed_value_states[packed_vae_token_indexes] = vae_v
 
             packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
-            packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
-            packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
+            packed_key_states = packed_key_states.view(-1, self.num_kv_heads, self.head_dim)
+            packed_value_states = packed_value_states.view(-1, self.num_kv_heads, self.head_dim)
 
             packed_query_states = packed_query_states.to(torch.float32)
             packed_query_states[packed_text_indexes] = self.q_norm(packed_query_states[packed_text_indexes])
@@ -343,8 +396,8 @@ class PackedAttentionMoT(Qwen2Attention):
             past_value_states = past_key_values.value_cache[self.layer_idx]
 
             seqlens = sum(query_lens) + sum(key_values_lens)
-            merged_key_states = past_key_states.new_zeros(size=[seqlens, self.num_key_value_heads, self.head_dim])
-            merged_value_states = past_key_states.new_zeros(size=[seqlens, self.num_key_value_heads, self.head_dim])
+            merged_key_states = past_key_states.new_zeros(size=[seqlens, self.num_kv_heads, self.head_dim])
+            merged_value_states = past_key_states.new_zeros(size=[seqlens, self.num_kv_heads, self.head_dim])
             merged_key_states[packed_query_indexes] = packed_key_states
             merged_key_states[packed_key_value_indexes] = past_key_states
             merged_value_states[packed_query_indexes] = packed_value_states
@@ -368,14 +421,16 @@ class PackedAttentionMoT(Qwen2Attention):
             max_seqlen_k=max(key_values_lens).item(),
             causal=is_causal,
         )
-        packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
+        packed_attn_output = packed_attn_output.reshape(-1, self.q_size)
         if mode == "und":
-            packed_attn_output = self.o_proj(packed_attn_output)
+            packed_attn_output, _ = self.o_proj(packed_attn_output)
         elif mode == "gen":
-            packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
-            packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(
-                packed_attn_output[packed_vae_token_indexes]
-            )
+            text_out, _ = self.o_proj(packed_attn_output[packed_text_indexes])
+            vae_out, _ = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+            full_output = text_out.new_zeros((packed_attn_output.shape[0], self.hidden_size))
+            full_output[packed_text_indexes] = text_out
+            full_output[packed_vae_token_indexes] = vae_out
+            packed_attn_output = full_output
 
         if update_past_key_values:
             past_key_values.key_cache[self.layer_idx] = merged_key_states
@@ -389,7 +444,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
         self,
         config,
         layer_idx: int | None = None,
-        attn_module: Qwen2Attention | None = PackedAttentionMoT,
+        attn_module: type[nn.Module] | None = PackedAttentionMoT,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -622,20 +677,43 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for vLLM parallel layers.
 
-        Parameter names (gate_proj, up_proj, down_proj, etc.) are kept
-        identical to the HF checkpoint, so no name remapping is needed.
-        vLLM parallel layers attach a ``weight_loader`` to each parameter
-        that handles TP sharding automatically.
+        Handles stacked parameter remapping for QKVParallelLinear:
+          - q_proj, k_proj, v_proj -> qkv_proj (shard ids: q, k, v)
+          - q_proj_moe_gen, k_proj_moe_gen, v_proj_moe_gen -> qkv_proj_moe_gen
+        Other parallel layers (gate_proj, up_proj, down_proj, embed_tokens, etc.)
+        keep HF checkpoint names and use weight_loader for TP sharding.
         """
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            # More specific _moe_gen patterns FIRST to avoid substring
+            # ambiguity (`.q_proj` is a substring of `.q_proj_moe_gen`).
+            (".qkv_proj_moe_gen", ".q_proj_moe_gen", "q"),
+            (".qkv_proj_moe_gen", ".k_proj_moe_gen", "k"),
+            (".qkv_proj_moe_gen", ".v_proj_moe_gen", "v"),
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+        ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            param = params_dict.get(name)
-            if param is None:
-                continue
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param = params_dict.get(name)
+                if param is None:
+                    break
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                param = params_dict.get(name)
+                if param is None:
+                    continue
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
         return loaded_params
@@ -751,7 +829,7 @@ def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_pat
     return pos_ids
 
 
-class Bagel(torch.nn.Module):
+class Bagel(nn.Module):
     config_class = BagelConfig
     base_model_prefix = "bagel"
 
