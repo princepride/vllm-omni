@@ -142,6 +142,7 @@ class BagelMLP(nn.Module):
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
+            input_is_parallel=True,
             bias=False,
         )
         if hidden_act != "silu":
