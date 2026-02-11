@@ -120,7 +120,7 @@ class _FakeStage:
         self._proc = MagicMock()
         self._proc.start = MagicMock()
         self._proc.join = MagicMock()
-        self._proc.is_alive = MagicMock(return_value=False)
+        self._proc.is_alive = MagicMock(return_value=True)  # Return True so Omni waits for stage_ready
         self._proc.terminate = MagicMock()
         # Send stage_ready message to output queue
         if self._out_q is not None:
