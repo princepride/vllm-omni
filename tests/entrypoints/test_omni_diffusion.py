@@ -21,6 +21,17 @@ warnings.filterwarnings(
 MODEL = "riverclouds/qwen_image_random"
 
 
+class _FakeStageRequestStats:
+    """Fake StageRequestStats object with necessary attributes."""
+
+    def __init__(self, **kwargs):
+        self.stage_gen_time_ms = kwargs.get("stage_gen_time_ms", 10.0)
+        self.num_tokens_out = kwargs.get("num_tokens_out", 1)
+        # Add any other attributes that might be needed
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
 class _FakeEngineArgs(dict):
     """Fake engine args that can be used both as object attributes and as **kwargs."""
 
@@ -387,6 +398,37 @@ def _setup_log_mocks(monkeypatch):
     )
 
 
+def _setup_connector_mocks(monkeypatch):
+    """Helper function to set up connector mocks for stage-to-stage forwarding."""
+
+    # Mock try_send_via_connector to always succeed
+    def _fake_try_send_via_connector(
+        connector,
+        stage_id,
+        next_stage_id,
+        req_id,
+        next_inputs,
+        sampling_params,
+        original_prompt,
+        next_stage_queue_submit_fn,
+        metrics,
+    ):
+        # Simulate successful send by calling the submit function
+        task = {
+            "request_id": req_id,
+            "engine_inputs": next_inputs,
+            "sampling_params": sampling_params,
+        }
+        next_stage_queue_submit_fn(task)
+        return True
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.omni.try_send_via_connector",
+        _fake_try_send_via_connector,
+        raising=False,
+    )
+
+
 @pytest.fixture(autouse=True)
 def mock_get_config(monkeypatch):
     """Auto-mock get_config and related model loading functions to avoid model path validation."""
@@ -543,6 +585,7 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     # Mock load_and_resolve_stage_configs
     monkeypatch.setattr(
@@ -608,6 +651,7 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -662,6 +706,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -699,7 +744,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "s0"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     # Stage 1 output (will be collected after stage 0 forwards to it)
@@ -711,7 +756,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1, "text": "s1"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
 
@@ -763,6 +808,7 @@ def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -799,28 +845,28 @@ def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "s0"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     omni.stage_list[0]._out_q.put_nowait(
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "s0"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     omni.stage_list[1]._out_q.put_nowait(
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     omni.stage_list[1]._out_q.put_nowait(
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
 
@@ -877,6 +923,7 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -963,6 +1010,7 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -997,14 +1045,14 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     omni.stage_list[1]._out_q.put_nowait(
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     # Use the default sampling params
@@ -1036,6 +1084,7 @@ def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -1097,6 +1146,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -1139,7 +1189,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "result"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
 
@@ -1177,6 +1227,7 @@ def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
