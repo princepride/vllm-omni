@@ -22,14 +22,32 @@ MODEL = "riverclouds/qwen_image_random"
 
 
 class _FakeStageRequestStats:
-    """Fake StageRequestStats object with necessary attributes."""
+    """Fake StageRequestStats object with necessary attributes aligned with real StageRequestStats."""
 
     def __init__(self, **kwargs):
-        self.stage_gen_time_ms = kwargs.get("stage_gen_time_ms", 10.0)
+        # Required fields (with defaults for testing)
+        self.batch_id = kwargs.get("batch_id", 0)
+        self.batch_size = kwargs.get("batch_size", 1)
+        self.num_tokens_in = kwargs.get("num_tokens_in", 0)
         self.num_tokens_out = kwargs.get("num_tokens_out", 1)
-        # Add any other attributes that might be needed
+        self.stage_gen_time_ms = kwargs.get("stage_gen_time_ms", 10.0)
+        self.rx_transfer_bytes = kwargs.get("rx_transfer_bytes", 0)
+        self.rx_decode_time_ms = kwargs.get("rx_decode_time_ms", 0.0)
+        self.rx_in_flight_time_ms = kwargs.get("rx_in_flight_time_ms", 0.0)
+        self.stage_stats = kwargs.get("stage_stats", None)
+
+        # Optional fields
+        self.stage_id = kwargs.get("stage_id", None)
+        self.final_output_type = kwargs.get("final_output_type", None)
+        self.request_id = kwargs.get("request_id", None)
+        self.postprocess_time_ms = kwargs.get("postprocess_time_ms", 0.0)
+        self.diffusion_metrics = kwargs.get("diffusion_metrics", None)
+        self.audio_generated_frames = kwargs.get("audio_generated_frames", 0)
+
+        # Allow additional attributes for flexibility
         for key, value in kwargs.items():
-            setattr(self, key, value)
+            if not hasattr(self, key):
+                setattr(self, key, value)
 
 
 class _FakeEngineArgs(dict):
@@ -400,6 +418,22 @@ def _setup_log_mocks(monkeypatch):
 
 def _setup_connector_mocks(monkeypatch):
     """Helper function to set up connector mocks for stage-to-stage forwarding."""
+
+    # Mock initialize_orchestrator_connectors to return fake connectors
+    def _fake_initialize_orchestrator_connectors(config_path, worker_backend=None, shm_threshold_bytes=None):
+        # Create fake connectors for all stage-to-stage edges
+        # Each connector is just a mock object that will be passed to try_send_via_connector
+        fake_connectors = {}
+        # Add connectors for common edges (0->1, 1->2, etc.)
+        for i in range(10):  # Support up to 10 stages
+            fake_connectors[(str(i), str(i + 1))] = MagicMock()
+        return None, fake_connectors
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.omni.initialize_orchestrator_connectors",
+        _fake_initialize_orchestrator_connectors,
+        raising=False,
+    )
 
     # Mock try_send_via_connector to always succeed
     def _fake_try_send_via_connector(
