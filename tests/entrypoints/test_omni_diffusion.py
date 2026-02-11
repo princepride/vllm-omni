@@ -455,9 +455,13 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
         base_engine_args: dict | None = None,
         default_stage_cfg_factory=None,
     ):
+        cfg0 = dict(fake_stage_config)
+        cfg0["stage_id"] = 0
+        cfg1 = dict(fake_stage_config)
+        cfg1["stage_id"] = 1
         return None, [
-            _FakeStageConfig(fake_stage_config),
-            _FakeStageConfig(fake_stage_config),
+            _FakeStageConfig(cfg0),
+            _FakeStageConfig(cfg1),
         ]
 
     # Remove modules from cache BEFORE setting mocks
@@ -568,7 +572,9 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
 def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     """Test multi-stage generation pipeline with queue polling."""
     stage_cfg0 = dict(fake_stage_config)
+    stage_cfg0["stage_id"] = 0
     stage_cfg1 = dict(fake_stage_config)
+    stage_cfg1["stage_id"] = 1
     stage_cfg1["processed_input"] = ["processed-for-stage-1"]
 
     def _fake_loader(
@@ -667,8 +673,10 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
 def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
     """Test single-stage generation pipeline with multiple inputs in one batch."""
     stage_cfg0 = dict(fake_stage_config)
-    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg0["stage_id"] = 0
     stage_cfg0["final_output"] = False
+    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg1["stage_id"] = 1
 
     def _fake_loader(
         model: str,
@@ -778,8 +786,10 @@ def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
 def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     """Test that generate returns empty list when all stages have final_output=False."""
     stage_cfg0 = dict(fake_stage_config)
-    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg0["stage_id"] = 0
     stage_cfg0["final_output"] = False
+    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg1["stage_id"] = 1
     stage_cfg1["final_output"] = False
 
     def _fake_loader(
@@ -862,8 +872,10 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
 def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_config):
     """Test that generate uses default sampling params when sampling_params_list is None."""
     stage_cfg0 = dict(fake_stage_config)
-    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg0["stage_id"] = 0
     stage_cfg0["final_output"] = False
+    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg1["stage_id"] = 1
     stage_cfg1["final_output"] = False
 
     def _fake_loader(
