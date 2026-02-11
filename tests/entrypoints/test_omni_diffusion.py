@@ -60,14 +60,43 @@ class _FakeQueue:
     def put_nowait(self, item):
         self._queue.put_nowait(item)
 
-    def get(self):
-        return self._queue.get()
+    def get(self, timeout=None):
+        if timeout is None:
+            return self._queue.get()
+        return self._queue.get(timeout=timeout)
 
     def get_nowait(self):
         return self._queue.get_nowait()
 
     def empty(self):
         return self._queue.empty()
+
+
+class _FakeZmqQueue:
+    """Fake ZmqQueue that wraps _FakeQueue and adds endpoint attribute."""
+
+    def __init__(self, endpoint=None, maxsize=0):
+        self._queue = _FakeQueue(maxsize=maxsize)
+        self.endpoint = endpoint or f"fake://zmq-endpoint-{id(self)}"
+
+    def put(self, item):
+        self._queue.put(item)
+
+    def put_nowait(self, item):
+        self._queue.put_nowait(item)
+
+    def get(self, timeout=None):
+        return self._queue.get(timeout=timeout)
+
+    def get_nowait(self):
+        return self._queue.get_nowait()
+
+    def empty(self):
+        return self._queue.empty()
+
+    def close(self):
+        """Mock close method for ZmqQueue."""
+        pass
 
 
 class _FakeStage:
@@ -271,6 +300,19 @@ def _setup_multiprocessing_mocks(monkeypatch):
 
     monkeypatch.setattr(mp, "get_context", _mock_get_context, raising=False)
     monkeypatch.setattr(mp, "Process", fake_process_class, raising=False)
+
+    # Mock ZmqQueue to use _FakeZmqQueue
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.omni_stage.ZmqQueue",
+        _FakeZmqQueue,
+        raising=False,
+    )
+    # Also mock in the zmq_queue module if it exists
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.zmq_queue.ZmqQueue",
+        _FakeZmqQueue,
+        raising=False,
+    )
 
 
 def _setup_ipc_mocks(monkeypatch):
