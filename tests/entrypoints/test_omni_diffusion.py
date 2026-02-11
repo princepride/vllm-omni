@@ -496,6 +496,7 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
 
     # Patch the imported class in the module
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     from vllm_omni.entrypoints.omni import Omni
 
@@ -555,6 +556,7 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     from vllm_omni.entrypoints.omni import Omni
 
@@ -606,6 +608,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -704,6 +707,7 @@ def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -815,6 +819,7 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -898,6 +903,7 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -981,6 +987,7 @@ def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStageNoReady(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     from vllm_omni.entrypoints.omni import Omni
 
@@ -1030,6 +1037,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -1109,6 +1117,7 @@ def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     from vllm_omni.entrypoints.omni import Omni
 
