@@ -35,6 +35,7 @@ class OmniDiffusion:
         # Capture stage info from kwargs before they might be filtered out
         stage_id = kwargs.get("stage_id")
         engine_input_source = kwargs.get("engine_input_source")
+        cfg_kv_collect_func = kwargs.pop("cfg_kv_collect_func", None)
 
         if od_config is None:
             od_config = OmniDiffusionConfig.from_kwargs(**kwargs)
@@ -84,6 +85,9 @@ class OmniDiffusion:
                 od_config.model_class_name = architectures[0]
             else:
                 raise
+
+        if cfg_kv_collect_func is not None:
+            od_config.cfg_kv_collect_func = cfg_kv_collect_func
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 

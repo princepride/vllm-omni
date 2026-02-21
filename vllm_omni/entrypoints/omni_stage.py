@@ -233,6 +233,16 @@ def _build_od_config(engine_args: dict[str, Any], model: str) -> dict[str, Any]:
     return od_config
 
 
+def _load_func_from_config(stage_config: Any, attr_name: str):
+    """Dynamically import a function referenced by a dotted path in stage config."""
+    func_path = getattr(stage_config, attr_name, None)
+    if not func_path:
+        return None
+    module_path, func_name = func_path.rsplit(".", 1)
+    module = importlib.import_module(module_path)
+    return getattr(module, func_name)
+
+
 class OmniStage:
     """Stage manager for orchestrating a single stage in the omni pipeline.
 
@@ -271,6 +281,9 @@ class OmniStage:
             self.custom_process_input_func = getattr(module, func_name)
         else:
             self.custom_process_input_func = None
+
+        self.prompt_expand_func = _load_func_from_config(stage_config, "prompt_expand_func")
+        self.cfg_kv_collect_func = _load_func_from_config(stage_config, "cfg_kv_collect_func")
 
         self.final_output = getattr(stage_config, "final_output", False)
         self.final_output_type = getattr(stage_config, "final_output_type", None)
@@ -442,6 +455,7 @@ class OmniStage:
             "connectors_config": connectors_config or {},
             "stage_type": self.stage_type,
             "engine_input_source": self.engine_input_source,
+            "cfg_kv_collect_func": getattr(self.stage_config, "cfg_kv_collect_func", None),
         }
         try:
             old_env = os.environ.get("VLLM_LOGGING_PREFIX")
@@ -671,6 +685,12 @@ def _stage_worker(
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type: Literal["llm", "diffusion"] = stage_payload.get("stage_type", "llm")
 
+    cfg_kv_collect_func_path = stage_payload.get("cfg_kv_collect_func")
+    cfg_kv_collect_func = None
+    if cfg_kv_collect_func_path:
+        _mod_path, _fn_name = cfg_kv_collect_func_path.rsplit(".", 1)
+        cfg_kv_collect_func = getattr(importlib.import_module(_mod_path), _fn_name)
+
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
 
@@ -711,6 +731,7 @@ def _stage_worker(
                 model=model,
                 stage_id=stage_id,
                 engine_input_source=stage_payload.get("engine_input_source", []),
+                cfg_kv_collect_func=cfg_kv_collect_func,
                 **engine_args,
             )
         else:
@@ -1050,6 +1071,12 @@ async def _stage_worker_async(
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type = stage_payload.get("stage_type", "llm")
 
+    cfg_kv_collect_func_path = stage_payload.get("cfg_kv_collect_func")
+    cfg_kv_collect_func = None
+    if cfg_kv_collect_func_path:
+        _mod_path, _fn_name = cfg_kv_collect_func_path.rsplit(".", 1)
+        cfg_kv_collect_func = getattr(importlib.import_module(_mod_path), _fn_name)
+
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
 
@@ -1112,10 +1139,13 @@ async def _stage_worker_async(
             od_config["omni_kv_config"]["engine_input_source"] = stage_payload.get("engine_input_source", [])
 
             logger.debug(f"[Stage-%s] Initializing diffusion engine with config: {od_config}", stage_id)
+            _diffusion_kwargs = {k: v for k, v in engine_args.items() if k not in {"od_config", "model"}}
+            if cfg_kv_collect_func is not None:
+                _diffusion_kwargs["cfg_kv_collect_func"] = cfg_kv_collect_func
             stage_engine = AsyncOmniDiffusion(
                 model=model,
                 od_config=od_config,
-                **{k: v for k, v in engine_args.items() if k not in {"od_config", "model"}},
+                **_diffusion_kwargs,
             )
             vllm_config = None  # Diffusion doesn't use vllm_config
         else:
