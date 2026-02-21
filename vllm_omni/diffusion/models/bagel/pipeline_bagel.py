@@ -327,7 +327,10 @@ class BagelPipeline(nn.Module):
             gen_context["past_key_values"] = injected_kv
             seq_len = injected_kv.key_cache[0].shape[0]
             gen_context["kv_lens"] = [seq_len]
-            gen_context["ropes"] = [seq_len]
+            if req.sampling_params.kv_metadata and "ropes" in req.sampling_params.kv_metadata:
+                gen_context["ropes"] = req.sampling_params.kv_metadata["ropes"]
+            else:
+                gen_context["ropes"] = [seq_len]
 
             # Disable CFG: single KV cache cannot support 3-branch CFG
             logger.warning("CFG is disabled when using injected KV Cache")
