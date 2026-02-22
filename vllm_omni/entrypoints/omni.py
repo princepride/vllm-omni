@@ -825,31 +825,35 @@ class Omni(OmniBase):
                     time.sleep(0.05)
                     continue
 
-                # --- Handle CFG companion requests at Stage-0 ---
+                # CFG: Handle companion requests at Stage-0
                 if req_id in cfg_companion_ids and stage_id == 0:
                     logger.debug(f"[{self._name}] CFG companion {req_id} completed at stage-0")
                     # Find the parent and mark this companion as done
+                    companion_parent_id = None
                     for parent_id, role_map in cfg_companion_map.items():
                         if req_id in role_map.values():
                             cfg_companion_done[parent_id].add(req_id)
+                            companion_parent_id = parent_id
                             break
-                    # Check if a pending parent can now be forwarded
-                    for parent_id in list(_pending_parent_results.keys()):
-                        if parent_id in cfg_companion_map and self._all_companions_done(
-                            parent_id, cfg_companion_map, cfg_companion_done
-                        ):
-                            self._forward_parent_with_cfg(
-                                parent_id,
-                                _pending_parent_results.pop(parent_id),
-                                cfg_companion_map,
-                                sampling_params_list,
-                                request_id_to_prompt,
-                                final_stage_id_to_prompt,
-                                metrics,
-                                remaining_by_stage,
-                                pbar,
-                                completed_requests,
-                            )
+                    # Only check *this* parent — it is the only one whose
+                    # completion status could have changed.
+                    if (
+                        companion_parent_id is not None
+                        and companion_parent_id in _pending_parent_results
+                        and self._all_companions_done(companion_parent_id, cfg_companion_map, cfg_companion_done)
+                    ):
+                        self._forward_parent_with_cfg(
+                            companion_parent_id,
+                            _pending_parent_results.pop(companion_parent_id),
+                            cfg_companion_map,
+                            sampling_params_list,
+                            request_id_to_prompt,
+                            final_stage_id_to_prompt,
+                            metrics,
+                            remaining_by_stage,
+                            pbar,
+                            completed_requests,
+                        )
                     continue
 
                 engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
