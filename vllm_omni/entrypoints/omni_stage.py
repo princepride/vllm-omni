@@ -597,7 +597,11 @@ class OmniStage:
             return None
 
     def process_engine_inputs(
-        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
+        self,
+        stage_list: list[Any],
+        prompt: OmniTokensPrompt | TextPrompt = None,
+        *,
+        source_outputs_override: Any = None,
     ) -> list[OmniTokensPrompt | TextPrompt]:
         """Process engine inputs for this stage from upstream stage outputs.
 
@@ -608,6 +612,10 @@ class OmniStage:
         Args:
             stage_list: List of all stages in the pipeline
             prompt: Optional original prompt (for multimodal data preservation)
+            source_outputs_override: If provided, use these outputs instead of
+                reading from the source stage's shared engine_outputs attribute.
+                This avoids a race where deferred requests (e.g. CFG parents
+                waiting for companions) read stale/overwritten outputs.
 
         Returns:
             List of processed engine inputs ready for this stage
@@ -620,7 +628,11 @@ class OmniStage:
             if len(self.engine_input_source) == 0:
                 raise ValueError("engine_input_source is empty")
             source_stage_id = self.engine_input_source[0]
-            source_outputs = stage_list[source_stage_id].engine_outputs
+            source_outputs = (
+                source_outputs_override
+                if source_outputs_override is not None
+                else stage_list[source_stage_id].engine_outputs
+            )
             if not isinstance(prompt, list):
                 prompt = [prompt]
             multi_modal_data = {
@@ -642,6 +654,19 @@ class OmniStage:
 
         else:
             engine_input_source = self.engine_input_source
+            if source_outputs_override is not None and engine_input_source:
+                # Temporarily set the source stage's outputs so that custom
+                # functions (which read from stage_list directly) see the
+                # correct data for deferred requests.
+                _source_id = engine_input_source[0]
+                _orig_outputs = stage_list[_source_id].engine_outputs
+                stage_list[_source_id].engine_outputs = source_outputs_override
+                try:
+                    return self.custom_process_input_func(
+                        stage_list, engine_input_source, prompt, self.requires_multimodal_data
+                    )
+                finally:
+                    stage_list[_source_id].engine_outputs = _orig_outputs
             return self.custom_process_input_func(
                 stage_list, engine_input_source, prompt, self.requires_multimodal_data
             )

@@ -781,6 +781,10 @@ class Omni(OmniBase):
         )
         # Parent requests that finished Stage-0 but are waiting for companions
         _pending_parent_results: dict[str, Any] = {}
+        # Parents whose CFG companions have failed
+        _cfg_failed_parents: set[str] = set()
+        # Safety timeout (seconds) for parent requests waiting for CFG companion completion.
+        cfg_pending_timeout = float(os.environ.get("VLLM_CFG_PENDING_TIMEOUT_S", "120"))
 
         while completed_requests < total_requests:
             made_progress = False
@@ -795,6 +799,24 @@ class Omni(OmniBase):
                     logger.error(
                         f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
                     )
+                    # Propagate companion failure to the parent so it does not
+                    # wait forever (deadlock).
+                    if req_id in cfg_companion_ids and stage_id == 0:
+                        for parent_id, role_map in cfg_companion_map.items():
+                            if req_id in role_map.values():
+                                _cfg_failed_parents.add(parent_id)
+                                logger.error(
+                                    f"[{self._name}] CFG companion {req_id} failed; "
+                                    f"marking parent {parent_id} as failed",
+                                )
+                                if parent_id in _pending_parent_results:
+                                    _pending_parent_results.pop(parent_id)
+                                    completed_requests += 1
+                                    logger.error(
+                                        f"[{self._name}] Parent {parent_id} aborted due to "
+                                        f"companion failure ({completed_requests}/{total_requests})",
+                                    )
+                                break
                     continue
 
                 if result.get("type") == "stage_ready":
@@ -923,8 +945,18 @@ class Omni(OmniBase):
                 if req_id not in final_stage_id_to_prompt:
                     continue
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
-                    # --- CFG: if this parent has companions, defer forwarding ---
+                    # CFG: if this parent has companions, defer forwarding
                     if req_id in cfg_companion_map and stage_id == 0:
+                        # If a companion already failed, abort this parent immediately.
+                        if req_id in _cfg_failed_parents:
+                            _cfg_failed_parents.discard(req_id)
+                            completed_requests += 1
+                            logger.error(
+                                f"[{self._name}] Parent {req_id} skipped CFG forwarding due to "
+                                f"companion failure ({completed_requests}/{total_requests})",
+                            )
+                            continue
+
                         if self._all_companions_done(req_id, cfg_companion_map, cfg_companion_done):
                             self._forward_parent_with_cfg(
                                 req_id,
@@ -942,6 +974,7 @@ class Omni(OmniBase):
                             _pending_parent_results[req_id] = {
                                 "engine_outputs": engine_outputs,
                                 "stage_id": stage_id,
+                                "pending_since": time.time(),
                             }
                             logger.debug(f"[{self._name}] Parent {req_id} waiting for CFG companions")
                         continue
@@ -996,6 +1029,20 @@ class Omni(OmniBase):
                     logger.debug(
                         f"[{self._name}] Request {req_id} fully completed ({completed_requests}/{total_requests})",
                     )
+            # CFG: expire pending parents that have waited too long for their CFG companions
+            if _pending_parent_results:
+                _now = time.time()
+                for parent_id in list(_pending_parent_results.keys()):
+                    pending_since = _pending_parent_results[parent_id].get("pending_since", _now)
+                    if _now - pending_since > cfg_pending_timeout:
+                        _pending_parent_results.pop(parent_id)
+                        _cfg_failed_parents.discard(parent_id)
+                        completed_requests += 1
+                        logger.error(
+                            f"[{self._name}] Parent {parent_id} timed out waiting for CFG "
+                            f"companions (>{cfg_pending_timeout:.0f}s); counting as failed "
+                            f"({completed_requests}/{total_requests})",
+                        )
 
             if not made_progress:
                 time.sleep(0.005)
@@ -1043,7 +1090,11 @@ class Omni(OmniBase):
         next_stage: OmniStage = self.stage_list[next_stage_id]
         try:
             with metrics.stage_postprocess_timer(stage_id, req_id):
-                next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
+                next_inputs = next_stage.process_engine_inputs(
+                    self.stage_list,
+                    [request_id_to_prompt[req_id]],
+                    source_outputs_override=parent_result["engine_outputs"],
+                )
         except Exception as e:
             logger.exception(
                 f"[{self._name}] Process engine inputs error for req {req_id} at stage {next_stage_id}: {e}",
