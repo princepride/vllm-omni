@@ -1105,7 +1105,7 @@ class Omni(OmniBase):
             )
             return
 
-        sp_next = copy.copy(sampling_params_list[next_stage_id])  # type: ignore[index]
+        sp_next = copy.deepcopy(sampling_params_list[next_stage_id])  # type: ignore[index]
         # Attach CFG companion request IDs so the diffusion stage can fetch their KV caches
         if isinstance(sp_next, OmniDiffusionSamplingParams):
             sp_next.cfg_kv_request_ids = cfg_companion_map[req_id]
