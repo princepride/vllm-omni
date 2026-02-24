@@ -283,12 +283,6 @@ class OmniStage:
             self.custom_process_input_func = None
 
         self.prompt_expand_func = _load_func_from_config(stage_config, "prompt_expand_func")
-        # cfg_kv_collect_func is only used inside the worker process (resolved
-        # from the string in stage_payload). We resolve it here too so that
-        # validation catches import errors early, but the parent-side object is
-        # otherwise unused.
-        self.cfg_kv_collect_func = _load_func_from_config(stage_config, "cfg_kv_collect_func")
-
         self.final_output = getattr(stage_config, "final_output", False)
         self.final_output_type = getattr(stage_config, "final_output_type", None)
         default_sampling_params = getattr(stage_config, "default_sampling_params", {})
