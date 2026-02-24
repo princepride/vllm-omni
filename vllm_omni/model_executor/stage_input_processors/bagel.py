@@ -137,14 +137,19 @@ def _get_negative_prompt(
     prompt: dict[str, Any],
     sampling_params: Any,
 ) -> str:
-    """Resolve the negative prompt for CFG from prompt or sampling params."""
+    """Resolve the negative prompt for CFG from prompt or sampling params.
+
+    An empty string is treated the same as absent (falls through to
+    the Bagel default token pair), because an empty negative prompt is
+    not meaningful for CFG guidance.
+    """
     neg = prompt.get("negative_prompt")
-    if neg is not None:
+    if neg:
         return neg
 
     if hasattr(sampling_params, "extra_args") and sampling_params.extra_args:
         neg = sampling_params.extra_args.get("negative_prompt")
-        if neg is not None:
+        if neg:
             return neg
 
     return "<|im_start|><|im_end|>"
