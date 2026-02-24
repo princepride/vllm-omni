@@ -179,7 +179,9 @@ Example configuration for TP=2 on GPUs 0 and 1:
 
 ## Using Mooncake Connector
 
-By default, BAGEL uses `SharedMemoryConnector` for inter-stage communication. You can use the [Mooncake](https://github.com/kvcache-ai/Mooncake) connector to transfer KV cache between stages, which also enables multi-node deployment.
+[Mooncake](https://github.com/kvcache-ai/Mooncake) is a high-performance distributed KV cache transfer engine that enables efficient cross-node data movement via TCP or RDMA, making it ideal for multi-node disaggregated inference.
+
+By default, BAGEL uses `SharedMemoryConnector` for inter-stage communication. You can switch to the Mooncake connector for better performance on multi-GPU setups and to enable multi-node deployment.
 
 ### Prerequisites
 
@@ -198,7 +200,8 @@ pip install mooncake-transfer-engine-non-cuda
 On the **primary node**, start the Mooncake master service:
 
 ```bash
-# Optional: create SSD storage directory
+# Optional: enable disk-backed storage by creating a directory and passing --root_fs_dir.
+# Without it, Mooncake runs in memory-only mode, which is sufficient for KV cache transfer.
 mkdir -p ./mc_storage
 
 mooncake_master \
@@ -208,7 +211,7 @@ mooncake_master \
   --http_metadata_server_port=8080 \
   --metrics_port=9003 \
   --root_fs_dir=./mc_storage/ \
-  --cluster_id=mc-local-1 &
+  --cluster_id=mc-local-1
 ```
 
 ### Step 2: Run Offline Inference with Mooncake
@@ -222,20 +225,20 @@ cd examples/offline_inference/bagel
 python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --modality text2img \
                   --prompts "A cute cat" \
-                  --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
+                  --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
 
 # Image to Text with Mooncake
 python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --modality img2text \
                   --image-path /path/to/image.jpg \
                   --prompts "Describe this image" \
-                  --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
+                  --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
 
 # Text to Text with Mooncake
 python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --modality text2text \
                   --prompts "What is the capital of France?" \
-                  --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
+                  --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
 ```
 
 For more details on the Mooncake connector and multi-node setup, see the [Mooncake Store Connector documentation](../../../docs/design/feature/omni_connectors/mooncake_store_connector.md).

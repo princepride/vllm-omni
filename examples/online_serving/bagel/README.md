@@ -62,7 +62,8 @@ pip install mooncake-transfer-engine-non-cuda
 **2. Start Mooncake Master** on the primary node:
 
 ```bash
-# Optional: create SSD storage directory
+# Optional: enable disk-backed storage by creating a directory and passing --root_fs_dir.
+# Without it, Mooncake runs in memory-only mode, which is sufficient for KV cache transfer.
 mkdir -p ./mc_storage
 
 mooncake_master \
@@ -93,6 +94,9 @@ For more details on the Mooncake connector configuration, see the [Mooncake Stor
 You can deploy each stage on a **separate node** for better resource utilization. In this example, the orchestrator (Stage 0 / Thinker) and Stage 1 (DiT) run on different machines, connected via Mooncake.
 
 Assume the orchestrator node IP is `10.244.227.244`.
+
+> [!WARNING]
+> **Before launching**, edit [`bagel_multiconnector.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml) and replace the `metadata_server` and `master` addresses with your Mooncake master node's actual IP. Mismatched addresses will cause silent connection failures.
 
 **1. Start Mooncake Master** (on the orchestrator node):
 
@@ -132,9 +136,23 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
 | `--stage-id` | Which stage this process runs (0 = Thinker, 1 = DiT) |
 | `--headless` | Run without the API server (worker-only mode) |
 | `-oma` | Orchestrator master address |
-| `-omp` | Orchestrator master port |
+| `-omp` | Orchestrator master port for Stage 1 to connect to Stage 0 for task coordination|
 
-> **Note**: Make sure the `metadata_server` and `master` addresses in `bagel_multiconnector.yaml` match the Mooncake master node's IP. Stage 0 (orchestrator) must be launched **before** Stage 1 (headless).
+> **Note**: Stage 0 (orchestrator) must be launched **before** Stage 1 (headless). Stage 0 will hang on startup until Stage 1 (worker) connects.
+
+**Network Requirements**
+
+All nodes must have network connectivity to each other. Ensure the following ports are open **between all participating nodes**:
+
+| Port | Protocol | Service | Direction |
+| :--- | :------- | :------ | :-------- |
+| 50051 | TCP | Mooncake Master RPC | Worker → Orchestrator |
+| 8080 | TCP | Mooncake HTTP Metadata Server | Worker → Orchestrator |
+| 8091 | TCP | Orchestrator Master (`-omp`) | Worker → Orchestrator |
+| 8000 | TCP | API Server (`--port`) | Client → Orchestrator |
+| 9003 | TCP | Metrics (optional) | Monitoring → Orchestrator |
+
+> **Tip**: If nodes are behind a firewall or in different VPCs/security groups, make sure the above ports are allowed in ingress/egress rules. All nodes should be reachable via their IP addresses (no NAT). Using nodes on the same subnet or VPC is recommended to minimize latency for Mooncake KV cache transfers.
 
 ### Send Multi-modal Request
 
