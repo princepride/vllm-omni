@@ -686,6 +686,8 @@ class Omni(OmniBase):
         cfg_companion_ids: set[str] = set()
         # Tracks which companions have completed Stage-0
         cfg_companion_done: dict[str, set[str]] = {}
+        # Reverse index: companion_id -> parent_id for O(1) lookup
+        cfg_companion_to_parent: dict[str, str] = {}
 
         if prompt_expand_func:
             sp0 = sampling_params_list[0]  # type: ignore[index]
@@ -698,6 +700,7 @@ class Omni(OmniBase):
                         companion_id = f"{rid}{ep.request_id_suffix}"
                         role_map[ep.role] = companion_id
                         cfg_companion_ids.add(companion_id)
+                        cfg_companion_to_parent[companion_id] = rid
                         expanded_prompts_to_submit.append((companion_id, ep.prompt))
                     cfg_companion_map[rid] = role_map
                     cfg_companion_done[rid] = set()
@@ -802,21 +805,20 @@ class Omni(OmniBase):
                     # Propagate companion failure to the parent so it does not
                     # wait forever (deadlock).
                     if req_id in cfg_companion_ids and stage_id == 0:
-                        for parent_id, role_map in cfg_companion_map.items():
-                            if req_id in role_map.values():
-                                _cfg_failed_parents.add(parent_id)
+                        parent_id = cfg_companion_to_parent.get(req_id)
+                        if parent_id is not None:
+                            _cfg_failed_parents.add(parent_id)
+                            logger.error(
+                                f"[{self._name}] CFG companion {req_id} failed; "
+                                f"marking parent {parent_id} as failed",
+                            )
+                            if parent_id in _pending_parent_results:
+                                _pending_parent_results.pop(parent_id)
+                                completed_requests += 1
                                 logger.error(
-                                    f"[{self._name}] CFG companion {req_id} failed; "
-                                    f"marking parent {parent_id} as failed",
+                                    f"[{self._name}] Parent {parent_id} aborted due to "
+                                    f"companion failure ({completed_requests}/{total_requests})",
                                 )
-                                if parent_id in _pending_parent_results:
-                                    _pending_parent_results.pop(parent_id)
-                                    completed_requests += 1
-                                    logger.error(
-                                        f"[{self._name}] Parent {parent_id} aborted due to "
-                                        f"companion failure ({completed_requests}/{total_requests})",
-                                    )
-                                break
                     continue
 
                 if result.get("type") == "stage_ready":
@@ -828,13 +830,9 @@ class Omni(OmniBase):
                 # CFG: Handle companion requests at Stage-0
                 if req_id in cfg_companion_ids and stage_id == 0:
                     logger.debug(f"[{self._name}] CFG companion {req_id} completed at stage-0")
-                    # Find the parent and mark this companion as done
-                    companion_parent_id = None
-                    for parent_id, role_map in cfg_companion_map.items():
-                        if req_id in role_map.values():
-                            cfg_companion_done[parent_id].add(req_id)
-                            companion_parent_id = parent_id
-                            break
+                    companion_parent_id = cfg_companion_to_parent.get(req_id)
+                    if companion_parent_id is not None:
+                        cfg_companion_done[companion_parent_id].add(req_id)
                     # Only check *this* parent — it is the only one whose
                     # completion status could have changed.
                     if (
