@@ -46,6 +46,7 @@ from vllm_omni.entrypoints.stage_utils import (
     OmniStageTaskType,
     _to_dict,
     is_profiler_task,
+    load_func_from_config,
     maybe_dump_to_shm,
     set_stage_devices,
 )
@@ -233,16 +234,6 @@ def _build_od_config(engine_args: dict[str, Any], model: str) -> dict[str, Any]:
     return od_config
 
 
-def _load_func_from_config(stage_config: Any, attr_name: str):
-    """Dynamically import a function referenced by a dotted path in stage config."""
-    func_path = getattr(stage_config, attr_name, None)
-    if not func_path:
-        return None
-    module_path, func_name = func_path.rsplit(".", 1)
-    module = importlib.import_module(module_path)
-    return getattr(module, func_name)
-
-
 class OmniStage:
     """Stage manager for orchestrating a single stage in the omni pipeline.
 
@@ -282,7 +273,7 @@ class OmniStage:
         else:
             self.custom_process_input_func = None
 
-        self.prompt_expand_func = _load_func_from_config(stage_config, "prompt_expand_func")
+        self.prompt_expand_func = load_func_from_config(getattr(stage_config, "prompt_expand_func", None))
         self.final_output = getattr(stage_config, "final_output", False)
         self.final_output_type = getattr(stage_config, "final_output_type", None)
         default_sampling_params = getattr(stage_config, "default_sampling_params", {})
@@ -711,11 +702,7 @@ def _stage_worker(
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type: Literal["llm", "diffusion"] = stage_payload.get("stage_type", "llm")
 
-    cfg_kv_collect_func_path = stage_payload.get("cfg_kv_collect_func")
-    cfg_kv_collect_func = None
-    if cfg_kv_collect_func_path:
-        _mod_path, _fn_name = cfg_kv_collect_func_path.rsplit(".", 1)
-        cfg_kv_collect_func = getattr(importlib.import_module(_mod_path), _fn_name)
+    cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
 
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
@@ -1097,11 +1084,7 @@ async def _stage_worker_async(
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type = stage_payload.get("stage_type", "llm")
 
-    cfg_kv_collect_func_path = stage_payload.get("cfg_kv_collect_func")
-    cfg_kv_collect_func = None
-    if cfg_kv_collect_func_path:
-        _mod_path, _fn_name = cfg_kv_collect_func_path.rsplit(".", 1)
-        cfg_kv_collect_func = getattr(importlib.import_module(_mod_path), _fn_name)
+    cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
 
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
