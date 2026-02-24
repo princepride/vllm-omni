@@ -133,19 +133,6 @@ def collect_cfg_kv_caches(
     return result
 
 
-def is_cfg_companion_request(request_id: str) -> bool:
-    """Check if a request ID belongs to a CFG companion (not a user request)."""
-    return request_id.endswith(CFG_TEXT_SUFFIX)
-
-
-def get_parent_request_id(companion_request_id: str) -> str:
-    """Extract the parent request ID from a companion request ID."""
-    for suffix in (CFG_TEXT_SUFFIX,):
-        if companion_request_id.endswith(suffix):
-            return companion_request_id[: -len(suffix)]
-    return companion_request_id
-
-
 def _get_negative_prompt(
     prompt: dict[str, Any],
     sampling_params: Any,
