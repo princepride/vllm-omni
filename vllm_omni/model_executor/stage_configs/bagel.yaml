@@ -6,6 +6,8 @@ stage_args:
     prompt_expand_func: vllm_omni.model_executor.stage_input_processors.bagel.expand_cfg_prompts
     runtime:
       devices: "0"
+      # 2 = 1 user prompt + 1 CFG companion (text-unconditional).
+      # For multi-prompt batches this should scale as batch_size × 2.
       max_batch_size: 2
     engine_args:
       model_stage: thinker
