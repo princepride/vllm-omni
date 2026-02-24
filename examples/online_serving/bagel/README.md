@@ -131,12 +131,24 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
     -omp 8091
 ```
 
+**Mooncake Master arguments:**
+
+| Argument | Description |
+| :------- | :---------- |
+| `--rpc_port` | Mooncake RPC port for control-plane coordination between stages |
+| `--enable_http_metadata_server` | Enable the HTTP metadata server for service discovery |
+| `--http_metadata_server_host` | IP address to bind the metadata server (use the orchestrator node's IP) |
+| `--http_metadata_server_port` | Port for the HTTP metadata server |
+| `--metrics_port` | Port for Prometheus-compatible metrics endpoint |
+
+**vllm serve arguments:**
+
 | Argument | Description |
 | :------- | :---------- |
 | `--stage-id` | Which stage this process runs (0 = Thinker, 1 = DiT) |
 | `--headless` | Run without the API server (worker-only mode) |
 | `-oma` | Orchestrator master address |
-| `-omp` | Orchestrator master port for Stage 1 to connect to Stage 0 for task coordination|
+| `-omp` | Orchestrator master port for Stage 1 to connect to Stage 0 for task coordination |
 
 > **Note**: Stage 0 (orchestrator) must be launched **before** Stage 1 (headless). Stage 0 will hang on startup until Stage 1 (worker) connects.
 
