@@ -852,7 +852,6 @@ class Omni(OmniBase):
                             metrics,
                             remaining_by_stage,
                             pbar,
-                            completed_requests,
                         )
                     continue
 
@@ -972,7 +971,6 @@ class Omni(OmniBase):
                                 metrics,
                                 remaining_by_stage,
                                 pbar,
-                                completed_requests,
                             )
                         else:
                             _pending_parent_results[req_id] = {
@@ -1083,7 +1081,6 @@ class Omni(OmniBase):
         metrics: OrchestratorAggregator,
         remaining_by_stage: list[int],
         pbar: tqdm | None,
-        completed_requests: int,
     ) -> None:
         """Forward a parent request to Stage-1 with CFG KV request IDs attached."""
         stage_id = parent_result["stage_id"]
