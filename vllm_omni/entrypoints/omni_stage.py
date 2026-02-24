@@ -655,9 +655,12 @@ class OmniStage:
         else:
             engine_input_source = self.engine_input_source
             if source_outputs_override is not None and engine_input_source:
-                # Temporarily set the source stage's outputs so that custom
-                # functions (which read from stage_list directly) see the
-                # correct data for deferred requests.
+                # Temporarily swap the source stage's engine_outputs so that
+                # custom_process_input_func (which reads from stage_list
+                # directly) sees the correct data for deferred requests.
+                # NOTE: This relies on the orchestrator being single-threaded.
+                # If concurrency is introduced, replace with a per-call context
+                # or a thread-local to avoid racing on shared mutable state.
                 _source_id = engine_input_source[0]
                 _orig_outputs = stage_list[_source_id].engine_outputs
                 stage_list[_source_id].engine_outputs = source_outputs_override
