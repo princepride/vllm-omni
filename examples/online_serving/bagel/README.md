@@ -93,7 +93,7 @@ For more details on the Mooncake connector configuration, see the [Mooncake Stor
 
 You can deploy each stage on a **separate node** for better resource utilization. In this example, the orchestrator (Stage 0 / Thinker) and Stage 1 (DiT) run on different machines, connected via Mooncake.
 
-Assume the orchestrator node IP is `10.244.227.244`.
+Replace `<ORCHESTRATOR_IP>` below with the actual IP address of your orchestrator node (e.g., `10.244.227.244`).
 
 > [!WARNING]
 > **Before launching**, edit [`bagel_multiconnector.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml) and replace the `metadata_server` and `master` addresses with your Mooncake master node's actual IP. Mismatched addresses will cause silent connection failures.
@@ -104,7 +104,7 @@ Assume the orchestrator node IP is `10.244.227.244`.
 mooncake_master \
   --rpc_port=50051 \
   --enable_http_metadata_server=true \
-  --http_metadata_server_host=10.244.227.244 \
+  --http_metadata_server_host=<ORCHESTRATOR_IP> \
   --http_metadata_server_port=8080 \
   --metrics_port=9003
 ```
@@ -113,10 +113,10 @@ mooncake_master \
 
 ```bash
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
-    --port 8000 \
+    --port 8000 \ # API server port for client requests
     --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml \
     --stage-id 0 \
-    -oma 10.244.227.244 \
+    -oma <ORCHESTRATOR_IP> \
     -omp 8091
 ```
 
@@ -127,7 +127,7 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
     --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml \
     --stage-id 1 \
     --headless \
-    -oma 10.244.227.244 \
+    -oma <ORCHESTRATOR_IP> \
     -omp 8091
 ```
 
@@ -150,7 +150,9 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
 | `-oma` | Orchestrator master address |
 | `-omp` | Orchestrator master port for Stage 1 to connect to Stage 0 for task coordination |
 
-> **Note**: Stage 0 (orchestrator) must be launched **before** Stage 1 (headless). Stage 0 will hang on startup until Stage 1 (worker) connects.
+> [!IMPORTANT]
+> **Startup Order**: Stage 0 (orchestrator) must be launched **before** Stage 1 (headless).
+> Stage 0 will appear to hang on startup until Stage 1 (worker) connects — this is expected behavior.
 
 **Network Requirements**
 

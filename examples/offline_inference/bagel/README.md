@@ -197,7 +197,7 @@ pip install mooncake-transfer-engine-non-cuda
 
 ### Step 1: Start the Mooncake Master
 
-On the **primary node**, start the Mooncake master service:
+On the **primary node**, start the Mooncake master service (run in a separate terminal or background with `&`):
 
 ```bash
 # Optional: enable disk-backed storage by creating a directory and passing --root_fs_dir.
@@ -211,7 +211,7 @@ mooncake_master \
   --http_metadata_server_port=8080 \
   --metrics_port=9003 \
   --root_fs_dir=./mc_storage/ \
-  --cluster_id=mc-local-1
+  --cluster_id=mc-local-1 &
 ```
 
 ### Step 2: Run Offline Inference with Mooncake
