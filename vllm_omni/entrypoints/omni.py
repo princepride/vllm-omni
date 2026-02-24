@@ -809,8 +809,7 @@ class Omni(OmniBase):
                         if parent_id is not None:
                             _cfg_failed_parents.add(parent_id)
                             logger.error(
-                                f"[{self._name}] CFG companion {req_id} failed; "
-                                f"marking parent {parent_id} as failed",
+                                f"[{self._name}] CFG companion {req_id} failed; marking parent {parent_id} as failed",
                             )
                             if parent_id in _pending_parent_results:
                                 _pending_parent_results.pop(parent_id)
