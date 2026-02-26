@@ -35,6 +35,7 @@ from vllm_omni.distributed.ray_utils.utils import (
     get_ray_queue_class,
     try_close_ray,
 )
+from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
@@ -892,39 +893,12 @@ class Omni(OmniBase):
         _req_start_ts: dict[str, float] = {}
         _wall_start_ts: float = time.time()
 
-        # If Stage-0 has a prompt_expand_func, expand each user prompt into
-        # additional companion requests (e.g., negative prompts for CFG).
-        prompt_expand_func = getattr(self.stage_list[0], "prompt_expand_func", None)
-        # Maps parent_req_id -> {role: companion_req_id}
-        cfg_companion_map: dict[str, dict[str, str]] = {}
-        # Set of all companion request IDs (not user-facing)
-        cfg_companion_ids: set[str] = set()
-        # Tracks which companions have completed Stage-0
-        cfg_companion_done: dict[str, set[str]] = {}
-        # Reverse index: companion_id -> parent_id for O(1) lookup
-        cfg_companion_to_parent: dict[str, str] = {}
-
-        if prompt_expand_func:
-            sp0 = sampling_params_list[0]  # type: ignore[index]
-            expanded_prompts_to_submit: list[tuple[str, Any]] = []
-            for rid, prompt in request_id_to_prompt.items():
-                expanded = prompt_expand_func(prompt, sp0)
-                if expanded:
-                    role_map: dict[str, str] = {}
-                    for ep in expanded:
-                        companion_id = f"{rid}{ep.request_id_suffix}"
-                        role_map[ep.role] = companion_id
-                        cfg_companion_ids.add(companion_id)
-                        cfg_companion_to_parent[companion_id] = rid
-                        expanded_prompts_to_submit.append((companion_id, ep.prompt))
-                    cfg_companion_map[rid] = role_map
-                    cfg_companion_done[rid] = set()
-            logger.debug(
-                "[%s] CFG expansion: %d parent requests -> %d companion requests",
-                self._name,
-                len(cfg_companion_map),
-                len(cfg_companion_ids),
-            )
+        # CFG companion tracking (prompt expansion + lifecycle management)
+        cfg = CfgCompanionTracker(
+            prompt_expand_func=getattr(self.stage_list[0], "prompt_expand_func", None),
+            stage0_sampling_params=sampling_params_list[0],
+        )
+        expanded_companions = cfg.expand_prompts(request_id_to_prompt)
 
         # Determine the final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
         final_stage_id_to_prompt: dict[str, int] = {}
@@ -968,12 +942,12 @@ class Omni(OmniBase):
             logger.debug(f"[{self._name}] Enqueued request {req_id} to stage-0")
 
         # Submit CFG companion requests to stage-0
-        if prompt_expand_func:
-            for companion_id, companion_prompt in expanded_prompts_to_submit:
+        if cfg.is_active:
+            for companion_id, companion_prompt in expanded_companions:
                 task = {
                     "request_id": companion_id,
                     "engine_inputs": companion_prompt,
-                    "sampling_params": sp0,
+                    "sampling_params": cfg.stage0_sampling_params,
                 }
                 self.stage_list[0].submit(task)
                 _req_start_ts[companion_id] = time.time()
@@ -990,19 +964,13 @@ class Omni(OmniBase):
             )
         # For each stage, forward results to next stage; collect finals at the end
         # We pipeline by continually polling output queues in stage order
-        remaining_by_stage: list[int] = [len(request_prompts) + len(cfg_companion_ids)] + [0] * (num_stages - 1)
+        remaining_by_stage: list[int] = [len(request_prompts) + cfg.num_companions] + [0] * (num_stages - 1)
         completed_requests = 0
         total_requests = len(request_prompts)
 
         logger.debug(
             f"[{self._name}] Entering scheduling loop: total_requests={total_requests}, stages={num_stages}",
         )
-        # Parent requests that finished Stage-0 but are waiting for companions
-        _pending_parent_results: dict[str, Any] = {}
-        # Parents whose CFG companions have failed
-        _cfg_failed_parents: set[str] = set()
-        # Safety timeout (seconds) for parent requests waiting for CFG companion completion.
-        cfg_pending_timeout = float(os.environ.get("VLLM_CFG_PENDING_TIMEOUT_S", "120"))
 
         while completed_requests < total_requests:
             made_progress = False
@@ -1017,22 +985,14 @@ class Omni(OmniBase):
                     logger.error(
                         f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
                     )
-                    # Propagate companion failure to the parent so it does not
-                    # wait forever (deadlock).
-                    if req_id in cfg_companion_ids and stage_id == 0:
-                        parent_id = cfg_companion_to_parent.get(req_id)
-                        if parent_id is not None:
-                            _cfg_failed_parents.add(parent_id)
+                    if cfg.is_companion(req_id) and stage_id == 0:
+                        parent_id, parent_aborted = cfg.on_companion_error(req_id)
+                        if parent_aborted:
+                            completed_requests += 1
                             logger.error(
-                                f"[{self._name}] CFG companion {req_id} failed; marking parent {parent_id} as failed",
+                                f"[{self._name}] Parent {parent_id} aborted due to "
+                                f"companion failure ({completed_requests}/{total_requests})",
                             )
-                            if parent_id in _pending_parent_results:
-                                _pending_parent_results.pop(parent_id)
-                                completed_requests += 1
-                                logger.error(
-                                    f"[{self._name}] Parent {parent_id} aborted due to "
-                                    f"companion failure ({completed_requests}/{total_requests})",
-                                )
                     continue
 
                 if result.get("type") == "stage_ready":
@@ -1041,29 +1001,19 @@ class Omni(OmniBase):
                     time.sleep(0.05)
                     continue
 
-                # CFG: Handle companion requests at Stage-0
-                if req_id in cfg_companion_ids and stage_id == 0:
-                    logger.debug(f"[{self._name}] CFG companion {req_id} completed at stage-0")
-                    companion_parent_id = cfg_companion_to_parent.get(req_id)
-                    if companion_parent_id is not None:
-                        cfg_companion_done[companion_parent_id].add(req_id)
-                    # Only check *this* parent — it is the only one whose
-                    # completion status could have changed.
-                    if (
-                        companion_parent_id is not None
-                        and companion_parent_id in _pending_parent_results
-                        and self._all_companions_done(companion_parent_id, cfg_companion_map, cfg_companion_done)
-                    ):
+                # CFG: companion requests only run through Stage-0
+                if cfg.is_companion(req_id) and stage_id == 0:
+                    ready_parent = cfg.on_companion_completed(req_id)
+                    if ready_parent is not None:
                         self._forward_parent_with_cfg(
-                            companion_parent_id,
-                            _pending_parent_results.pop(companion_parent_id),
-                            cfg_companion_map,
+                            ready_parent,
+                            cfg.pop_pending_parent(ready_parent),
+                            cfg,
                             sampling_params_list,
                             request_id_to_prompt,
                             final_stage_id_to_prompt,
                             metrics,
                             remaining_by_stage,
-                            pbar,
                         )
                     continue
 
@@ -1161,10 +1111,9 @@ class Omni(OmniBase):
                     continue
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
                     # CFG: if this parent has companions, defer forwarding
-                    if req_id in cfg_companion_map and stage_id == 0:
-                        # If a companion already failed, abort this parent immediately.
-                        if req_id in _cfg_failed_parents:
-                            _cfg_failed_parents.discard(req_id)
+                    if cfg.has_companions(req_id) and stage_id == 0:
+                        if cfg.is_parent_failed(req_id):
+                            cfg.consume_parent_failure(req_id)
                             completed_requests += 1
                             logger.error(
                                 f"[{self._name}] Parent {req_id} skipped CFG forwarding due to "
@@ -1172,25 +1121,19 @@ class Omni(OmniBase):
                             )
                             continue
 
-                        if self._all_companions_done(req_id, cfg_companion_map, cfg_companion_done):
+                        if cfg.all_companions_done(req_id):
                             self._forward_parent_with_cfg(
                                 req_id,
                                 {"engine_outputs": engine_outputs, "stage_id": stage_id},
-                                cfg_companion_map,
+                                cfg,
                                 sampling_params_list,
                                 request_id_to_prompt,
                                 final_stage_id_to_prompt,
                                 metrics,
                                 remaining_by_stage,
-                                pbar,
                             )
                         else:
-                            _pending_parent_results[req_id] = {
-                                "engine_outputs": engine_outputs,
-                                "stage_id": stage_id,
-                                "pending_since": time.time(),
-                            }
-                            logger.debug(f"[{self._name}] Parent {req_id} waiting for CFG companions")
+                            cfg.defer_parent(req_id, engine_outputs, stage_id)
                         continue
 
                     next_stage: OmniStage = self.stage_list[next_stage_id]
@@ -1243,20 +1186,12 @@ class Omni(OmniBase):
                     logger.debug(
                         f"[{self._name}] Request {req_id} fully completed ({completed_requests}/{total_requests})",
                     )
-            # CFG: expire pending parents that have waited too long for their CFG companions
-            if _pending_parent_results:
-                _now = time.time()
-                for parent_id in list(_pending_parent_results.keys()):
-                    pending_since = _pending_parent_results[parent_id].get("pending_since", _now)
-                    if _now - pending_since > cfg_pending_timeout:
-                        _pending_parent_results.pop(parent_id)
-                        _cfg_failed_parents.discard(parent_id)
-                        completed_requests += 1
-                        logger.error(
-                            f"[{self._name}] Parent {parent_id} timed out waiting for CFG "
-                            f"companions (>{cfg_pending_timeout:.0f}s); counting as failed "
-                            f"({completed_requests}/{total_requests})",
-                        )
+            for timed_out_id in cfg.check_timeouts():
+                completed_requests += 1
+                logger.error(
+                    f"[{self._name}] Parent {timed_out_id} timed out; counting as failed "
+                    f"({completed_requests}/{total_requests})",
+                )
 
             if not made_progress:
                 time.sleep(0.005)
@@ -1271,30 +1206,18 @@ class Omni(OmniBase):
         except Exception as e:
             logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
 
-    @staticmethod
-    def _all_companions_done(
-        parent_id: str,
-        cfg_companion_map: dict[str, dict[str, str]],
-        cfg_companion_done: dict[str, set[str]],
-    ) -> bool:
-        """Check if all CFG companion requests for a parent have completed."""
-        role_map = cfg_companion_map.get(parent_id, {})
-        done_set = cfg_companion_done.get(parent_id, set())
-        return all(cid in done_set for cid in role_map.values())
-
     def _forward_parent_with_cfg(
         self,
         req_id: str,
         parent_result: dict[str, Any],
-        cfg_companion_map: dict[str, dict[str, str]],
+        cfg_tracker: CfgCompanionTracker,
         sampling_params_list: Sequence[OmniSamplingParams],
         request_id_to_prompt: dict[str, OmniPromptType],
         final_stage_id_to_prompt: dict[str, int],
         metrics: OrchestratorAggregator,
         remaining_by_stage: list[int],
-        pbar: tqdm | None,
     ) -> None:
-        """Forward a parent request to Stage-1 with CFG KV request IDs attached."""
+        """Forward a parent request to the next stage with CFG KV request IDs attached."""
         stage_id = parent_result["stage_id"]
         next_stage_id = stage_id + 1
         if next_stage_id > final_stage_id_to_prompt.get(req_id, 0):
@@ -1315,9 +1238,8 @@ class Omni(OmniBase):
             return
 
         sp_next = copy.deepcopy(sampling_params_list[next_stage_id])  # type: ignore[index]
-        # Attach CFG companion request IDs so the diffusion stage can fetch their KV caches
         if isinstance(sp_next, OmniDiffusionSamplingParams):
-            sp_next.cfg_kv_request_ids = cfg_companion_map[req_id]
+            sp_next.cfg_kv_request_ids = cfg_tracker.get_companion_request_ids(req_id)
             logger.info(
                 "[%s] Attaching cfg_kv_request_ids=%s to request %s",
                 self._name,
