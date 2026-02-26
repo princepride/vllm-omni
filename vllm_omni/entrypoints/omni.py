@@ -1065,8 +1065,7 @@ class Omni(OmniBase):
                     # End-to-end timing and time-per-token for final output
                     # (only once per request at the designated final stage)
                     try:
-                        # Ensure this is a primary request
-                        if req_id in final_stage_id_to_prompt and stage_id == final_stage_id_to_prompt[req_id]:
+                        if stage_id == final_stage_id_to_prompt[req_id]:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
@@ -1105,8 +1104,6 @@ class Omni(OmniBase):
                     yield output_to_yield
 
                 next_stage_id = stage_id + 1
-                if req_id not in final_stage_id_to_prompt:
-                    continue
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
                     # CFG: if this parent has companions, defer forwarding
                     if cfg.has_companions(req_id) and stage_id == 0:

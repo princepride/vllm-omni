@@ -632,10 +632,8 @@ class OmniStage:
         Args:
             stage_list: List of all stages in the pipeline
             prompt: Optional original prompt (for multimodal data preservation)
-            source_outputs_override: If provided, use these outputs instead of
-                reading from the source stage's shared engine_outputs attribute.
-                This avoids a race where deferred requests (e.g. CFG parents
-                waiting for companions) read stale/overwritten outputs.
+            source_outputs_override: Use these outputs instead of reading from
+                the source stage's ``engine_outputs`` (for deferred CFG requests).
 
         Returns:
             List of processed engine inputs ready for this stage
@@ -675,12 +673,8 @@ class OmniStage:
         else:
             engine_input_source = self.engine_input_source
             if source_outputs_override is not None and engine_input_source:
-                # Temporarily swap the source stage's engine_outputs so that
-                # custom_process_input_func (which reads from stage_list
-                # directly) sees the correct data for deferred requests.
-                # NOTE: This relies on the orchestrator being single-threaded.
-                # If concurrency is introduced, replace with a per-call context
-                # or a thread-local to avoid racing on shared mutable state.
+                # Temporarily swap engine_outputs so custom_process_input_func
+                # (which reads stage_list directly) sees the correct data.
                 _source_id = engine_input_source[0]
                 _orig_outputs = stage_list[_source_id].engine_outputs
                 stage_list[_source_id].engine_outputs = source_outputs_override
