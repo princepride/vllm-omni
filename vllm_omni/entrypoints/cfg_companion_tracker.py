@@ -8,11 +8,15 @@ so that ``Omni._run_generation`` stays clean.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
+
+from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 
 logger = logging.getLogger(__name__)
 
@@ -155,3 +159,73 @@ class CfgCompanionTracker:
                 timed_out.append(pid)
                 logger.error("Parent %s timed out waiting for CFG companions (>%.0fs)", pid, self._timeout_s)
         return timed_out
+
+    # -- Forward parent with CFG KV --
+
+    def forward_parent_with_cfg(
+        self,
+        req_id: str,
+        parent_result: dict[str, Any],
+        stage_list: Sequence[Any],
+        connectors: dict[tuple[str, str], Any],
+        sampling_params_list: Sequence[OmniSamplingParams],
+        request_id_to_prompt: dict[str, Any],
+        final_stage_id_to_prompt: dict[str, int],
+        metrics: Any,
+        remaining_by_stage: list[int],
+    ) -> None:
+        """Forward a parent request to the next stage with CFG KV request IDs attached."""
+        stage_id = parent_result["stage_id"]
+        next_stage_id = stage_id + 1
+        if next_stage_id > final_stage_id_to_prompt.get(req_id, 0):
+            return
+
+        next_stage = stage_list[next_stage_id]
+        try:
+            with metrics.stage_postprocess_timer(stage_id, req_id):
+                next_inputs = next_stage.process_engine_inputs(
+                    stage_list,
+                    [request_id_to_prompt[req_id]],
+                    source_outputs_override=parent_result["engine_outputs"],
+                )
+        except Exception as e:
+            logger.exception(
+                "Process engine inputs error for req %s at stage %d: %s",
+                req_id,
+                next_stage_id,
+                e,
+            )
+            return
+
+        sp_next = copy.deepcopy(sampling_params_list[next_stage_id])
+        if isinstance(sp_next, OmniDiffusionSamplingParams):
+            sp_next.cfg_kv_request_ids = self.get_companion_request_ids(req_id)
+            logger.info(
+                "Attaching cfg_kv_request_ids=%s to request %s",
+                sp_next.cfg_kv_request_ids,
+                req_id,
+            )
+
+        connector_key = (str(stage_id), str(next_stage_id))
+        connector = connectors.get(connector_key)
+        sent_via_connector = False
+        if connector:
+            sent_via_connector = try_send_via_connector(
+                connector=connector,
+                stage_id=stage_id,
+                next_stage_id=next_stage_id,
+                req_id=req_id,
+                next_inputs=next_inputs,
+                sampling_params=sp_next,
+                original_prompt=request_id_to_prompt[req_id],
+                next_stage_queue_submit_fn=stage_list[next_stage_id].submit,
+                metrics=metrics,
+            )
+
+        if not sent_via_connector:
+            raise RuntimeError(
+                f"Failed to send request {req_id} to stage-{next_stage_id} via connector. "
+                "Configure a connector for this edge or inspect connector logs for details."
+            )
+        logger.debug("Forwarded CFG-enabled request %s to stage-%d", req_id, next_stage_id)
+        remaining_by_stage[next_stage_id] += 1

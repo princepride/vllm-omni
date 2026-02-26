@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import copy
 import json
 import multiprocessing as mp
 import os
@@ -971,7 +970,6 @@ class Omni(OmniBase):
         logger.debug(
             f"[{self._name}] Entering scheduling loop: total_requests={total_requests}, stages={num_stages}",
         )
-
         while completed_requests < total_requests:
             made_progress = False
             for stage_id, stage in enumerate(self.stage_list):
@@ -1005,10 +1003,11 @@ class Omni(OmniBase):
                 if cfg.is_companion(req_id) and stage_id == 0:
                     ready_parent = cfg.on_companion_completed(req_id)
                     if ready_parent is not None:
-                        self._forward_parent_with_cfg(
+                        cfg.forward_parent_with_cfg(
                             ready_parent,
                             cfg.pop_pending_parent(ready_parent),
-                            cfg,
+                            self.stage_list,
+                            self.connectors,
                             sampling_params_list,
                             request_id_to_prompt,
                             final_stage_id_to_prompt,
@@ -1067,7 +1066,6 @@ class Omni(OmniBase):
                     # (only once per request at the designated final stage)
                     try:
                         # Ensure this is a primary request
-                        # (not a CFG companion request which isn't in final_stage_id_to_prompt)
                         if req_id in final_stage_id_to_prompt and stage_id == final_stage_id_to_prompt[req_id]:
                             metrics.on_finalize_request(
                                 stage_id,
@@ -1122,10 +1120,11 @@ class Omni(OmniBase):
                             continue
 
                         if cfg.all_companions_done(req_id):
-                            self._forward_parent_with_cfg(
+                            cfg.forward_parent_with_cfg(
                                 req_id,
                                 {"engine_outputs": engine_outputs, "stage_id": stage_id},
-                                cfg,
+                                self.stage_list,
+                                self.connectors,
                                 sampling_params_list,
                                 request_id_to_prompt,
                                 final_stage_id_to_prompt,
@@ -1205,71 +1204,6 @@ class Omni(OmniBase):
             metrics.build_and_log_summary()
         except Exception as e:
             logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
-
-    def _forward_parent_with_cfg(
-        self,
-        req_id: str,
-        parent_result: dict[str, Any],
-        cfg_tracker: CfgCompanionTracker,
-        sampling_params_list: Sequence[OmniSamplingParams],
-        request_id_to_prompt: dict[str, OmniPromptType],
-        final_stage_id_to_prompt: dict[str, int],
-        metrics: OrchestratorAggregator,
-        remaining_by_stage: list[int],
-    ) -> None:
-        """Forward a parent request to the next stage with CFG KV request IDs attached."""
-        stage_id = parent_result["stage_id"]
-        next_stage_id = stage_id + 1
-        if next_stage_id > final_stage_id_to_prompt.get(req_id, 0):
-            return
-
-        next_stage: OmniStage = self.stage_list[next_stage_id]
-        try:
-            with metrics.stage_postprocess_timer(stage_id, req_id):
-                next_inputs = next_stage.process_engine_inputs(
-                    self.stage_list,
-                    [request_id_to_prompt[req_id]],
-                    source_outputs_override=parent_result["engine_outputs"],
-                )
-        except Exception as e:
-            logger.exception(
-                f"[{self._name}] Process engine inputs error for req {req_id} at stage {next_stage_id}: {e}",
-            )
-            return
-
-        sp_next = copy.deepcopy(sampling_params_list[next_stage_id])  # type: ignore[index]
-        if isinstance(sp_next, OmniDiffusionSamplingParams):
-            sp_next.cfg_kv_request_ids = cfg_tracker.get_companion_request_ids(req_id)
-            logger.info(
-                "[%s] Attaching cfg_kv_request_ids=%s to request %s",
-                self._name,
-                sp_next.cfg_kv_request_ids,
-                req_id,
-            )
-
-        connector_key = (str(stage_id), str(next_stage_id))
-        connector = self.connectors.get(connector_key)
-        sent_via_connector = False
-        if connector:
-            sent_via_connector = try_send_via_connector(
-                connector=connector,
-                stage_id=stage_id,
-                next_stage_id=next_stage_id,
-                req_id=req_id,
-                next_inputs=next_inputs,
-                sampling_params=sp_next,
-                original_prompt=request_id_to_prompt[req_id],
-                next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
-                metrics=metrics,
-            )
-
-        if not sent_via_connector:
-            raise RuntimeError(
-                f"[{self._name}] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
-                "Configure a connector for this edge or inspect connector logs for details."
-            )
-        logger.debug(f"[{self._name}] Forwarded CFG-enabled request {req_id} to stage-{next_stage_id}")
-        remaining_by_stage[next_stage_id] += 1
 
     @property
     def _name(self) -> str:
