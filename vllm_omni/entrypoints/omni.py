@@ -1010,7 +1010,7 @@ class Omni(OmniBase):
                 if cfg.is_companion(req_id) and stage_id == 0:
                     ready_parent = cfg.on_companion_completed(req_id)
                     if ready_parent is not None:
-                        cfg.forward_parent_with_cfg(
+                        success = cfg.forward_parent_with_cfg(
                             ready_parent,
                             cfg.pop_pending_parent(ready_parent),
                             self.stage_list,
@@ -1021,6 +1021,13 @@ class Omni(OmniBase):
                             metrics,
                             remaining_by_stage,
                         )
+                        if not success:
+                            cfg.consume_parent_failure(ready_parent)
+                            completed_requests += 1
+                            logger.error(
+                                f"[{self._name}] Parent {ready_parent} dropped due to CFG forwarding failure "
+                                f"({completed_requests}/{total_requests})",
+                            )
                     continue
 
                 engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
@@ -1124,7 +1131,7 @@ class Omni(OmniBase):
                             continue
 
                         if cfg.all_companions_done(req_id):
-                            cfg.forward_parent_with_cfg(
+                            success = cfg.forward_parent_with_cfg(
                                 req_id,
                                 {"engine_outputs": engine_outputs, "stage_id": stage_id},
                                 self.stage_list,
@@ -1135,6 +1142,13 @@ class Omni(OmniBase):
                                 metrics,
                                 remaining_by_stage,
                             )
+                            if not success:
+                                cfg.consume_parent_failure(req_id)
+                                completed_requests += 1
+                                logger.error(
+                                    f"[{self._name}] Parent {req_id} dropped due to CFG forwarding failure "
+                                    f"({completed_requests}/{total_requests})",
+                                )
                         else:
                             cfg.defer_parent(req_id, engine_outputs, stage_id)
                         continue
@@ -1147,9 +1161,10 @@ class Omni(OmniBase):
                                 self.stage_list, [request_id_to_prompt[req_id]]
                             )
                     except Exception as e:
+                        completed_requests += 1
                         logger.exception(
                             f"[{self._name}] Process engine inputs error for req {req_id}"
-                            f" at stage {next_stage_id}: {e}",
+                            f" at stage {next_stage_id}: {e} ({completed_requests}/{total_requests})",
                         )
                         continue
                     sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
@@ -1172,10 +1187,14 @@ class Omni(OmniBase):
                         )
 
                     if not sent_via_connector:
-                        raise RuntimeError(
+                        completed_requests += 1
+                        logger.error(
                             f"[{self._name}] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
-                            "Configure a connector for this edge or inspect connector logs for details."
+                            f"Configure a connector for this edge or inspect connector logs for details. "
+                            f"({completed_requests}/{total_requests})"
                         )
+                        continue
+
                     logger.debug(
                         f"[{self._name}] Forwarded request {req_id} to stage-{next_stage_id}",
                     )

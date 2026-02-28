@@ -173,12 +173,12 @@ class CfgCompanionTracker:
         final_stage_id_to_prompt: dict[str, int],
         metrics: Any,
         remaining_by_stage: list[int],
-    ) -> None:
+    ) -> bool:
         """Forward a parent request to the next stage with CFG KV request IDs attached."""
         stage_id = parent_result["stage_id"]
         next_stage_id = stage_id + 1
         if next_stage_id > final_stage_id_to_prompt.get(req_id, 0):
-            return
+            return True
 
         next_stage = stage_list[next_stage_id]
         try:
@@ -195,7 +195,7 @@ class CfgCompanionTracker:
                 next_stage_id,
                 e,
             )
-            return
+            return False
 
         sp_next = copy.deepcopy(sampling_params_list[next_stage_id])
         if isinstance(sp_next, OmniDiffusionSamplingParams):
@@ -223,9 +223,12 @@ class CfgCompanionTracker:
             )
 
         if not sent_via_connector:
-            raise RuntimeError(
-                f"Failed to send request {req_id} to stage-{next_stage_id} via connector. "
+            logger.error(
+                f"Failed to send CFG request {req_id} to stage-{next_stage_id} via connector. "
                 "Configure a connector for this edge or inspect connector logs for details."
             )
+            return False
+
         logger.debug("Forwarded CFG-enabled request %s to stage-%d", req_id, next_stage_id)
         remaining_by_stage[next_stage_id] += 1
+        return True
