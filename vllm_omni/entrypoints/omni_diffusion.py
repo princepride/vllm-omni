@@ -85,17 +85,19 @@ class OmniDiffusion:
                     od_config.model_class_name = "NextStep11Pipeline"
                 od_config.tf_model_config = TransformerConfig()
                 od_config.update_multimodal_support()
-            elif model_type == "glm-image" or "GlmImageForConditionalGeneration" in architectures:
-                pipeline_class = "GlmImagePipeline"
-            elif architectures and len(architectures) == 1:
-                pipeline_class = architectures[0]
+            else:
+                pipeline_class = None
+                if model_type == "glm-image" or "GlmImageForConditionalGeneration" in architectures:
+                    pipeline_class = "GlmImagePipeline"
+                elif architectures and len(architectures) == 1:
+                    pipeline_class = architectures[0]
 
-            if pipeline_class is None:
-                raise ValueError(f"Unknown model type: {model_type}, architectures: {architectures}")
+                if pipeline_class is None:
+                    raise ValueError(f"Unknown model type: {model_type}, architectures: {architectures}")
 
-            od_config.model_class_name = pipeline_class
-            od_config.tf_model_config = TransformerConfig()
-            od_config.update_multimodal_support()
+                od_config.model_class_name = pipeline_class
+                od_config.tf_model_config = TransformerConfig()
+                od_config.update_multimodal_support()
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
