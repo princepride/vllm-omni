@@ -1187,13 +1187,10 @@ class Omni(OmniBase):
                         )
 
                     if not sent_via_connector:
-                        completed_requests += 1
-                        logger.error(
+                        raise RuntimeError(
                             f"[{self._name}] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
-                            f"Configure a connector for this edge or inspect connector logs for details. "
-                            f"({completed_requests}/{total_requests})"
+                            "Configure a connector for this edge or inspect connector logs for details."
                         )
-                        continue
 
                     logger.debug(
                         f"[{self._name}] Forwarded request {req_id} to stage-{next_stage_id}",

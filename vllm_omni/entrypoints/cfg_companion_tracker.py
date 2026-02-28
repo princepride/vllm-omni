@@ -223,11 +223,10 @@ class CfgCompanionTracker:
             )
 
         if not sent_via_connector:
-            logger.error(
+            raise RuntimeError(
                 f"Failed to send CFG request {req_id} to stage-{next_stage_id} via connector. "
                 "Configure a connector for this edge or inspect connector logs for details."
             )
-            return False
 
         logger.debug("Forwarded CFG-enabled request %s to stage-%d", req_id, next_stage_id)
         remaining_by_stage[next_stage_id] += 1
