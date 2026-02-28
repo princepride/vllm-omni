@@ -204,8 +204,7 @@ class BagelPipeline(nn.Module):
         vit_conf = SiglipVisionConfig.from_json_file(vit_config_path)
         if vit_conf.num_hidden_layers == 27:
             vit_conf.num_hidden_layers = 26
-        if not hasattr(vit_conf, "vision_use_head"):
-            vit_conf.vision_use_head = False
+        vit_conf.vision_use_head = False
         self.vit_model = SiglipVisionModel(vit_conf)
         self.image_processor = SiglipImageProcessor.from_pretrained(model_path, local_files_only=True)
 
