@@ -45,7 +45,7 @@ class CfgCompanionTracker:
 
     @property
     def is_active(self) -> bool:
-        return len(self._companion_ids) > 0
+        return bool(self._companion_ids)
 
     @property
     def num_companions(self) -> int:
