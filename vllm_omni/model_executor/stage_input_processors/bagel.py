@@ -123,11 +123,12 @@ def collect_cfg_kv_caches(
                     role,
                     companion_rid,
                 )
-        except Exception:
+        except Exception as e:
             logger.exception(
-                "Error collecting CFG KV cache for role=%s, rid=%s",
+                "Error collecting CFG KV cache for role=%s, rid=%s: %s",
                 role,
                 companion_rid,
+                e,
             )
 
     return result
