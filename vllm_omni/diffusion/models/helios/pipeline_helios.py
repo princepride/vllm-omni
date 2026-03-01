@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
@@ -41,6 +43,13 @@ def calculate_shift(
     b = base_shift - m * base_seq_len
     mu = image_seq_len * m + b
     return mu
+
+
+def optimized_scale(positive_flat, negative_flat):
+    dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
+    squared_norm = torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
+    st_star = dot_product / squared_norm
+    return st_star
 
 
 def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True) -> dict:
@@ -198,6 +207,8 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
 
         self.scheduler = HeliosScheduler(**scheduler_kwargs)
 
+        self.is_distilled = scheduler_kwargs.get("scheduler_type") == "dmd"
+
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
 
@@ -240,10 +251,34 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
         history_sizes: list | None = None,
         num_latent_frames_per_chunk: int = 9,
         keep_first_frame: bool = True,
+        # Stage 2 (pyramid multi-stage denoising)
+        is_enable_stage2: bool = False,
+        pyramid_num_stages: int = 3,
+        pyramid_num_inference_steps_list: list | None = None,
+        # DMD
+        is_amplify_first_chunk: bool = False,
+        # CFG Zero Star
+        use_cfg_zero_star: bool = False,
+        use_zero_init: bool = True,
+        zero_steps: int = 1,
         **kwargs,
     ) -> DiffusionOutput:
+        if pyramid_num_inference_steps_list is None:
+            pyramid_num_inference_steps_list = [10, 10, 10]
         if history_sizes is None:
             history_sizes = [16, 2, 1]
+
+        # Read Helios-specific params from extra_args
+        extra = getattr(req.sampling_params, "extra_args", {}) or {}
+        is_enable_stage2 = extra.get("is_enable_stage2", is_enable_stage2)
+        pyramid_num_stages = extra.get("pyramid_num_stages", pyramid_num_stages)
+        pyramid_num_inference_steps_list = extra.get(
+            "pyramid_num_inference_steps_list", pyramid_num_inference_steps_list
+        )
+        is_amplify_first_chunk = extra.get("is_amplify_first_chunk", is_amplify_first_chunk)
+        use_cfg_zero_star = extra.get("use_cfg_zero_star", use_cfg_zero_star)
+        use_zero_init = extra.get("use_zero_init", use_zero_init)
+        zero_steps = extra.get("zero_steps", zero_steps)
 
         if len(req.prompts) > 1:
             raise ValueError("This model only supports a single prompt, not a batched request.")
@@ -396,34 +431,61 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
                 latents=None,
             )
 
-            # Set up scheduler timesteps
-            patch_size = self.transformer.config.patch_size
-            image_seq_len = (latents.shape[-1] * latents.shape[-2] * latents.shape[-3]) // (
-                patch_size[0] * patch_size[1] * patch_size[2]
-            )
-            sigmas = np.linspace(0.999, 0.0, num_steps + 1)[:-1]
-            mu = calculate_shift(image_seq_len)
-            self.scheduler.set_timesteps(num_steps, device=device, sigmas=sigmas, mu=mu)
-            timesteps = self.scheduler.timesteps
-            self._num_timesteps = len(timesteps)
+            if not is_enable_stage2:
+                # Stage 1 only: single-stage denoising
+                patch_size = self.transformer.config.patch_size
+                image_seq_len = (latents.shape[-1] * latents.shape[-2] * latents.shape[-3]) // (
+                    patch_size[0] * patch_size[1] * patch_size[2]
+                )
+                sigmas = np.linspace(0.999, 0.0, num_steps + 1)[:-1]
+                mu = calculate_shift(image_seq_len)
+                self.scheduler.set_timesteps(num_steps, device=device, sigmas=sigmas, mu=mu)
+                timesteps = self.scheduler.timesteps
+                self._num_timesteps = len(timesteps)
 
-            # Stage 1 denoising
-            latents = self._stage1_sample(
-                latents=latents,
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
-                timesteps=timesteps,
-                guidance_scale=guidance_scale,
-                indices_hidden_states=indices_hidden_states,
-                indices_latents_history_short=indices_latents_history_short,
-                indices_latents_history_mid=indices_latents_history_mid,
-                indices_latents_history_long=indices_latents_history_long,
-                latents_history_short=latents_history_short,
-                latents_history_mid=latents_history_mid,
-                latents_history_long=latents_history_long,
-                attention_kwargs=attention_kwargs,
-                transformer_dtype=dtype,
-            )
+                latents = self._stage1_sample(
+                    latents=latents,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    timesteps=timesteps,
+                    guidance_scale=guidance_scale,
+                    indices_hidden_states=indices_hidden_states,
+                    indices_latents_history_short=indices_latents_history_short,
+                    indices_latents_history_mid=indices_latents_history_mid,
+                    indices_latents_history_long=indices_latents_history_long,
+                    latents_history_short=latents_history_short,
+                    latents_history_mid=latents_history_mid,
+                    latents_history_long=latents_history_long,
+                    attention_kwargs=attention_kwargs,
+                    transformer_dtype=dtype,
+                    use_cfg_zero_star=use_cfg_zero_star,
+                    use_zero_init=use_zero_init,
+                    zero_steps=zero_steps,
+                )
+            else:
+                # Stage 2: pyramid multi-stage denoising
+                latents = self._stage2_sample(
+                    latents=latents,
+                    pyramid_num_stages=pyramid_num_stages,
+                    pyramid_num_inference_steps_list=pyramid_num_inference_steps_list,
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    guidance_scale=guidance_scale,
+                    indices_hidden_states=indices_hidden_states,
+                    indices_latents_history_short=indices_latents_history_short,
+                    indices_latents_history_mid=indices_latents_history_mid,
+                    indices_latents_history_long=indices_latents_history_long,
+                    latents_history_short=latents_history_short,
+                    latents_history_mid=latents_history_mid,
+                    latents_history_long=latents_history_long,
+                    attention_kwargs=attention_kwargs,
+                    transformer_dtype=dtype,
+                    is_amplify_first_chunk=is_amplify_first_chunk and is_first_chunk,
+                    use_cfg_zero_star=use_cfg_zero_star,
+                    use_zero_init=use_zero_init,
+                    zero_steps=zero_steps,
+                    device=device,
+                )
 
             if keep_first_frame and is_first_chunk and image_latents is None:
                 image_latents = latents[:, :, 0:1, :, :]
@@ -472,18 +534,21 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
         latents_history_long: torch.Tensor,
         attention_kwargs: dict,
         transformer_dtype: torch.dtype,
+        use_cfg_zero_star: bool = False,
+        use_zero_init: bool = True,
+        zero_steps: int = 1,
     ) -> torch.Tensor:
         """Single-stage denoising loop for one chunk."""
-        for t in timesteps:
+        batch_size = latents.shape[0]
+        do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+
+        for i, t in enumerate(timesteps):
             self._current_timestep = t
-            timestep = t.expand(latents.shape[0])
+            timestep = t.expand(batch_size)
 
-            do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
-
-            positive_kwargs = {
+            transformer_kwargs = {
                 "hidden_states": latents.to(transformer_dtype),
                 "timestep": timestep,
-                "encoder_hidden_states": prompt_embeds,
                 "indices_hidden_states": indices_hidden_states,
                 "indices_latents_history_short": indices_latents_history_short,
                 "indices_latents_history_mid": indices_latents_history_mid,
@@ -495,11 +560,140 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
                 "return_dict": False,
             }
 
-            if do_true_cfg:
-                negative_kwargs = {
+            if use_cfg_zero_star and do_true_cfg:
+                noise_pred = self.transformer(
+                    encoder_hidden_states=prompt_embeds,
+                    **transformer_kwargs,
+                )[0]
+
+                noise_uncond = self.transformer(
+                    encoder_hidden_states=negative_prompt_embeds,
+                    **transformer_kwargs,
+                )[0]
+
+                positive_flat = noise_pred.view(batch_size, -1)
+                negative_flat = noise_uncond.view(batch_size, -1)
+                alpha_cfg = optimized_scale(positive_flat, negative_flat)
+                alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1)))
+                alpha_cfg = alpha_cfg.to(noise_pred.dtype)
+
+                if (i <= zero_steps) and use_zero_init:
+                    noise_pred = noise_pred * 0.0
+                else:
+                    noise_pred = noise_uncond * alpha_cfg + guidance_scale * (noise_pred - noise_uncond * alpha_cfg)
+            else:
+                positive_kwargs = {
+                    "encoder_hidden_states": prompt_embeds,
+                    **transformer_kwargs,
+                }
+                if do_true_cfg:
+                    negative_kwargs = {
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        **transformer_kwargs,
+                    }
+                else:
+                    negative_kwargs = None
+
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                )
+
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
+        return latents
+
+    def _stage2_sample(
+        self,
+        latents: torch.Tensor,
+        pyramid_num_stages: int,
+        pyramid_num_inference_steps_list: list[int],
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        guidance_scale: float,
+        indices_hidden_states: torch.Tensor,
+        indices_latents_history_short: torch.Tensor,
+        indices_latents_history_mid: torch.Tensor,
+        indices_latents_history_long: torch.Tensor,
+        latents_history_short: torch.Tensor,
+        latents_history_mid: torch.Tensor,
+        latents_history_long: torch.Tensor,
+        attention_kwargs: dict,
+        transformer_dtype: torch.dtype,
+        is_amplify_first_chunk: bool = False,
+        use_cfg_zero_star: bool = False,
+        use_zero_init: bool = True,
+        zero_steps: int = 1,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        """Pyramid multi-stage denoising for one chunk."""
+        batch_size, num_channel, num_frames_lat, height, width = latents.shape
+
+        # Downsample latents to the smallest pyramid level
+        latents_flat = latents.permute(0, 2, 1, 3, 4).reshape(batch_size * num_frames_lat, num_channel, height, width)
+        for _ in range(pyramid_num_stages - 1):
+            height //= 2
+            width //= 2
+            latents_flat = F.interpolate(latents_flat, size=(height, width), mode="bilinear") * 2
+        latents = latents_flat.reshape(batch_size, num_frames_lat, num_channel, height, width).permute(0, 2, 1, 3, 4)
+
+        start_point_list = None
+        if self.is_distilled:
+            start_point_list = [latents]
+
+        do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+
+        for i_s in range(pyramid_num_stages):
+            patch_size = self.transformer.config.patch_size
+            image_seq_len = (latents.shape[-1] * latents.shape[-2] * latents.shape[-3]) // (
+                patch_size[0] * patch_size[1] * patch_size[2]
+            )
+            mu = calculate_shift(image_seq_len)
+            self.scheduler.set_timesteps(
+                pyramid_num_inference_steps_list[i_s],
+                stage_index=i_s,
+                device=device,
+                mu=mu,
+                is_amplify_first_chunk=is_amplify_first_chunk,
+            )
+            timesteps = self.scheduler.timesteps
+
+            if i_s > 0:
+                # Upsample latents to next pyramid level
+                height *= 2
+                width *= 2
+                num_frames_cur = latents.shape[2]
+                latents_flat = latents.permute(0, 2, 1, 3, 4).reshape(
+                    batch_size * num_frames_cur, num_channel, height // 2, width // 2
+                )
+                latents_flat = F.interpolate(latents_flat, size=(height, width), mode="nearest")
+                latents = latents_flat.reshape(batch_size, num_frames_cur, num_channel, height, width).permute(
+                    0, 2, 1, 3, 4
+                )
+
+                # Add block noise to fix artifacts between stages
+                ori_sigma = 1 - self.scheduler.ori_start_sigmas[i_s]
+                gamma = self.scheduler.config.gamma
+                alpha = 1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
+                beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
+
+                noise = self.sample_block_noise(batch_size, num_channel, latents.shape[2], height, width, patch_size)
+                noise = noise.to(device=device, dtype=transformer_dtype)
+                latents = alpha * latents + beta * noise
+
+                if self.is_distilled and start_point_list is not None:
+                    start_point_list.append(latents)
+
+            for idx, t in enumerate(timesteps):
+                self._current_timestep = t
+                timestep = t.expand(latents.shape[0]).to(torch.int64)
+
+                transformer_kwargs = {
                     "hidden_states": latents.to(transformer_dtype),
                     "timestep": timestep,
-                    "encoder_hidden_states": negative_prompt_embeds,
                     "indices_hidden_states": indices_hidden_states,
                     "indices_latents_history_short": indices_latents_history_short,
                     "indices_latents_history_mid": indices_latents_history_mid,
@@ -510,20 +704,61 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
                     "attention_kwargs": attention_kwargs,
                     "return_dict": False,
                 }
-            else:
-                negative_kwargs = None
 
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=do_true_cfg,
-                true_cfg_scale=guidance_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=False,
-            )
+                noise_pred = self.transformer(
+                    encoder_hidden_states=prompt_embeds,
+                    **transformer_kwargs,
+                )[0]
 
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if do_true_cfg:
+                    noise_uncond = self.transformer(
+                        encoder_hidden_states=negative_prompt_embeds,
+                        **transformer_kwargs,
+                    )[0]
+
+                    if use_cfg_zero_star:
+                        positive_flat = noise_pred.view(batch_size, -1)
+                        negative_flat = noise_uncond.view(batch_size, -1)
+                        alpha_cfg = optimized_scale(positive_flat, negative_flat)
+                        alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1)))
+                        alpha_cfg = alpha_cfg.to(noise_pred.dtype)
+
+                        if (i_s == 0 and idx <= zero_steps) and use_zero_init:
+                            noise_pred = noise_pred * 0.0
+                        else:
+                            noise_pred = noise_uncond * alpha_cfg + guidance_scale * (
+                                noise_pred - noise_uncond * alpha_cfg
+                            )
+                    else:
+                        noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+
+                latents = self.scheduler.step(
+                    noise_pred,
+                    t,
+                    latents,
+                    return_dict=False,
+                    cur_sampling_step=idx,
+                    dmd_noisy_tensor=start_point_list[i_s] if start_point_list is not None else None,
+                    dmd_sigmas=self.scheduler.sigmas,
+                    dmd_timesteps=self.scheduler.timesteps,
+                    all_timesteps=timesteps,
+                )[0]
 
         return latents
+
+    def sample_block_noise(self, batch_size, channel, num_frames, height, width, patch_size=(1, 2, 2)):
+        gamma = self.scheduler.config.gamma
+        _, ph, pw = patch_size
+        block_size = ph * pw
+
+        cov = torch.eye(block_size) * (1 + gamma) - torch.ones(block_size, block_size) * gamma
+        dist = torch.distributions.MultivariateNormal(torch.zeros(block_size, device=cov.device), covariance_matrix=cov)
+        block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
+
+        noise = dist.sample((block_number,))
+        noise = noise.view(batch_size, channel, num_frames, height // ph, width // pw, ph, pw)
+        noise = noise.permute(0, 1, 2, 3, 5, 4, 6).reshape(batch_size, channel, num_frames, height, width)
+        return noise
 
     def predict_noise(self, **kwargs: Any) -> torch.Tensor:
         return self.transformer(**kwargs)[0]
