@@ -52,9 +52,10 @@ def optimized_scale(positive_flat, negative_flat):
     return st_star
 
 
-def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True) -> dict:
+def load_json_config(model_path: str, subfolder: str, filename: str, local_files_only: bool = True) -> dict:
+    """Load a JSON config file from a local path or HuggingFace Hub repo."""
     if local_files_only:
-        config_path = os.path.join(model_path, subfolder, "config.json")
+        config_path = os.path.join(model_path, subfolder, filename)
         if os.path.exists(config_path):
             with open(config_path) as f:
                 return json.load(f)
@@ -64,13 +65,17 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
 
             config_path = hf_hub_download(
                 repo_id=model_path,
-                filename=f"{subfolder}/config.json",
+                filename=f"{subfolder}/{filename}",
             )
             with open(config_path) as f:
                 return json.load(f)
         except Exception:
             pass
     return {}
+
+
+def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True) -> dict:
+    return load_json_config(model_path, subfolder, "config.json", local_files_only)
 
 
 def create_transformer_from_config(config: dict) -> HeliosTransformer3DModel:
@@ -179,32 +184,29 @@ class HeliosPipeline(nn.Module, CFGParallelMixin):
         self.transformer = create_transformer_from_config(transformer_config)
 
         # Read scheduler config to determine scheduler type
-        scheduler_config_path = os.path.join(model, "scheduler", "scheduler_config.json") if local_files_only else None
+        sched_cfg = load_json_config(model, "scheduler", "scheduler_config.json", local_files_only)
         scheduler_kwargs = {}
-        if scheduler_config_path and os.path.exists(scheduler_config_path):
-            with open(scheduler_config_path) as f:
-                sched_cfg = json.load(f)
-                passthrough_keys = [
-                    "num_train_timesteps",
-                    "shift",
-                    "stages",
-                    "stage_range",
-                    "gamma",
-                    "thresholding",
-                    "prediction_type",
-                    "solver_order",
-                    "predict_x0",
-                    "solver_type",
-                    "lower_order_final",
-                    "disable_corrector",
-                    "use_flow_sigmas",
-                    "scheduler_type",
-                    "use_dynamic_shifting",
-                    "time_shift_type",
-                ]
-                for key in passthrough_keys:
-                    if key in sched_cfg:
-                        scheduler_kwargs[key] = sched_cfg[key]
+        passthrough_keys = [
+            "num_train_timesteps",
+            "shift",
+            "stages",
+            "stage_range",
+            "gamma",
+            "thresholding",
+            "prediction_type",
+            "solver_order",
+            "predict_x0",
+            "solver_type",
+            "lower_order_final",
+            "disable_corrector",
+            "use_flow_sigmas",
+            "scheduler_type",
+            "use_dynamic_shifting",
+            "time_shift_type",
+        ]
+        for key in passthrough_keys:
+            if key in sched_cfg:
+                scheduler_kwargs[key] = sched_cfg[key]
 
         self.scheduler = HeliosScheduler(**scheduler_kwargs)
 
