@@ -172,7 +172,7 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
         self.num_inference_steps = num_inference_steps
         self.init_sigmas()
 
-        if self.config.stages == 1:
+        if self.config.stages == 1 or stage_index is None:
             if sigmas is None:
                 sigmas = np.linspace(1, 1 / self.config.num_train_timesteps, num_inference_steps + 1)[:-1].astype(
                     np.float32
