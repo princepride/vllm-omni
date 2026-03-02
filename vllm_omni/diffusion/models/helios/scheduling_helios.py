@@ -207,7 +207,7 @@ class HeliosScheduler(SchedulerMixin, ConfigMixin):
         if self.config.use_dynamic_shifting:
             assert self.config.shift == 1.0
             self.sigmas = self.time_shift(mu, 1.0, self.sigmas)
-            if self.config.stages == 1:
+            if self.config.stages == 1 or stage_index is None:
                 self.timesteps = self.sigmas[:-1] * self.config.num_train_timesteps
             else:
                 self.timesteps = self.timesteps_per_stage[stage_index].min() + self.sigmas[:-1] * (
