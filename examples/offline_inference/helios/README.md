@@ -149,13 +149,13 @@ python end2end.py \
 | `--model` | `BestWishYsh/Helios-Base` | Model ID or local path |
 | `--sample-type` | `t2v` | Generation mode: `t2v`, `i2v`, or `v2v` |
 | `--prompt` | — | Text prompt describing the video |
-| `--negative-prompt` | `""` | Negative prompt for CFG |
+| `--negative-prompt` | *(see source)* | Negative prompt for CFG (includes anti-static terms) |
 | `--image-path` | — | Input image (required for `i2v`) |
 | `--video-path` | — | Input video (required for `v2v`) |
 | `--height` | `384` | Video height in pixels |
 | `--width` | `640` | Video width in pixels |
-| `--num-frames` | `33` | Number of output frames |
-| `--num-inference-steps` | `30` | Denoising steps (Stage 1 only) |
+| `--num-frames` | `99` | Number of output frames |
+| `--num-inference-steps` | `50` | Denoising steps (Stage 1 only) |
 | `--guidance-scale` | `5.0` | CFG scale (`1.0` for Distilled) |
 | `--seed` | `42` | Random seed |
 | `--fps` | `16` | Output video frame rate |

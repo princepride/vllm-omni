@@ -8,8 +8,8 @@ Usage (T2V, Helios-Base, Stage 1 only):
     python end2end.py \
         --model /path/to/Helios-Base --sample-type t2v \
         --prompt "A serene lakeside sunrise with mist over the water." \
-        --height 384 --width 640 --num-frames 33 \
-        --num-inference-steps 30 --guidance-scale 5.0
+        --height 384 --width 640 --num-frames 99 \
+        --num-inference-steps 50 --guidance-scale 5.0
 
 Usage (I2V, Helios-Base):
     python end2end.py \
@@ -105,13 +105,23 @@ def parse_args() -> argparse.Namespace:
         help="Generation mode: t2v (text-to-video), i2v (image-to-video), v2v (video-to-video).",
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
-    parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
+    parser.add_argument(
+        "--negative-prompt",
+        default=(
+            "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, "
+            "images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, "
+            "incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, "
+            "misshapen limbs, fused fingers, still picture, messy background, three legs, many people "
+            "in the background, walking backwards"
+        ),
+        help="Negative prompt.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance-scale", type=float, default=5.0, help="CFG scale.")
     parser.add_argument("--height", type=int, default=384, help="Video height.")
     parser.add_argument("--width", type=int, default=640, help="Video width.")
-    parser.add_argument("--num-frames", type=int, default=33, help="Number of video frames.")
-    parser.add_argument("--num-inference-steps", type=int, default=30, help="Sampling steps (Stage 1 only).")
+    parser.add_argument("--num-frames", type=int, default=99, help="Number of video frames.")
+    parser.add_argument("--num-inference-steps", type=int, default=50, help="Sampling steps (Stage 1 only).")
     parser.add_argument("--output", type=str, default="helios_output.mp4", help="Output video path.")
     parser.add_argument("--fps", type=int, default=16, help="Frames per second for the output video.")
 
@@ -294,6 +304,10 @@ def main():
             else:
                 raise ValueError("No video frames found in OmniRequestOutput.")
 
+    # Unwrap batch list from postprocess_video: [numpy(T,H,W,C)] -> numpy(T,H,W,C)
+    if isinstance(frames, list) and len(frames) > 0 and isinstance(frames[0], np.ndarray):
+        frames = frames[0]
+
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -313,13 +327,13 @@ def main():
         if video_tensor.is_floating_point():
             video_tensor = video_tensor.clamp(-1, 1) * 0.5 + 0.5
         video_array = video_tensor.float().numpy()
+    elif isinstance(frames, np.ndarray):
+        video_array = frames
     else:
         video_array = frames
-        if hasattr(video_array, "shape") and video_array.ndim == 5:
-            video_array = video_array[0]
 
-    if isinstance(video_array, np.ndarray) and video_array.ndim == 4:
-        video_array = list(video_array)
+    if isinstance(video_array, np.ndarray) and video_array.ndim == 5:
+        video_array = video_array[0]
 
     export_to_video(video_array, str(output_path), fps=args.fps)
     print(f"Saved generated video to {output_path}")
