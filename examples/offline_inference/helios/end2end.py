@@ -2,30 +2,42 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Helios Text-to-Video generation example.
+Helios video generation example supporting T2V, I2V, and V2V.
 
-Usage (Helios-Base, Stage 1 only):
-    python helios_text_to_video.py \
-        --model /path/to/Helios-Base \
+Usage (T2V, Helios-Base, Stage 1 only):
+    python end2end.py \
+        --model /path/to/Helios-Base --sample-type t2v \
         --prompt "A serene lakeside sunrise with mist over the water." \
         --height 384 --width 640 --num-frames 33 \
         --num-inference-steps 30 --guidance-scale 5.0
 
+Usage (I2V, Helios-Base):
+    python end2end.py \
+        --model /path/to/Helios-Base --sample-type i2v \
+        --image-path /path/to/image.jpg \
+        --prompt "Description of desired animation." \
+        --guidance-scale 5.0
+
+Usage (V2V, Helios-Base):
+    python end2end.py \
+        --model /path/to/Helios-Base --sample-type v2v \
+        --video-path /path/to/video.mp4 \
+        --prompt "Description of desired transformation." \
+        --guidance-scale 5.0
+
 Usage (Helios-Mid, Stage 2 + CFG-Zero*):
-    python helios_text_to_video.py \
-        --model /path/to/Helios-Mid \
+    python end2end.py \
+        --model /path/to/Helios-Mid --sample-type t2v \
         --prompt "A serene lakeside sunrise with mist over the water." \
-        --height 384 --width 640 --num-frames 33 \
         --guidance-scale 5.0 \
         --is-enable-stage2 \
         --pyramid-num-inference-steps-list 20 20 20 \
         --use-cfg-zero-star --use-zero-init --zero-steps 1
 
 Usage (Helios-Distilled, Stage 2 pyramid + DMD):
-    python helios_text_to_video.py \
-        --model /path/to/Helios-Distilled \
+    python end2end.py \
+        --model /path/to/Helios-Distilled --sample-type t2v \
         --prompt "A serene lakeside sunrise with mist over the water." \
-        --height 384 --width 640 --num-frames 33 \
         --guidance-scale 1.0 \
         --is-enable-stage2 \
         --pyramid-num-inference-steps-list 2 2 2 \
@@ -46,12 +58,51 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 
+def load_image_as_tensor(image_path: str, height: int, width: int) -> torch.Tensor:
+    """Load an image and return a (1, C, H, W) tensor normalized to [-1, 1]."""
+    from PIL import Image
+    from torchvision import transforms
+
+    image = Image.open(image_path).convert("RGB").resize((width, height))
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ]
+    )
+    return transform(image).unsqueeze(0)
+
+
+def load_video_as_tensor(video_path: str, height: int, width: int) -> torch.Tensor:
+    """Load a video and return a (1, C, T, H, W) tensor normalized to [-1, 1]."""
+    from torchvision import transforms
+    from torchvision.io import read_video
+
+    video_frames, _, _ = read_video(video_path, output_format="TCHW")
+    video_frames = video_frames.float() / 255.0
+
+    transform = transforms.Compose(
+        [
+            transforms.Resize((height, width), antialias=True),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ]
+    )
+    video_frames = torch.stack([transform(f) for f in video_frames])
+    return video_frames.permute(1, 0, 2, 3).unsqueeze(0)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a video with Helios T2V.")
+    parser = argparse.ArgumentParser(description="Generate a video with Helios (T2V / I2V / V2V).")
     parser.add_argument(
         "--model",
         default="BestWishYsh/Helios-Base",
-        help="Helios model ID or local path (e.g. Helios-Base, Helios-Distilled).",
+        help="Helios model ID or local path (e.g. Helios-Base, Helios-Mid, Helios-Distilled).",
+    )
+    parser.add_argument(
+        "--sample-type",
+        choices=["t2v", "i2v", "v2v"],
+        default="t2v",
+        help="Generation mode: t2v (text-to-video), i2v (image-to-video), v2v (video-to-video).",
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
@@ -63,6 +114,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-inference-steps", type=int, default=30, help="Sampling steps (Stage 1 only).")
     parser.add_argument("--output", type=str, default="helios_output.mp4", help="Output video path.")
     parser.add_argument("--fps", type=int, default=16, help="Frames per second for the output video.")
+
+    # I2V / V2V
+    parser.add_argument("--image-path", type=str, default=None, help="Input image path for I2V mode.")
+    parser.add_argument("--video-path", type=str, default=None, help="Input video path for V2V mode.")
 
     # Stage 2 (pyramid multi-stage denoising)
     parser.add_argument(
@@ -144,6 +199,12 @@ def main():
         enforce_eager=args.enforce_eager,
     )
 
+    # Validate I2V / V2V arguments
+    if args.sample_type == "i2v" and not args.image_path:
+        raise ValueError("--image-path is required for I2V mode.")
+    if args.sample_type == "v2v" and not args.video_path:
+        raise ValueError("--video-path is required for V2V mode.")
+
     # Build extra_args for Helios-specific parameters
     extra_args = {}
     if args.is_enable_stage2:
@@ -158,10 +219,22 @@ def main():
         extra_args["use_zero_init"] = True
         extra_args["zero_steps"] = args.zero_steps
 
+    if args.sample_type == "i2v":
+        image_tensor = load_image_as_tensor(args.image_path, args.height, args.width)
+        extra_args["image"] = image_tensor
+    elif args.sample_type == "v2v":
+        video_tensor = load_video_as_tensor(args.video_path, args.height, args.width)
+        extra_args["video"] = video_tensor
+
     # Print generation configuration
     print(f"\n{'=' * 60}")
     print("Helios Generation Configuration:")
     print(f"  Model: {args.model}")
+    print(f"  Sample type: {args.sample_type.upper()}")
+    if args.sample_type == "i2v":
+        print(f"  Image: {args.image_path}")
+    elif args.sample_type == "v2v":
+        print(f"  Video: {args.video_path}")
     print(f"  Prompt: {args.prompt[:80]}{'...' if len(args.prompt) > 80 else ''}")
     print(f"  Video size: {args.width}x{args.height}, {args.num_frames} frames")
     print(f"  Inference steps: {args.num_inference_steps}")
