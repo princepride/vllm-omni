@@ -9,8 +9,15 @@ from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
+from vllm.model_executor.layers.layernorm import RMSNorm as VllmRMSNorm
+from vllm.model_executor.layers.linear import (
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.bagel import BagelForConditionalGeneration
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
+from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2MLP
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -31,6 +38,7 @@ from vllm.multimodal.processing import (
     BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptReplacement,
+    PromptUpdateDetails,
 )
 from vllm.transformers_utils.processors.bagel import BagelProcessor
 
@@ -326,8 +334,19 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
                 new_w = min(new_w, max_img_size)
 
                 num_vae_patches = (new_h // latent_downsample) * (new_w // latent_downsample)
-                total = (num_vae_patches + 2) + (num_vit_patches + 2)
-                return [img2img_token_id] * total
+                num_vae_total = num_vae_patches + 2
+                num_vit_total = num_vit_patches + 2
+                # +1 separator between VAE and ViT blocks so that
+                # extract_embeds_range() produces two distinct mm_prefix_range
+                # entries, preventing VAE tokens from attending to ViT.
+                total = num_vae_total + 1 + num_vit_total
+                tokens = [img2img_token_id] * total
+
+                embed_mask = [True] * num_vae_total + [False] + [True] * num_vit_total
+                return PromptUpdateDetails(
+                    full=tokens,
+                    is_embed=lambda _tok, _seq, _m=embed_mask: torch.tensor(_m, dtype=torch.bool),
+                )
 
             replacements.append(
                 PromptReplacement(
@@ -424,6 +443,61 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         logger.info(
             "[AR init] vision boundary token IDs: start=%d, end=%d", self._start_of_image_id, self._end_of_image_id
         )
+
+        self._vae_token_mask: torch.Tensor | None = None
+
+        self._install_mot_modules(config)
+
+    def _install_mot_modules(self, config):
+        """Add generation-mode (MoT) weight modules to each Qwen2 decoder layer.
+
+        The single-stage DiT routes VAE latent tokens through separate
+        ``qkv_proj_moe_gen / o_proj_moe_gen / mlp_moe_gen`` weight matrices
+        (``mode="gen"``).  We replicate that structure here so the AR stage
+        produces the same KV cache values.
+        """
+        llm_cfg = config.llm_config
+        hidden_size = llm_cfg.hidden_size
+        intermediate_size = llm_cfg.intermediate_size
+        num_heads = llm_cfg.num_attention_heads
+        num_kv_heads = llm_cfg.num_key_value_heads
+        head_dim = hidden_size // num_heads
+        rms_eps = llm_cfg.rms_norm_eps
+
+        qwen2_model = self.language_model.model  # Qwen2Model
+
+        # Final norm (gen variant)
+        qwen2_model.norm_moe_gen = VllmRMSNorm(hidden_size, eps=rms_eps)
+
+        for layer in qwen2_model.layers:
+            if not isinstance(layer, Qwen2DecoderLayer):
+                continue
+            attn = layer.self_attn
+
+            attn.qkv_proj_moe_gen = QKVParallelLinear(
+                hidden_size,
+                head_dim,
+                num_heads,
+                num_kv_heads,
+                bias=True,
+            )
+            attn.o_proj_moe_gen = RowParallelLinear(
+                num_heads * head_dim,
+                hidden_size,
+                bias=False,
+            )
+            attn.q_norm_moe_gen = VllmRMSNorm(head_dim, eps=rms_eps)
+            attn.k_norm_moe_gen = VllmRMSNorm(head_dim, eps=rms_eps)
+
+            layer.mlp_moe_gen = Qwen2MLP(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=llm_cfg.hidden_act,
+            )
+            layer.input_layernorm_moe_gen = VllmRMSNorm(hidden_size, eps=rms_eps)
+            layer.post_attention_layernorm_moe_gen = VllmRMSNorm(hidden_size, eps=rms_eps)
+
+        logger.info("[AR init] Installed MoT gen-mode modules on %d layers", len(list(qwen2_model.layers)))
 
     def _resize_to_stride(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Resize pixel values to stride-aligned dimensions
@@ -647,6 +721,8 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
+        use_mot = False
+
         if self._pending_img2img_info:
             logger.info(
                 "[AR forward] before adjust: input_ids shape=%s, "
@@ -660,18 +736,20 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             if input_ids is not None:
                 logger.info("[AR forward] input_ids[:30]=%s", input_ids[:30].tolist())
             positions = self._adjust_positions_for_img2img(positions)
+            use_mot = True
 
         elif self._cfg_companions_remaining > 0 and self._cached_img2img_info is not None:
             self._cfg_companions_remaining -= 1
             cached = self._cached_img2img_info
             num_vae, num_vit, img_H, img_W = cached
-            num_img2img = num_vae + num_vit
+            num_img2img = num_vae + 1 + num_vit  # +1 separator
             seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
 
             if inputs_embeds is not None and seq_len >= num_img2img:
                 logger.info("[AR forward] cfg_text companion: seq_len=%d, reusing cached info=%s", seq_len, cached)
                 self._pending_img2img_info = [cached]
                 positions = self._adjust_positions_for_img2img(positions)
+                use_mot = True
             else:
                 rope = int(positions[seq_len - 1].item()) + 1
                 self._ropes_queue.append({"ropes": [rope]})
@@ -680,18 +758,25 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             if self._cfg_companions_remaining == 0:
                 self._cached_img2img_info = None
 
+        if use_mot:
+            return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
         return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
 
     def _adjust_positions_for_img2img(self, positions: torch.Tensor) -> torch.Tensor:
         """Rewrite position IDs to match the single-stage DiT scheme:
-        VAE tokens -> position 0, ViT tokens -> position 1, text -> 2, 3, ...
-        Also pushes per-request ropes + image_shape to the FIFO consumed by
+        VAE tokens -> position 0, separator -> position 0,
+        ViT tokens -> position 1, text -> 2, 3, ...
+
+        Also computes ``self._vae_token_mask`` (bool tensor, True for actual
+        VAE latent patches that should use gen-mode weights) and pushes
+        per-request ropes + image_shape to the FIFO consumed by
         ``get_kv_transfer_metadata``.
         """
         info_list = self._pending_img2img_info
         self._pending_img2img_info = []
 
         if not info_list:
+            self._vae_token_mask = None
             return positions
 
         logger.info("[AR positions] original positions[:20]=%s ... total=%d", positions[:20].tolist(), len(positions))
@@ -704,6 +789,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
         num_requests = len(boundaries) - 1
         new_positions = positions.clone()
+        vae_mask = torch.zeros(len(positions), dtype=torch.bool, device=positions.device)
 
         logger.info("[AR positions] %d requests, boundaries=%s, img2img_info=%s", num_requests, boundaries, info_list)
 
@@ -715,16 +801,31 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
             if img2img_idx < len(info_list):
                 num_vae, num_vit, img_H, img_W = info_list[img2img_idx]
-                num_img2img = num_vae + num_vit
+                # +1 separator between VAE and ViT blocks
+                num_img2img = num_vae + 1 + num_vit
 
                 if req_len >= num_img2img:
+                    # VAE block (including start/end markers): position 0
                     new_positions[start : start + num_vae] = 0
-                    new_positions[start + num_vae : start + num_img2img] = 1
+                    # Separator: shares VAE position 0
+                    new_positions[start + num_vae] = 0
+                    # ViT block (including start/end markers): position 1
+                    vit_start = start + num_vae + 1
+                    new_positions[vit_start : vit_start + num_vit] = 1
+                    # Text tokens: positions 2, 3, ...
                     num_text = req_len - num_img2img
                     if num_text > 0:
-                        new_positions[start + num_img2img : end] = torch.arange(
+                        text_start = start + num_img2img
+                        new_positions[text_start:end] = torch.arange(
                             2, 2 + num_text, device=positions.device, dtype=positions.dtype
                         )
+
+                    # VAE gen-mode mask: only actual VAE patches (not markers)
+                    # Layout: [start_marker, vae_patch_1, ..., vae_patch_N, end_marker, sep, ...]
+                    vae_patches_start = start + 1  # skip start_marker
+                    vae_patches_end = start + num_vae - 1  # before end_marker
+                    if vae_patches_end > vae_patches_start:
+                        vae_mask[vae_patches_start:vae_patches_end] = True
 
                     rope = 2 + num_text
                     self._ropes_queue.append(
@@ -735,9 +836,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                     )
                     logger.info(
                         "[AR positions] req[%d]: img2img, len=%d, "
-                        "num_vae=%d, num_vit=%d, num_text=%d, "
+                        "num_vae=%d(+1sep), num_vit=%d, num_text=%d, "
                         "rope=%d, image_shape=(%d,%d), "
-                        "positions[start:start+5]=%s",
+                        "vae_gen_count=%d",
                         req_idx,
                         req_len,
                         num_vae,
@@ -746,7 +847,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                         rope,
                         img_H,
                         img_W,
-                        new_positions[start : start + 5].tolist(),
+                        int(vae_mask[start:end].sum().item()),
                     )
                     img2img_idx += 1
                     continue
@@ -755,11 +856,177 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             self._ropes_queue.append({"ropes": [rope]})
             logger.info("[AR positions] req[%d]: text-only, len=%d, rope=%d", req_idx, req_len, rope)
 
+        self._vae_token_mask = vae_mask if vae_mask.any() else None
         return new_positions
+
+    # ------------------------------------------------------------------
+    # MoT (Mixture-of-Transformers) forward path
+    # ------------------------------------------------------------------
+
+    def _mot_forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors,
+        inputs_embeds: torch.Tensor | None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Full forward pass with MoT routing for img2img requests.
+
+        VAE latent patches are routed through ``*_moe_gen`` weight matrices
+        while all other tokens (markers, ViT, separator, text) use the
+        standard understanding-mode weights.
+        """
+        qwen2_model = self.language_model.model  # Qwen2Model
+
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = qwen2_model.embed_input_ids(input_ids)
+
+        residual = None
+        vae_mask = self._vae_token_mask
+        self._vae_token_mask = None  # consumed
+
+        for layer in qwen2_model.layers:
+            if not isinstance(layer, Qwen2DecoderLayer):
+                continue  # skip PPMissingLayer (pipeline parallelism)
+            hidden_states, residual = self._mot_layer_forward(
+                layer,
+                positions,
+                hidden_states,
+                residual,
+                vae_mask,
+            )
+
+        # Final norm with MoT routing
+        if residual is not None:
+            hidden_states = hidden_states + residual
+        if vae_mask is not None and vae_mask.any():
+            out = torch.empty_like(hidden_states)
+            non_vae = ~vae_mask
+            if non_vae.any():
+                out[non_vae] = qwen2_model.norm(hidden_states[non_vae])
+            out[vae_mask] = qwen2_model.norm_moe_gen(hidden_states[vae_mask])
+            hidden_states = out
+        else:
+            hidden_states = qwen2_model.norm(hidden_states)
+
+        return hidden_states
+
+    def _mot_layer_forward(
+        self,
+        layer: Qwen2DecoderLayer,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        vae_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single decoder-layer forward with MoT routing."""
+        if vae_mask is None or not vae_mask.any():
+            return layer(positions, hidden_states, residual)
+
+        non_vae = ~vae_mask
+
+        # ---- input layernorm (split) ----
+        if residual is not None:
+            hidden_states = hidden_states + residual
+        residual = hidden_states
+        normed = torch.empty_like(hidden_states)
+        if non_vae.any():
+            normed[non_vae] = layer.input_layernorm(hidden_states[non_vae])
+        normed[vae_mask] = layer.input_layernorm_moe_gen(hidden_states[vae_mask])
+        hidden_states = normed
+
+        # ---- attention (split QKV / O projections) ----
+        hidden_states = self._mot_attn_forward(layer.self_attn, positions, hidden_states, vae_mask)
+
+        # ---- post-attention layernorm (split) ----
+        hidden_states = hidden_states + residual
+        residual = hidden_states
+        normed = torch.empty_like(hidden_states)
+        if non_vae.any():
+            normed[non_vae] = layer.post_attention_layernorm(hidden_states[non_vae])
+        normed[vae_mask] = layer.post_attention_layernorm_moe_gen(hidden_states[vae_mask])
+        hidden_states = normed
+
+        # ---- MLP (split) ----
+        mlp_out = torch.empty_like(hidden_states)
+        if non_vae.any():
+            mlp_out[non_vae] = layer.mlp(hidden_states[non_vae])
+        mlp_out[vae_mask] = layer.mlp_moe_gen(hidden_states[vae_mask])
+        hidden_states = mlp_out
+
+        return hidden_states, residual
+
+    def _mot_attn_forward(
+        self,
+        attn,  # Qwen2Attention
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        vae_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attention forward with MoT routing for QKV and O projections."""
+        non_vae = ~vae_mask
+        qkv_dim = attn.q_size + 2 * attn.kv_size
+
+        # ---- QKV projection (split) ----
+        qkv = torch.empty(
+            hidden_states.shape[0],
+            qkv_dim,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        if non_vae.any():
+            qkv_und, _ = attn.qkv_proj(hidden_states[non_vae])
+            qkv[non_vae] = qkv_und
+        qkv_gen, _ = attn.qkv_proj_moe_gen(hidden_states[vae_mask])
+        qkv[vae_mask] = qkv_gen
+
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+
+        # ---- QK normalization (split) ----
+        if attn.qk_norm:
+            n_tok = q.shape[0]
+            q = q.view(n_tok, attn.num_heads, attn.head_dim)
+            k = k.view(n_tok, attn.num_kv_heads, attn.head_dim)
+
+            q_out = torch.empty_like(q)
+            k_out = torch.empty_like(k)
+            if non_vae.any():
+                q_out[non_vae] = attn.q_norm(q[non_vae])
+                k_out[non_vae] = attn.k_norm(k[non_vae])
+            q_out[vae_mask] = attn.q_norm_moe_gen(q[vae_mask])
+            k_out[vae_mask] = attn.k_norm_moe_gen(k[vae_mask])
+
+            q = q_out.reshape(n_tok, attn.q_size)
+            k = k_out.reshape(n_tok, attn.kv_size)
+
+        # ---- RoPE + attention (same for all tokens) ----
+        q, k = attn.rotary_emb(positions, q, k)
+        attn_output = attn.attn(q, k, v)
+
+        # ---- O projection (split) ----
+        output = torch.empty(
+            hidden_states.shape[0],
+            attn.hidden_size,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        if non_vae.any():
+            o_und, _ = attn.o_proj(attn_output[non_vae])
+            output[non_vae] = o_und
+        o_gen, _ = attn.o_proj_moe_gen(attn_output[vae_mask])
+        output[vae_mask] = o_gen
+
+        return output
+
+    # ------------------------------------------------------------------
+    # Weight loading
+    # ------------------------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         generation_keywords_to_skip = [
-            "moe_gen",
             "llm2vae",
             "decoder.",
         ]
@@ -771,12 +1038,19 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 return "vae." + name
             return name
 
+        moe_gen_weights: list[tuple[str, torch.Tensor]] = []
         filtered_weights = []
+
         for name, tensor in weights:
             if any(skip in name for skip in generation_keywords_to_skip):
                 continue
 
             mapped_name = _map_vae_weight_name(name)
+
+            # Collect moe_gen weights for manual loading
+            if "moe_gen" in mapped_name:
+                moe_gen_weights.append((mapped_name, tensor))
+                continue
 
             if "patch_embedding.weight" in mapped_name and tensor.ndim == 2:
                 out_channels = tensor.shape[0]
@@ -811,4 +1085,56 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             skip_prefixes=["vit_pos_embed.pos_embed"],
             ignore_unexpected_prefixes=["vae.", "latent_pos_embed.", "time_embedder.", "vae2llm."],
         )
-        return loader.load_weights(filtered_weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(filtered_weights, mapper=self.hf_to_vllm_mapper)
+
+        # Load moe_gen weights with stacked-param handling
+        loaded |= self._load_moe_gen_weights(moe_gen_weights)
+
+        return loaded
+
+    def _load_moe_gen_weights(self, weights: list[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load generation-mode MoT weights with proper stacked-param mapping."""
+        stacked_params = [
+            ("qkv_proj_moe_gen", "q_proj_moe_gen", "q"),
+            ("qkv_proj_moe_gen", "k_proj_moe_gen", "k"),
+            ("qkv_proj_moe_gen", "v_proj_moe_gen", "v"),
+            ("mlp_moe_gen.gate_up_proj", "mlp_moe_gen.gate_proj", 0),
+            ("mlp_moe_gen.gate_up_proj", "mlp_moe_gen.up_proj", 1),
+        ]
+
+        # Apply the hf_to_vllm_mapper prefix mapping
+        mapper = self.hf_to_vllm_mapper
+        prefix_map = getattr(mapper, "orig_to_new_prefix", {})
+
+        params_dict = dict(self.named_parameters())
+        loaded: set[str] = set()
+
+        for name, tensor in weights:
+            mapped = name
+            for orig, new in prefix_map.items():
+                if mapped.startswith(orig):
+                    mapped = new + mapped[len(orig) :]
+                    break
+
+            found_stacked = False
+            for param_name, weight_name, shard_id in stacked_params:
+                if weight_name not in mapped:
+                    continue
+                mapped = mapped.replace(weight_name, param_name)
+                if mapped in params_dict:
+                    param = params_dict[mapped]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, tensor, shard_id)
+                    loaded.add(mapped)
+                found_stacked = True
+                break
+
+            if not found_stacked:
+                if mapped in params_dict:
+                    param = params_dict[mapped]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, tensor)
+                    loaded.add(mapped)
+
+        logger.info("[AR load_weights] Loaded %d moe_gen weight entries", len(loaded))
+        return loaded
