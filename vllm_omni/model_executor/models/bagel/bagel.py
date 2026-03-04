@@ -8,7 +8,6 @@ import torch.nn as nn
 from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
-from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm as VllmRMSNorm
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
@@ -52,8 +51,6 @@ from vllm_omni.diffusion.models.bagel.bagel_transformer import (
     TimestepEmbedder,
 )
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import default_ae_params
-
-logger = init_logger(__name__)
 
 
 class OmniBagelProcessor(BagelProcessor):
@@ -135,14 +132,8 @@ class OmniBagelProcessingInfo(BaseProcessingInfo):
                         old = getattr(config, "max_latent_size", 32)
                         if old != side:
                             config.max_latent_size = side
-                            logger.info(
-                                "[Processor] Patched max_latent_size: %d -> %d (from latent_pos_embed shape[0]=%d)",
-                                old,
-                                side,
-                                npos,
-                            )
-        except Exception as e:
-            logger.warning("[Processor] Could not infer max_latent_size: %s", e)
+        except Exception:
+            pass
 
     def get_data_parser(self) -> "OmniBagelDataParser":
         return OmniBagelDataParser(
@@ -422,15 +413,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
         self._pending_img2img_info: list[tuple[int, int, int, int]] = []
         self._ropes_queue: deque[dict[str, Any]] = deque()
-        # Cached info from the most recent _process_img2img_input call, reused
-        # by CFG companion forward passes (cfg_text / cfg_img) whose encoder
-        # results are deduplicated and therefore don't trigger a second call.
         self._cached_img2img_info: tuple[int, int, int, int] | None = None
         self._cfg_companions_remaining: int = 0
 
-        # Resolve <|vision_start|> / <|vision_end|> token IDs so the AR stage
-        # can wrap VAE and ViT embeddings with the same boundary markers used
-        # by the single-stage DiT pipeline.
         from transformers import AutoTokenizer
 
         tok_name = getattr(vllm_config.model_config, "tokenizer", None) or vllm_config.model_config.model
@@ -440,9 +425,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 _tok.add_tokens([t])
         self._start_of_image_id = int(_tok.convert_tokens_to_ids("<|vision_start|>"))
         self._end_of_image_id = int(_tok.convert_tokens_to_ids("<|vision_end|>"))
-        logger.info(
-            "[AR init] vision boundary token IDs: start=%d, end=%d", self._start_of_image_id, self._end_of_image_id
-        )
 
         self._vae_token_mask: torch.Tensor | None = None
 
@@ -466,7 +448,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
         qwen2_model = self.language_model.model  # Qwen2Model
 
-        # Final norm (gen variant)
         qwen2_model.norm_moe_gen = VllmRMSNorm(hidden_size, eps=rms_eps)
 
         for layer in qwen2_model.layers:
@@ -497,8 +478,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             layer.input_layernorm_moe_gen = VllmRMSNorm(hidden_size, eps=rms_eps)
             layer.post_attention_layernorm_moe_gen = VllmRMSNorm(hidden_size, eps=rms_eps)
 
-        logger.info("[AR init] Installed MoT gen-mode modules on %d layers", len(list(qwen2_model.layers)))
-
     def _resize_to_stride(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Resize pixel values to stride-aligned dimensions
         (matches DiT's ``_resize_images_to_stride``)."""
@@ -522,10 +501,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
     def get_kv_transfer_metadata(self, req_id: str) -> dict[str, Any] | None:
         if self._ropes_queue:
-            meta = self._ropes_queue.popleft()
-            logger.info("[AR kv_meta] req_id=%s -> %s", req_id, meta)
-            return meta
-        logger.info("[AR kv_meta] req_id=%s -> queue empty, returning None", req_id)
+            return self._ropes_queue.popleft()
         return None
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
@@ -582,17 +558,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         timestep = 0
 
         if self._ropes_queue:
-            logger.info("[AR img2img] Clearing stale _ropes_queue (%d entries)", len(self._ropes_queue))
             self._ropes_queue.clear()
-
-        logger.info(
-            "[AR img2img] num_images=%d, input pixel_values shape=%s, dtype=%s, range=[%.4f, %.4f]",
-            num_images,
-            list(pixel_values.shape),
-            pixel_values.dtype,
-            pixel_values.min().item(),
-            pixel_values.max().item(),
-        )
 
         vit_pixel_values = torch.nn.functional.interpolate(
             pixel_values,
@@ -600,70 +566,32 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             mode="bicubic",
             align_corners=False,
         )
-        logger.info(
-            "[AR img2img] ViT pixel_values after resize: shape=%s, range=[%.4f, %.4f]",
-            list(vit_pixel_values.shape),
-            vit_pixel_values.min().item(),
-            vit_pixel_values.max().item(),
-        )
 
         vit_embeddings_tuple = self._process_image_input({"pixel_values": vit_pixel_values})
-        logger.info(
-            "[AR img2img] ViT embeddings: num=%d, shape[0]=%s, first[0,:5]=%s",
-            len(vit_embeddings_tuple),
-            list(vit_embeddings_tuple[0].shape),
-            vit_embeddings_tuple[0][0, :5].tolist(),
-        )
 
-        # Embed <|vision_start|> / <|vision_end|> boundary markers
         marker_ids = torch.tensor(
             [self._start_of_image_id, self._end_of_image_id],
             device=pixel_values.device,
             dtype=torch.long,
         )
         marker_embeds = self.language_model.model.embed_tokens(marker_ids)
-        start_embed = marker_embeds[0:1]  # [1, hidden_size]
-        end_embed = marker_embeds[1:2]  # [1, hidden_size]
+        start_embed = marker_embeds[0:1]
+        end_embed = marker_embeds[1:2]
 
         results = []
 
         for i in range(num_images):
             single_pv = pixel_values[i : i + 1]
-            orig_H, orig_W = single_pv.shape[2:]
             single_pv = self._resize_to_stride(single_pv)
             H, W = single_pv.shape[2:]
-            logger.info(
-                "[AR img2img][%d] stride resize: (%d,%d)->(%d,%d), pv range=[%.4f, %.4f]",
-                i,
-                orig_H,
-                orig_W,
-                H,
-                W,
-                single_pv.min().item(),
-                single_pv.max().item(),
-            )
 
             padded_latent = self.vae.encode(single_pv)
             h = H // self.latent_downsample
             w = W // self.latent_downsample
-            logger.info(
-                "[AR img2img][%d] VAE encode: padded_latent shape=%s, latent grid h=%d w=%d, first[0,0,:5]=%s",
-                i,
-                list(padded_latent.shape),
-                h,
-                w,
-                padded_latent[0, 0, 0, :5].tolist(),
-            )
 
             latent = padded_latent[0][:, : h * p, : w * p]
             latent = latent.reshape(self.latent_channel, h, p, w, p)
             latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, p * p * self.latent_channel)
-            logger.info(
-                "[AR img2img][%d] patchified latent: shape=%s, first[:3]=%s",
-                i,
-                list(latent.shape),
-                latent[0, :3].tolist(),
-            )
 
             vae_position_ids = self.get_flattened_position_ids(
                 H,
@@ -676,18 +604,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 timestep_embeds = self.time_embedder(packed_timesteps.to(padded_latent))
             vae_embeds = self.vae2llm(latent) + timestep_embeds + pos_embed
-            logger.info(
-                "[AR img2img][%d] vae_embeds: shape=%s, first[0,:5]=%s",
-                i,
-                list(vae_embeds.shape),
-                vae_embeds[0, :5].tolist(),
-            )
 
             vit_emb = vit_embeddings_tuple[i] if i < len(vit_embeddings_tuple) else vit_embeddings_tuple[0]
 
-            # Match single-stage DiT structure:
-            #   [start_of_image, vae_1..vae_N, end_of_image,
-            #    start_of_image, vit_1..vit_M, end_of_image]
             se = start_embed.to(vae_embeds.dtype)
             ee = end_embed.to(vae_embeds.dtype)
             combined = torch.cat([se, vae_embeds, ee, se, vit_emb, ee], dim=0)
@@ -699,17 +618,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             self._pending_img2img_info.append(info)
             self._cached_img2img_info = info
             self._cfg_companions_remaining = 2  # cfg_text + cfg_img
-            logger.info(
-                "[AR img2img][%d] combined: shape=%s "
-                "(num_vae=%d incl markers, num_vit=%d incl markers), "
-                "image_shape=(%d,%d)",
-                i,
-                list(combined.shape),
-                num_vae,
-                num_vit,
-                H,
-                W,
-            )
 
         return tuple(results)
 
@@ -724,17 +632,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         use_mot = False
 
         if self._pending_img2img_info:
-            logger.info(
-                "[AR forward] before adjust: input_ids shape=%s, "
-                "positions shape=%s, inputs_embeds shape=%s, "
-                "pending_info=%s",
-                list(input_ids.shape) if input_ids is not None else None,
-                list(positions.shape),
-                list(inputs_embeds.shape) if inputs_embeds is not None else None,
-                self._pending_img2img_info,
-            )
-            if input_ids is not None:
-                logger.info("[AR forward] input_ids[:30]=%s", input_ids[:30].tolist())
             positions = self._adjust_positions_for_img2img(positions)
             use_mot = True
 
@@ -746,14 +643,12 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
 
             if inputs_embeds is not None and seq_len >= num_img2img:
-                logger.info("[AR forward] cfg_text companion: seq_len=%d, reusing cached info=%s", seq_len, cached)
                 self._pending_img2img_info = [cached]
                 positions = self._adjust_positions_for_img2img(positions)
                 use_mot = True
             else:
                 rope = int(positions[seq_len - 1].item()) + 1
                 self._ropes_queue.append({"ropes": [rope]})
-                logger.info("[AR forward] cfg_img companion: seq_len=%d, rope=%d", seq_len, rope)
 
             if self._cfg_companions_remaining == 0:
                 self._cached_img2img_info = None
@@ -779,8 +674,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             self._vae_token_mask = None
             return positions
 
-        logger.info("[AR positions] original positions[:20]=%s ... total=%d", positions[:20].tolist(), len(positions))
-
         boundaries = [0]
         for i in range(1, len(positions)):
             if positions[i] < positions[i - 1]:
@@ -791,8 +684,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         new_positions = positions.clone()
         vae_mask = torch.zeros(len(positions), dtype=torch.bool, device=positions.device)
 
-        logger.info("[AR positions] %d requests, boundaries=%s, img2img_info=%s", num_requests, boundaries, info_list)
-
         img2img_idx = 0
         for req_idx in range(num_requests):
             start = boundaries[req_idx]
@@ -801,18 +692,13 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
             if img2img_idx < len(info_list):
                 num_vae, num_vit, img_H, img_W = info_list[img2img_idx]
-                # +1 separator between VAE and ViT blocks
-                num_img2img = num_vae + 1 + num_vit
+                num_img2img = num_vae + 1 + num_vit  # +1 separator
 
                 if req_len >= num_img2img:
-                    # VAE block (including start/end markers): position 0
                     new_positions[start : start + num_vae] = 0
-                    # Separator: shares VAE position 0
-                    new_positions[start + num_vae] = 0
-                    # ViT block (including start/end markers): position 1
+                    new_positions[start + num_vae] = 0  # separator
                     vit_start = start + num_vae + 1
                     new_positions[vit_start : vit_start + num_vit] = 1
-                    # Text tokens: positions 2, 3, ...
                     num_text = req_len - num_img2img
                     if num_text > 0:
                         text_start = start + num_img2img
@@ -821,7 +707,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                         )
 
                     # VAE gen-mode mask: only actual VAE patches (not markers)
-                    # Layout: [start_marker, vae_patch_1, ..., vae_patch_N, end_marker, sep, ...]
                     vae_patches_start = start + 1  # skip start_marker
                     vae_patches_end = start + num_vae - 1  # before end_marker
                     if vae_patches_end > vae_patches_start:
@@ -834,27 +719,11 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                             "image_shape": [img_H, img_W],
                         }
                     )
-                    logger.info(
-                        "[AR positions] req[%d]: img2img, len=%d, "
-                        "num_vae=%d(+1sep), num_vit=%d, num_text=%d, "
-                        "rope=%d, image_shape=(%d,%d), "
-                        "vae_gen_count=%d",
-                        req_idx,
-                        req_len,
-                        num_vae,
-                        num_vit,
-                        num_text,
-                        rope,
-                        img_H,
-                        img_W,
-                        int(vae_mask[start:end].sum().item()),
-                    )
                     img2img_idx += 1
                     continue
 
             rope = int(new_positions[end - 1].item()) + 1
             self._ropes_queue.append({"ropes": [rope]})
-            logger.info("[AR positions] req[%d]: text-only, len=%d, rope=%d", req_idx, req_len, rope)
 
         self._vae_token_mask = vae_mask if vae_mask.any() else None
         return new_positions
@@ -1047,7 +916,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
             mapped_name = _map_vae_weight_name(name)
 
-            # Collect moe_gen weights for manual loading
             if "moe_gen" in mapped_name:
                 moe_gen_weights.append((mapped_name, tensor))
                 continue
@@ -1072,11 +940,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                         setattr(self.config, "max_latent_size", int(side))
                         if hasattr(self.latent_pos_embed, "max_num_patch_per_side"):
                             self.latent_pos_embed.max_num_patch_per_side = int(side)
-                        logger.info(
-                            "[AR load_weights] Updated max_latent_size to %d (from latent_pos_embed shape %s)",
-                            side,
-                            list(tensor.shape),
-                        )
 
             filtered_weights.append((mapped_name, tensor))
 
@@ -1087,7 +950,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         )
         loaded = loader.load_weights(filtered_weights, mapper=self.hf_to_vllm_mapper)
 
-        # Load moe_gen weights with stacked-param handling
         loaded |= self._load_moe_gen_weights(moe_gen_weights)
 
         return loaded
@@ -1102,7 +964,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             ("mlp_moe_gen.gate_up_proj", "mlp_moe_gen.up_proj", 1),
         ]
 
-        # Apply the hf_to_vllm_mapper prefix mapping
         mapper = self.hf_to_vllm_mapper
         prefix_map = getattr(mapper, "orig_to_new_prefix", {})
 
@@ -1136,5 +997,4 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                     weight_loader(param, tensor)
                     loaded.add(mapped)
 
-        logger.info("[AR load_weights] Loaded %d moe_gen weight entries", len(loaded))
         return loaded
