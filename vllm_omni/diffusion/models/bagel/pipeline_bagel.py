@@ -257,6 +257,122 @@ class BagelPipeline(nn.Module):
         self.to(self.device)
 
     @staticmethod
+    def _extract_image_input(first_prompt) -> list[Image.Image] | None:
+        """Extract PIL images from the prompt's multi_modal_data, if present."""
+        if isinstance(first_prompt, str):
+            return None
+        image_input = (first_prompt.get("multi_modal_data") or {}).get("image")
+        if image_input is None:
+            return None
+        if not isinstance(image_input, list):
+            image_input = [image_input]
+        image_input = [Image.open(img) if isinstance(img, str) else img for img in image_input]
+        return image_input
+
+    def _resize_images_to_stride(self, images: list[Image.Image]) -> list[Image.Image]:
+        """Resize images so that dimensions are multiples of latent_downsample."""
+        stride = self.bagel.latent_downsample
+        max_img_size = int(self.bagel.max_latent_size * stride)
+
+        def _resize_one(img: Image.Image) -> Image.Image:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            w, h = img.size
+            scale = min(max_img_size / max(w, h), 1.0)
+            min_img_size = min(256, max_img_size)
+            scale = max(scale, min_img_size / min(w, h))
+            new_w = max(stride, int(round(w * scale / stride) * stride))
+            new_h = max(stride, int(round(h * scale / stride) * stride))
+            new_w = min(new_w, max_img_size)
+            new_h = min(new_h, max_img_size)
+            if new_w != w or new_h != h:
+                img = img.resize((new_w, new_h), Image.BICUBIC)
+            return img
+
+        return [_resize_one(img) for img in images]
+
+    @staticmethod
+    def _vae_transforms(img: Image.Image) -> torch.Tensor:
+        """Convert PIL image to [-1, 1] tensor (C, H, W) for VAE encoding."""
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
+        return arr.permute(2, 0, 1)
+
+    def _vae_encode_into_context(
+        self,
+        images: list[Image.Image],
+        context: dict,
+    ) -> dict:
+        """Run VAE encoding of *images* and append the resulting KV to *context*.
+
+        This mirrors the existing ``forward_cache_update_vae`` call in the
+        single-stage img2img path but operates on an arbitrary context dict
+        (gen or cfg_text) that may already contain KV from the AR stage.
+        """
+        logger.info(
+            "[DiT single-stage VAE] input: kv_lens=%s, ropes=%s, num_images=%d",
+            context["kv_lens"],
+            context["ropes"],
+            len(images),
+        )
+        gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
+            curr_kvlens=context["kv_lens"],
+            curr_rope=context["ropes"],
+            images=images,
+            transforms=self._vae_transforms,
+            new_token_ids=self.new_token_ids,
+        )
+        logger.info(
+            "[DiT single-stage VAE] prepare_vae output: "
+            "newlens=%s, new_rope=%s, "
+            "packed_vae_position_ids[:10]=%s, "
+            "packed_position_ids=%s",
+            newlens_vae,
+            new_rope_vae,
+            gen_input_vae["packed_vae_position_ids"][:10].tolist(),
+            gen_input_vae["packed_position_ids"].tolist(),
+        )
+        for k, v in gen_input_vae.items():
+            if torch.is_tensor(v):
+                gen_input_vae[k] = v.to(self.device)
+        with torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        ):
+            context["past_key_values"] = self.bagel.forward_cache_update_vae(
+                self.vae, context["past_key_values"], **gen_input_vae
+            )
+        context["kv_lens"] = newlens_vae
+        context["ropes"] = new_rope_vae
+        return context
+
+    def _apply_vae_encoding(
+        self,
+        images: list[Image.Image],
+        gen_context: dict,
+        cfg_text_context: dict,
+        has_cfg_text: bool,
+    ) -> tuple[tuple[int, int], dict, dict]:
+        """Resize images, VAE-encode them, and append to gen + cfg_text contexts.
+
+        Returns the (height, width) image shape derived from the resized image
+        together with the updated gen_context and cfg_text_context.
+        """
+        images = self._resize_images_to_stride(images)
+        resized_w, resized_h = images[0].size
+        image_shape = (resized_h, resized_w)
+        logger.info("img2img multi-stage: resized image to %dx%d", resized_w, resized_h)
+
+        gen_context = self._vae_encode_into_context(images, gen_context)
+
+        if has_cfg_text:
+            cfg_text_context = self._vae_encode_into_context(images, cfg_text_context)
+
+        return image_shape, gen_context, cfg_text_context
+
+    @staticmethod
     def _decode_image_from_latent(
         bagel: Bagel, vae: AutoEncoder, latent: torch.Tensor, image_shape: tuple[int, int]
     ) -> Image.Image:
@@ -323,7 +439,7 @@ class BagelPipeline(nn.Module):
 
         injected_kv = req.sampling_params.past_key_values
         if injected_kv is not None:
-            logger.info("Using injected KV Cache (direct)")
+            logger.info("[DiT multi-stage] Using injected KV Cache")
             gen_context["past_key_values"] = injected_kv
             seq_len = injected_kv.key_cache[0].shape[0]
             gen_context["kv_lens"] = [seq_len]
@@ -332,9 +448,19 @@ class BagelPipeline(nn.Module):
             else:
                 gen_context["ropes"] = [seq_len]
 
+            logger.info(
+                "[DiT multi-stage] gen: kv_lens=%s, ropes=%s, kv_metadata=%s",
+                gen_context["kv_lens"],
+                gen_context["ropes"],
+                req.sampling_params.kv_metadata,
+            )
+
+            if req.sampling_params.kv_metadata and "image_shape" in req.sampling_params.kv_metadata:
+                image_shape = tuple(req.sampling_params.kv_metadata["image_shape"])
+                logger.info("[DiT multi-stage] using image_shape=%s from AR metadata", image_shape)
+
             cfg_text_kv = getattr(req.sampling_params, "cfg_text_past_key_values", None)
             if cfg_text_kv is not None:
-                logger.info("CFG enabled with multi-KV: using injected cfg_text KV Cache")
                 cfg_text_seq_len = cfg_text_kv.key_cache[0].shape[0]
                 cfg_text_context["past_key_values"] = cfg_text_kv
                 cfg_text_context["kv_lens"] = [cfg_text_seq_len]
@@ -353,6 +479,17 @@ class BagelPipeline(nn.Module):
                     cfg_img_context["ropes"] = cfg_img_metadata["ropes"]
                 else:
                     cfg_img_context["ropes"] = [cfg_img_seq_len]
+
+                logger.info(
+                    "[DiT multi-stage] cfg_text: kv_lens=%s, ropes=%s",
+                    cfg_text_context["kv_lens"],
+                    cfg_text_context["ropes"],
+                )
+                logger.info(
+                    "[DiT multi-stage] cfg_img: kv_lens=%s, ropes=%s",
+                    cfg_img_context["kv_lens"],
+                    cfg_img_context["ropes"],
+                )
             else:
                 logger.warning("CFG is disabled: only single KV cache available")
                 gen_params = BagelGenParams(
@@ -363,76 +500,36 @@ class BagelPipeline(nn.Module):
                 )
 
         else:
-            image_input = (
-                None if isinstance(first_prompt, str) else (first_prompt.get("multi_modal_data") or {}).get("image")
-            )
-            if image_input and not isinstance(image_input, list):
-                image_input = [image_input]
-            if image_input:
-                image_input = [Image.open(image) if isinstance(image, str) else image for image in image_input]
+            image_input = self._extract_image_input(first_prompt)
 
             if image_input:
-                # If we have an image, we prefill with it
                 if self.image_processor and self.vae:
 
                     def vit_transforms(img):
                         return self.image_processor(images=img, return_tensors="pt").pixel_values[0]
 
-                    stride = self.bagel.latent_downsample
-                    max_img_size = int(self.bagel.max_latent_size * stride)
-
-                    def _resize_to_stride(img):
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
-                        w, h = img.size
-                        # Scale down if longest edge exceeds max
-                        scale = min(max_img_size / max(w, h), 1.0)
-                        # Scale up if shortest edge is too small (min 256)
-                        min_img_size = min(256, max_img_size)
-                        scale = max(scale, min_img_size / min(w, h))
-                        new_w = max(stride, int(round(w * scale / stride) * stride))
-                        new_h = max(stride, int(round(h * scale / stride) * stride))
-                        # Clamp to max
-                        new_w = min(new_w, max_img_size)
-                        new_h = min(new_h, max_img_size)
-                        if new_w != w or new_h != h:
-                            img = img.resize((new_w, new_h), Image.BICUBIC)
-                        return img
-
-                    image_input = [_resize_to_stride(img) for img in image_input]
+                    image_input = self._resize_images_to_stride(image_input)
 
                     resized_w, resized_h = image_input[0].size
                     image_shape = (resized_h, resized_w)
-                    logger.info(f"img2img: resized image to {resized_w}x{resized_h}")
-
-                    def vae_transforms(img):
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
-                        # Convert to [-1, 1] tensor (H, W, C) -> (C, H, W)
-                        arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
-                        return arr.permute(2, 0, 1)
-
-                    # Update gen_context with image (VAE + ViT)
-                    gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
-                        curr_kvlens=gen_context["kv_lens"],
-                        curr_rope=gen_context["ropes"],
-                        images=image_input,
-                        transforms=vae_transforms,
-                        new_token_ids=self.new_token_ids,
+                    logger.info(
+                        "[DiT single-stage] resized image to %dx%d, image_shape=%s", resized_w, resized_h, image_shape
                     )
-                    for k, v in gen_input_vae.items():
-                        if torch.is_tensor(v):
-                            gen_input_vae[k] = v.to(self.device)
-                    with torch.autocast(
-                        device_type=self.device.type,
-                        enabled=self.device.type != "cpu",
-                        dtype=self.od_config.dtype,
-                    ):
-                        gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
-                            self.vae, gen_context["past_key_values"], **gen_input_vae
-                        )
-                    gen_context["kv_lens"] = newlens_vae
-                    gen_context["ropes"] = new_rope_vae
+
+                    vae_img_tensor = self._vae_transforms(image_input[0])
+                    logger.info(
+                        "[DiT single-stage] VAE input: shape=%s, range=[%.4f, %.4f]",
+                        list(vae_img_tensor.shape),
+                        vae_img_tensor.min().item(),
+                        vae_img_tensor.max().item(),
+                    )
+
+                    gen_context = self._vae_encode_into_context(image_input, gen_context)
+                    logger.info(
+                        "[DiT single-stage] after VAE encode: kv_lens=%s, ropes=%s",
+                        gen_context["kv_lens"],
+                        gen_context["ropes"],
+                    )
 
                     gen_input_img, newlens_img, new_rope_img = self.bagel.prepare_vit_images(
                         curr_kvlens=gen_context["kv_lens"],
@@ -454,10 +551,14 @@ class BagelPipeline(nn.Module):
                         )
                     gen_context["kv_lens"] = newlens_img
                     gen_context["ropes"] = new_rope_img
+                    logger.info(
+                        "[DiT single-stage] after ViT encode: kv_lens=%s, ropes=%s",
+                        gen_context["kv_lens"],
+                        gen_context["ropes"],
+                    )
 
                     cfg_text_context = deepcopy(gen_context)
 
-            # Update gen_context with text prompt
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
@@ -488,8 +589,17 @@ class BagelPipeline(nn.Module):
                 )
             gen_context["kv_lens"] = newlens
             gen_context["ropes"] = new_rope
+            logger.info(
+                "[DiT single-stage] after text encode (gen): kv_lens=%s, ropes=%s, prompt=%r",
+                gen_context["kv_lens"],
+                gen_context["ropes"],
+                prompt,
+            )
+            logger.info("[DiT single-stage] gen text_ids=%s", generation_input["packed_text_ids"].tolist())
+            logger.info(
+                "[DiT single-stage] gen text_position_ids=%s", generation_input["packed_text_position_ids"].tolist()
+            )
 
-            # cfg_text_context: update with negative prompt (no text condition)
             neg_prompt = extra_args.get("negative_prompt", "")
             neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
                 curr_kvlens=cfg_text_context["kv_lens"],
@@ -511,8 +621,12 @@ class BagelPipeline(nn.Module):
                 )
             cfg_text_context["kv_lens"] = neg_newlens
             cfg_text_context["ropes"] = neg_rope
-
-            # cfg_img_context: update with text prompt (no image condition)
+            logger.info(
+                "[DiT single-stage] after text encode (cfg_text): kv_lens=%s, ropes=%s, neg_prompt=%r",
+                cfg_text_context["kv_lens"],
+                cfg_text_context["ropes"],
+                neg_prompt,
+            )
             cfg_img_generation_input, cfg_img_newlens, cfg_img_new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=cfg_img_context["kv_lens"],
                 curr_rope=cfg_img_context["ropes"],
@@ -533,11 +647,29 @@ class BagelPipeline(nn.Module):
                 )
             cfg_img_context["kv_lens"] = cfg_img_newlens
             cfg_img_context["ropes"] = cfg_img_new_rope
+            logger.info(
+                "[DiT single-stage] after text encode (cfg_img): kv_lens=%s, ropes=%s",
+                cfg_img_context["kv_lens"],
+                cfg_img_context["ropes"],
+            )
 
         if req.sampling_params.seed is not None:
             torch.manual_seed(req.sampling_params.seed)
             if self.device.type == "cuda":
                 torch.cuda.manual_seed(req.sampling_params.seed)
+
+        logger.info(
+            "[DiT pre-denoise] gen: kv_lens=%s, ropes=%s, image_shape=%s",
+            gen_context["kv_lens"],
+            gen_context["ropes"],
+            image_shape,
+        )
+        logger.info(
+            "[DiT pre-denoise] cfg_text: kv_lens=%s, ropes=%s", cfg_text_context["kv_lens"], cfg_text_context["ropes"]
+        )
+        logger.info(
+            "[DiT pre-denoise] cfg_img: kv_lens=%s, ropes=%s", cfg_img_context["kv_lens"], cfg_img_context["ropes"]
+        )
 
         generation_input = self.bagel.prepare_vae_latent(
             curr_kvlens=gen_context["kv_lens"],
@@ -567,11 +699,22 @@ class BagelPipeline(nn.Module):
                 f"max={max_lat_pid} > allowed_max={max_lat_pid_allowed}. "
                 f"Requested image_shape={image_shape}, max_latent_size={self.bagel.max_latent_size}."
             )
+        logger.info(
+            "[DiT pre-denoise] gen vae_latent: "
+            "packed_position_ids=%s, "
+            "packed_vae_position_ids[:5]=%s, "
+            "key_values_lens=%s, "
+            "packed_text_ids[:5]=%s",
+            generation_input["packed_position_ids"].tolist(),
+            generation_input["packed_vae_position_ids"][:5].tolist(),
+            generation_input["key_values_lens"].tolist(),
+            generation_input["packed_text_ids"][:5].tolist(),
+        )
+
         for k, v in generation_input.items():
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
-        # text cfg
         generation_input_cfg_text = self.bagel.prepare_vae_latent_cfg(
             curr_kvlens=cfg_text_context["kv_lens"],
             curr_rope=cfg_text_context["ropes"],

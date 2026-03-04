@@ -20,6 +20,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 CFG_TEXT_SUFFIX = "__cfg_text"
+CFG_IMG_SUFFIX = "__cfg_img"
 
 
 @dataclass
@@ -73,7 +74,49 @@ def expand_cfg_prompts(
             ),
         ]
 
-    # img2img: more complex (3 distinct caches). Reserve for future.
+    if "img2img" in modalities:
+        IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
+
+        cfg_text_dict: dict[str, Any] = {
+            "prompt": f"{IMG2IMG_PLACEHOLDER}{neg_prompt}",
+            "modalities": ["img2img"],
+        }
+        mm_data = prompt.get("multi_modal_data")
+        if mm_data:
+            cfg_text_dict["multi_modal_data"] = mm_data
+
+        original_text = prompt.get("prompt", "")
+        cfg_img_text = original_text.replace(IMG2IMG_PLACEHOLDER, "")
+        cfg_img_dict: dict[str, Any] = {
+            "prompt": cfg_img_text,
+            "modalities": ["img2img"],
+        }
+
+        logger.info("[CFG expand img2img] gen prompt=%r", prompt.get("prompt", "")[:200])
+        logger.info(
+            "[CFG expand img2img] cfg_text prompt=%r, has_mm=%s",
+            cfg_text_dict["prompt"][:200],
+            "multi_modal_data" in cfg_text_dict,
+        )
+        logger.info(
+            "[CFG expand img2img] cfg_img prompt=%r, has_mm=%s",
+            cfg_img_dict["prompt"][:200],
+            "multi_modal_data" in cfg_img_dict,
+        )
+
+        return [
+            ExpandedPrompt(
+                prompt=cfg_text_dict,
+                role="cfg_text",
+                request_id_suffix=CFG_TEXT_SUFFIX,
+            ),
+            ExpandedPrompt(
+                prompt=cfg_img_dict,
+                role="cfg_img",
+                request_id_suffix=CFG_IMG_SUFFIX,
+            ),
+        ]
+
     return []
 
 

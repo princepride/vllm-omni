@@ -163,6 +163,7 @@ class OmniKVTransferManager:
         block_size: int,
         cache_dtype: str,
         request_id_resolver: Callable[[str], str] | None = None,
+        model: torch.nn.Module | None = None,
     ) -> list[str]:
         """Handle KV cache transfer for finished requests.
 
@@ -175,6 +176,7 @@ class OmniKVTransferManager:
             block_size: Size of each cache block
             cache_dtype: Data type of the cache
             request_id_resolver: Optional function to resolve global request ID
+            model: Optional model instance to query for custom metadata
 
         Returns:
             List of request IDs that were processed
@@ -200,8 +202,21 @@ class OmniKVTransferManager:
                     logger.warning(f"Request {req_id} has no block IDs, skipping")
                     continue
 
+                custom_metadata = data.get("custom_metadata")
+                if model is not None and hasattr(model, "get_kv_transfer_metadata"):
+                    try:
+                        model_meta = model.get_kv_transfer_metadata(req_id)
+                        if model_meta:
+                            if custom_metadata is None:
+                                custom_metadata = {}
+                            custom_metadata.update(model_meta)
+                    except Exception as e:
+                        logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
+
                 # Extract KV cache from GPU blocks -> CPU tensors
-                kv_data = self._extract_kv_cache(req_id, block_ids, seq_len, kv_caches, block_size, cache_dtype)
+                kv_data = self._extract_kv_cache(
+                    req_id, block_ids, seq_len, kv_caches, block_size, cache_dtype, custom_metadata
+                )
                 if kv_data:
                     # Resolve global request ID if available
                     transfer_req_id = request_id_resolver(req_id) if request_id_resolver else req_id
@@ -224,6 +239,7 @@ class OmniKVTransferManager:
         kv_caches: list[LayerKV],
         block_size: int,
         cache_dtype: str,
+        custom_metadata: dict[str, Any] | None = None,
     ) -> KVCacheTransferData | None:
         """Extract KV cache from GPU blocks for a single request.
 
@@ -234,6 +250,7 @@ class OmniKVTransferManager:
             kv_caches: List of KV cache (tensor or tuple) per layer
             block_size: Size of each cache block
             cache_dtype: Data type of the cache
+            custom_metadata: Optional custom metadata to include
 
         Note: If key/value block counts differ, extraction uses only the overlapping
         block range. Extra key/value blocks are ignored, so returned KV may be partial.
@@ -280,16 +297,20 @@ class OmniKVTransferManager:
         if not any(k is not None for k in key_cache):
             return None
 
+        metadata = {
+            "block_size": block_size,
+            "num_layers": num_layers,
+            "dtype": str(cache_dtype),
+            "seq_len": seq_len,
+        }
+        if custom_metadata:
+            metadata.update(custom_metadata)
+
         return KVCacheTransferData(
             request_id=req_id,
             layer_blocks={"key_cache": key_cache, "value_cache": value_cache},
             block_ids=block_ids,
-            metadata={
-                "block_size": block_size,
-                "num_layers": num_layers,
-                "dtype": str(cache_dtype),
-                "seq_len": seq_len,
-            },
+            metadata=metadata,
         )
 
     def _normalize_layer_kv(
@@ -309,14 +330,18 @@ class OmniKVTransferManager:
             Tuple of (key_blocks, value_blocks) if valid, None otherwise
         """
         if isinstance(layer_kv, torch.Tensor):
-            if layer_kv.ndim < 3 or layer_kv.shape[0] != 2:
+            if layer_kv.ndim >= 3 and layer_kv.shape[0] == 2:
+                key_blocks = layer_kv[0]
+                value_blocks = layer_kv[1]
+            elif layer_kv.ndim >= 3 and layer_kv.shape[1] == 2:
+                key_blocks = layer_kv[:, 0]
+                value_blocks = layer_kv[:, 1]
+            else:
                 logger.warning(
                     f"Layer {layer_idx} for request {req_id} has invalid stacked KV shape: "
-                    f"expected [2, blocks, block_size, ...], got {tuple(layer_kv.shape)}"
+                    f"expected [2, ...] or [..., 2, ...] at dim 0/1, got {tuple(layer_kv.shape)}"
                 )
                 return None
-            key_blocks = layer_kv[0]
-            value_blocks = layer_kv[1]
         elif isinstance(layer_kv, tuple):
             if len(layer_kv) != 2:
                 logger.warning(
@@ -496,6 +521,8 @@ class OmniKVTransferManager:
 
         if "metadata" in data:
             req.kv_metadata = data["metadata"]
+            if hasattr(req, "sampling_params") and req.sampling_params is not None:
+                req.sampling_params.kv_metadata = data["metadata"]
 
     # Legacy compatibility method
     def receive_kv_cache(self, req: Any, target_device: torch.device | None = None) -> bool:

@@ -85,6 +85,11 @@ _OMNI_MODELS = {
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
     ),
+    "OmniBagelForConditionalGeneration": (
+        "bagel",
+        "bagel",
+        "OmniBagelForConditionalGeneration",
+    ),
 }
 
 
