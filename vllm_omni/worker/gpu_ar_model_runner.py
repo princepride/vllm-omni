@@ -299,6 +299,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 sampler=self.sampler,
             )
 
+            # [Omni] Map pending ropes metadata to req_ids.
+            if hasattr(self.model, "flush_pending_metadata"):
+                self.model.flush_pending_metadata(list(req_ids))
+
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.

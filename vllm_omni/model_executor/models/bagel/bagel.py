@@ -1,4 +1,3 @@
-from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from math import isqrt
 from typing import Any
@@ -412,7 +411,8 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         self.time_embedder = TimestepEmbedder(hidden_size)
 
         self._pending_img2img_info: list[tuple[int, int, int, int]] = []
-        self._ropes_queue: deque[dict[str, Any]] = deque()
+        self._ropes_pending: list[dict[str, Any]] = []
+        self._ropes_metadata: dict[str, dict[str, Any]] = {}
         self._cached_img2img_info: tuple[int, int, int, int] | None = None
         self._cfg_companions_remaining: int = 0
 
@@ -501,16 +501,23 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
     def _clear_warmup_state(self):
         """Clear stale state accumulated during warmup/profiling runs."""
-        self._ropes_queue.clear()
+        self._ropes_pending.clear()
+        self._ropes_metadata.clear()
         self._pending_img2img_info.clear()
         self._cached_img2img_info = None
         self._cfg_companions_remaining = 0
         self._vae_token_mask = None
 
     def get_kv_transfer_metadata(self, req_id: str) -> dict[str, Any] | None:
-        if self._ropes_queue:
-            return self._ropes_queue.popleft()
-        return None
+        return self._ropes_metadata.pop(req_id, None)
+
+    def flush_pending_metadata(self, req_ids: list[str]) -> None:
+        """Map pending metadata (batch order) to req_ids after forward()."""
+        pending = self._ropes_pending
+        self._ropes_pending = []
+        for i, meta in enumerate(pending):
+            if i < len(req_ids):
+                self._ropes_metadata[req_ids[i]] = meta
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
         mm_input_by_modality = {}
@@ -565,8 +572,8 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         p = self.latent_patch_size
         timestep = 0
 
-        if self._ropes_queue:
-            self._ropes_queue.clear()
+        if self._ropes_pending:
+            self._ropes_pending.clear()
 
         vit_pixel_values = torch.nn.functional.interpolate(
             pixel_values,
@@ -657,7 +664,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 use_mot = True
             else:
                 rope = int(positions[seq_len - 1].item()) + 1
-                self._ropes_queue.append({"ropes": [rope]})
+                self._ropes_pending.append({"ropes": [rope]})
 
             if self._cfg_companions_remaining == 0:
                 self._cached_img2img_info = None
@@ -722,7 +729,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                         vae_mask[vae_patches_start:vae_patches_end] = True
 
                     rope = 2 + num_text
-                    self._ropes_queue.append(
+                    self._ropes_pending.append(
                         {
                             "ropes": [rope],
                             "image_shape": [img_H, img_W],
@@ -732,7 +739,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                     continue
 
             rope = int(new_positions[end - 1].item()) + 1
-            self._ropes_queue.append({"ropes": [rope]})
+            self._ropes_pending.append({"ropes": [rope]})
 
         self._vae_token_mask = vae_mask if vae_mask.any() else None
         return new_positions
