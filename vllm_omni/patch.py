@@ -1,6 +1,8 @@
 import sys
+from functools import cached_property as _cached_property
 
 from aenum import extend_enum
+from vllm.config import ModelConfig as _ModelConfig
 from vllm.inputs.data import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -42,6 +44,25 @@ try:
 except ImportError:
     # GlmImageTextConfig not available, skip patching
     pass
+
+# =============================================================================
+# Patch ModelConfig.is_mm_prefix_lm to include Bagel
+# =============================================================================
+# Bagel requires bidirectional attention for multimodal prefix positions
+# (same as Gemma3, Molmo2, PaliGemma). This must be patched at the ModelConfig
+# class level so it takes effect in all processes, including spawned Workers.
+
+
+@_cached_property
+def _patched_is_mm_prefix_lm(self) -> bool:
+    _MM_PREFIX_LM_MODELS = ("bagel", "gemma3", "molmo2", "paligemma")
+    if not hasattr(self.hf_config, "model_type"):
+        return False
+    return self.hf_config.model_type in _MM_PREFIX_LM_MODELS
+
+
+_patched_is_mm_prefix_lm.__set_name__(_ModelConfig, "is_mm_prefix_lm")
+_ModelConfig.is_mm_prefix_lm = _patched_is_mm_prefix_lm
 
 # Extend RequestStatus enum with omni-specific statuses
 if not hasattr(RequestStatus, "WAITING_FOR_CHUNK"):

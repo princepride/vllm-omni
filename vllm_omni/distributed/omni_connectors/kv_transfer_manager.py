@@ -191,13 +191,17 @@ class OmniKVTransferManager:
             logger.warning("No connector available, skipping KV transfer but freeing resources")
             return list(finished_reqs.keys())
 
-        logger.debug(f"Processing KV transfer for {len(finished_reqs)} requests")
+        logger.info(f"[KV transfer] Processing {len(finished_reqs)} requests")
 
         extracted_ids = []
         for req_id, data in finished_reqs.items():
             try:
                 seq_len = data.get("seq_len", 0)
                 block_ids = data.get("block_ids", [])
+                logger.info(
+                    f"[KV transfer] req_id={req_id}, seq_len={seq_len}, "
+                    f"num_blocks={len(block_ids)}, block_ids={block_ids[:5]}..."
+                )
                 if not block_ids:
                     logger.warning(f"Request {req_id} has no block IDs, skipping")
                     continue
@@ -294,8 +298,15 @@ class OmniKVTransferManager:
             key_cache[layer_idx] = flat_k.detach().cpu().contiguous()
             value_cache[layer_idx] = flat_v.detach().cpu().contiguous()
 
-        if not any(k is not None for k in key_cache):
+        extracted_count = sum(1 for k in key_cache if k is not None)
+        if not extracted_count:
+            logger.warning(f"[KV extract] req={req_id}: no layers extracted successfully")
             return None
+
+        logger.info(
+            f"[KV extract] req={req_id}: extracted {extracted_count}/{num_layers} layers, "
+            f"seq_len={seq_len}, key_shape={key_cache[0].shape if key_cache[0] is not None else None}"
+        )
 
         metadata = {
             "block_size": block_size,
@@ -330,6 +341,10 @@ class OmniKVTransferManager:
             Tuple of (key_blocks, value_blocks) if valid, None otherwise
         """
         if isinstance(layer_kv, torch.Tensor):
+            if layer_idx == 0:
+                logger.info(
+                    f"[KV normalize] req={req_id} layer=0 tensor shape={tuple(layer_kv.shape)} ndim={layer_kv.ndim}"
+                )
             if layer_kv.ndim >= 3 and layer_kv.shape[0] == 2:
                 key_blocks = layer_kv[0]
                 value_blocks = layer_kv[1]
@@ -472,7 +487,8 @@ class OmniKVTransferManager:
                 )
                 if result:
                     data, size = result
-                    logger.info(f"Successfully received KV cache for {request_id}, {size} bytes")
+                    meta = data.get("metadata", {}) if isinstance(data, dict) else {}
+                    logger.info(f"Successfully received KV cache for {request_id}, {size} bytes, metadata={meta}")
 
                     # Move tensors to target device if specified
                     if target_device is not None and isinstance(data, dict) and "layer_blocks" in data:
