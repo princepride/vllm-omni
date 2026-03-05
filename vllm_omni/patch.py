@@ -45,20 +45,13 @@ except ImportError:
     # GlmImageTextConfig not available, skip patching
     pass
 
-# =============================================================================
-# Patch ModelConfig.is_mm_prefix_lm to include Bagel
-# =============================================================================
-# Bagel requires bidirectional attention for multimodal prefix positions
-# (same as Gemma3, Molmo2, PaliGemma). This must be patched at the ModelConfig
-# class level so it takes effect in all processes, including spawned Workers.
+# Patch ModelConfig.is_mm_prefix_lm to include Bagel (bidirectional attention)
+_orig_is_mm_prefix_lm_func = _ModelConfig.__dict__["is_mm_prefix_lm"].func
 
 
 @_cached_property
 def _patched_is_mm_prefix_lm(self) -> bool:
-    _MM_PREFIX_LM_MODELS = ("bagel", "gemma3", "molmo2", "paligemma")
-    if not hasattr(self.hf_config, "model_type"):
-        return False
-    return self.hf_config.model_type in _MM_PREFIX_LM_MODELS
+    return _orig_is_mm_prefix_lm_func(self) or getattr(self.hf_config, "model_type", None) == "bagel"
 
 
 _patched_is_mm_prefix_lm.__set_name__(_ModelConfig, "is_mm_prefix_lm")
