@@ -502,6 +502,14 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             )
         return pixel_values
 
+    def _clear_warmup_state(self):
+        """Clear stale state accumulated during warmup/profiling runs."""
+        self._ropes_queue.clear()
+        self._pending_img2img_info.clear()
+        self._cached_img2img_info = None
+        self._cfg_companions_remaining = 0
+        self._vae_token_mask = None
+
     def get_kv_transfer_metadata(self, req_id: str) -> dict[str, Any] | None:
         if self._ropes_queue:
             meta = self._ropes_queue.popleft()
