@@ -422,6 +422,7 @@ class BagelPipeline(nn.Module):
 
         injected_kv = req.sampling_params.past_key_values
         if injected_kv is not None:
+            logger.info("Using injected KV Cache (direct)")
             gen_context["past_key_values"] = injected_kv
             seq_len = injected_kv.key_cache[0].shape[0]
             gen_context["kv_lens"] = [seq_len]
@@ -435,6 +436,7 @@ class BagelPipeline(nn.Module):
 
             cfg_text_kv = getattr(req.sampling_params, "cfg_text_past_key_values", None)
             if cfg_text_kv is not None:
+                logger.info("CFG enabled with multi-KV: using injected cfg_text KV Cache")
                 cfg_text_seq_len = cfg_text_kv.key_cache[0].shape[0]
                 cfg_text_context["past_key_values"] = cfg_text_kv
                 cfg_text_context["kv_lens"] = [cfg_text_seq_len]
@@ -467,6 +469,7 @@ class BagelPipeline(nn.Module):
             image_input = self._extract_image_input(first_prompt)
 
             if image_input:
+                # If we have an image, we prefill with it
                 if self.image_processor and self.vae:
 
                     def vit_transforms(img):
@@ -476,6 +479,7 @@ class BagelPipeline(nn.Module):
 
                     resized_w, resized_h = image_input[0].size
                     image_shape = (resized_h, resized_w)
+                    logger.info(f"img2img: resized image to {resized_w}x{resized_h}")
 
                     gen_context = self._vae_encode_into_context(image_input, gen_context)
 
@@ -502,6 +506,7 @@ class BagelPipeline(nn.Module):
 
                     cfg_text_context = deepcopy(gen_context)
 
+            # Update gen_context with text prompt
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
@@ -533,6 +538,7 @@ class BagelPipeline(nn.Module):
             gen_context["kv_lens"] = newlens
             gen_context["ropes"] = new_rope
 
+            # cfg_text_context: update with negative prompt (no text condition)
             neg_prompt = extra_args.get("negative_prompt", "")
             neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
                 curr_kvlens=cfg_text_context["kv_lens"],
@@ -554,6 +560,8 @@ class BagelPipeline(nn.Module):
                 )
             cfg_text_context["kv_lens"] = neg_newlens
             cfg_text_context["ropes"] = neg_rope
+
+            # cfg_img_context: update with text prompt (no image condition)
             cfg_img_generation_input, cfg_img_newlens, cfg_img_new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=cfg_img_context["kv_lens"],
                 curr_rope=cfg_img_context["ropes"],
@@ -612,6 +620,7 @@ class BagelPipeline(nn.Module):
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
+        # text cfg
         generation_input_cfg_text = self.bagel.prepare_vae_latent_cfg(
             curr_kvlens=cfg_text_context["kv_lens"],
             curr_rope=cfg_text_context["ropes"],
@@ -777,6 +786,12 @@ class BagelPipeline(nn.Module):
                     kept += 1
                     yield picked, tensor
                 # else: ignore extra weights (e.g. connector/vision/und)
+            logger.info_once(
+                "BagelPipeline weight filter kept %d/%d tensors (shape mismatches seen: %d)",
+                kept,
+                total,
+                shape_mismatch,
+            )
 
         loader = AutoWeightsLoader(self)
         return loader.load_weights(_filtered_weights())

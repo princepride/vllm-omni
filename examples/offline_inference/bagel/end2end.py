@@ -45,9 +45,11 @@ def parse_args():
     parser.add_argument("--stage-configs-path", type=str, default=None)
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
 
-    parser.add_argument("--cfg-text-scale", type=float, default=4.0)
-    parser.add_argument("--cfg-img-scale", type=float, default=1.5)
-    parser.add_argument("--negative-prompt", type=str, default=None)
+    parser.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (default: 4.0)")
+    parser.add_argument("--cfg-img-scale", type=float, default=1.5, help="Image CFG scale (default: 1.5)")
+    parser.add_argument(
+        "--negative-prompt", type=str, default=None, help="Negative prompt for CFG (default: empty prompt)"
+    )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for generation.")
 
     args = parser.parse_args()
@@ -59,6 +61,7 @@ def main():
     model_name = args.model
     prompts: list[OmniPromptType] = []
     try:
+        # Preferred: load from txt file (one prompt per line)
         if getattr(args, "txt_prompts", None) and args.prompt_type == "text":
             with open(args.txt_prompts, encoding="utf-8") as f:
                 lines = [ln.strip() for ln in f.readlines()]
@@ -71,6 +74,7 @@ def main():
         raise
 
     if not prompts:
+        # Default prompt for text2img test if none provided
         prompts = ["<|im_start|>A cute cat<|im_end|>"]
         print(f"[Info] No prompts provided, using default: {prompts}")
     omni_outputs = []

@@ -191,6 +191,8 @@ class OmniKVTransferManager:
             logger.warning("No connector available, skipping KV transfer but freeing resources")
             return list(finished_reqs.keys())
 
+        logger.debug(f"Processing KV transfer for {len(finished_reqs)} requests")
+
         extracted_ids = []
         for req_id, data in finished_reqs.items():
             try:
