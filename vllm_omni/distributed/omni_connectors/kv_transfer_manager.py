@@ -163,7 +163,6 @@ class OmniKVTransferManager:
         block_size: int,
         cache_dtype: str,
         request_id_resolver: Callable[[str], str] | None = None,
-        model: torch.nn.Module | None = None,
     ) -> list[str]:
         """Handle KV cache transfer for finished requests.
 
@@ -176,7 +175,6 @@ class OmniKVTransferManager:
             block_size: Size of each cache block
             cache_dtype: Data type of the cache
             request_id_resolver: Optional function to resolve global request ID
-            model: Optional model instance to query for custom metadata
 
         Returns:
             List of request IDs that were processed
@@ -203,15 +201,6 @@ class OmniKVTransferManager:
                     continue
 
                 custom_metadata = data.get("custom_metadata")
-                if model is not None and hasattr(model, "get_kv_transfer_metadata"):
-                    try:
-                        model_meta = model.get_kv_transfer_metadata(req_id)
-                        if model_meta:
-                            if custom_metadata is None:
-                                custom_metadata = {}
-                            custom_metadata.update(model_meta)
-                    except Exception as e:
-                        logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
 
                 # Extract KV cache from GPU blocks -> CPU tensors
                 kv_data = self._extract_kv_cache(

@@ -102,13 +102,23 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 self.model._clear_warmup_state()
 
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
+        finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
+        if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
+            for req_id, data in finished_reqs.items():
+                try:
+                    model_meta = self.model.get_kv_transfer_metadata(req_id)
+                    if model_meta:
+                        existing = data.get("custom_metadata") or {}
+                        existing.update(model_meta)
+                        data["custom_metadata"] = existing
+                except Exception as e:
+                    logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
         self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
-            finished_reqs=getattr(scheduler_output, "finished_requests_needing_kv_transfer", {}),
+            finished_reqs=finished_reqs,
             kv_caches=self.kv_caches,
             block_size=self.cache_config.block_size,
             cache_dtype=str(self.cache_config.cache_dtype),
             request_id_resolver=self._resolve_global_request_id,
-            model=self.model,
         )
 
         if self.vllm_config.model_config.enable_return_routed_experts:
