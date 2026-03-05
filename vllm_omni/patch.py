@@ -45,13 +45,11 @@ except ImportError:
     # GlmImageTextConfig not available, skip patching
     pass
 
+
 # Patch ModelConfig.is_mm_prefix_lm to include Bagel (bidirectional attention)
-_orig_is_mm_prefix_lm_func = _ModelConfig.__dict__["is_mm_prefix_lm"].func
-
-
 @_cached_property
 def _patched_is_mm_prefix_lm(self) -> bool:
-    return _orig_is_mm_prefix_lm_func(self) or getattr(self.hf_config, "model_type", None) == "bagel"
+    return _ModelConfig.__dict__["is_mm_prefix_lm"].func(self) or getattr(self.hf_config, "model_type", None) == "bagel"
 
 
 _patched_is_mm_prefix_lm.__set_name__(_ModelConfig, "is_mm_prefix_lm")
