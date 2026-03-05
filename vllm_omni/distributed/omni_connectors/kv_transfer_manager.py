@@ -286,20 +286,17 @@ class OmniKVTransferManager:
         if not any(k is not None for k in key_cache):
             return None
 
-        metadata = {
-            "block_size": block_size,
-            "num_layers": num_layers,
-            "dtype": str(cache_dtype),
-            "seq_len": seq_len,
-        }
-        if custom_metadata:
-            metadata.update(custom_metadata)
-
         return KVCacheTransferData(
             request_id=req_id,
             layer_blocks={"key_cache": key_cache, "value_cache": value_cache},
             block_ids=block_ids,
-            metadata=metadata,
+            metadata={
+                "block_size": block_size,
+                "num_layers": num_layers,
+                "dtype": str(cache_dtype),
+                "seq_len": seq_len,
+                **(custom_metadata or {}),
+            },
         )
 
     def _normalize_layer_kv(
