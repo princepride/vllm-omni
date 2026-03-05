@@ -8,7 +8,6 @@ import torch.nn as nn
 from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
-from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm as VllmRMSNorm
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
@@ -52,8 +51,6 @@ from vllm_omni.diffusion.models.bagel.bagel_transformer import (
     TimestepEmbedder,
 )
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import default_ae_params
-
-logger = init_logger(__name__)
 
 
 class OmniBagelProcessor(BagelProcessor):
@@ -512,10 +509,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
     def get_kv_transfer_metadata(self, req_id: str) -> dict[str, Any] | None:
         if self._ropes_queue:
-            meta = self._ropes_queue.popleft()
-            logger.info("[AR kv_meta] req_id=%s -> %s (remaining=%d)", req_id, meta, len(self._ropes_queue))
-            return meta
-        logger.info("[AR kv_meta] req_id=%s -> None (queue empty)", req_id)
+            return self._ropes_queue.popleft()
         return None
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
@@ -645,16 +639,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
     ) -> torch.Tensor:
         use_mot = False
         seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
-        logger.info(
-            "[AR forward] seq_len=%d, has_embeds=%s, pending_img2img=%s, "
-            "cfg_companions=%d, ropes_queue_len=%d, positions[:5]=%s",
-            seq_len,
-            inputs_embeds is not None,
-            bool(self._pending_img2img_info),
-            self._cfg_companions_remaining,
-            len(self._ropes_queue),
-            positions[:5].tolist(),
-        )
 
         if self._pending_img2img_info:
             positions = self._adjust_positions_for_img2img(positions)
@@ -678,7 +662,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             if self._cfg_companions_remaining == 0:
                 self._cached_img2img_info = None
 
-        logger.info("[AR forward] use_mot=%s, ropes_queue after=%d", use_mot, len(self._ropes_queue))
         if use_mot:
             return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
         return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)

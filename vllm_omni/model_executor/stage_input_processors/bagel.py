@@ -92,18 +92,6 @@ def expand_cfg_prompts(
             "modalities": ["img2img"],
         }
 
-        logger.info("[CFG expand img2img] gen prompt=%r", prompt.get("prompt", "")[:200])
-        logger.info(
-            "[CFG expand img2img] cfg_text prompt=%r, has_mm=%s",
-            cfg_text_dict["prompt"][:200],
-            "multi_modal_data" in cfg_text_dict,
-        )
-        logger.info(
-            "[CFG expand img2img] cfg_img prompt=%r, has_mm=%s",
-            cfg_img_dict["prompt"][:200],
-            "multi_modal_data" in cfg_img_dict,
-        )
-
         return [
             ExpandedPrompt(
                 prompt=cfg_text_dict,
