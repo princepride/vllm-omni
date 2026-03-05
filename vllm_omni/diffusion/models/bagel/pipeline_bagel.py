@@ -257,105 +257,6 @@ class BagelPipeline(nn.Module):
         self.to(self.device)
 
     @staticmethod
-    def _extract_image_input(first_prompt) -> list[Image.Image] | None:
-        """Extract PIL images from the prompt's multi_modal_data, if present."""
-        if isinstance(first_prompt, str):
-            return None
-        image_input = (first_prompt.get("multi_modal_data") or {}).get("image")
-        if image_input is None:
-            return None
-        if not isinstance(image_input, list):
-            image_input = [image_input]
-        image_input = [Image.open(img) if isinstance(img, str) else img for img in image_input]
-        return image_input
-
-    def _resize_images_to_stride(self, images: list[Image.Image]) -> list[Image.Image]:
-        """Resize images so that dimensions are multiples of latent_downsample."""
-        stride = self.bagel.latent_downsample
-        max_img_size = int(self.bagel.max_latent_size * stride)
-
-        def _resize_one(img: Image.Image) -> Image.Image:
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            w, h = img.size
-            scale = min(max_img_size / max(w, h), 1.0)
-            min_img_size = min(256, max_img_size)
-            scale = max(scale, min_img_size / min(w, h))
-            new_w = max(stride, int(round(w * scale / stride) * stride))
-            new_h = max(stride, int(round(h * scale / stride) * stride))
-            new_w = min(new_w, max_img_size)
-            new_h = min(new_h, max_img_size)
-            if new_w != w or new_h != h:
-                img = img.resize((new_w, new_h), Image.BICUBIC)
-            return img
-
-        return [_resize_one(img) for img in images]
-
-    @staticmethod
-    def _vae_transforms(img: Image.Image) -> torch.Tensor:
-        """Convert PIL image to [-1, 1] tensor (C, H, W) for VAE encoding."""
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
-        return arr.permute(2, 0, 1)
-
-    def _vae_encode_into_context(
-        self,
-        images: list[Image.Image],
-        context: dict,
-    ) -> dict:
-        """Run VAE encoding of *images* and append the resulting KV to *context*.
-
-        This mirrors the existing ``forward_cache_update_vae`` call in the
-        single-stage img2img path but operates on an arbitrary context dict
-        (gen or cfg_text) that may already contain KV from the AR stage.
-        """
-        gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
-            curr_kvlens=context["kv_lens"],
-            curr_rope=context["ropes"],
-            images=images,
-            transforms=self._vae_transforms,
-            new_token_ids=self.new_token_ids,
-        )
-        for k, v in gen_input_vae.items():
-            if torch.is_tensor(v):
-                gen_input_vae[k] = v.to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
-            context["past_key_values"] = self.bagel.forward_cache_update_vae(
-                self.vae, context["past_key_values"], **gen_input_vae
-            )
-        context["kv_lens"] = newlens_vae
-        context["ropes"] = new_rope_vae
-        return context
-
-    def _apply_vae_encoding(
-        self,
-        images: list[Image.Image],
-        gen_context: dict,
-        cfg_text_context: dict,
-        has_cfg_text: bool,
-    ) -> tuple[tuple[int, int], dict, dict]:
-        """Resize images, VAE-encode them, and append to gen + cfg_text contexts.
-
-        Returns the (height, width) image shape derived from the resized image
-        together with the updated gen_context and cfg_text_context.
-        """
-        images = self._resize_images_to_stride(images)
-        resized_w, resized_h = images[0].size
-        image_shape = (resized_h, resized_w)
-
-        gen_context = self._vae_encode_into_context(images, gen_context)
-
-        if has_cfg_text:
-            cfg_text_context = self._vae_encode_into_context(images, cfg_text_context)
-
-        return image_shape, gen_context, cfg_text_context
-
-    @staticmethod
     def _decode_image_from_latent(
         bagel: Bagel, vae: AutoEncoder, latent: torch.Tensor, image_shape: tuple[int, int]
     ) -> Image.Image:
@@ -455,7 +356,6 @@ class BagelPipeline(nn.Module):
                     cfg_img_context["ropes"] = cfg_img_metadata["ropes"]
                 else:
                     cfg_img_context["ropes"] = [cfg_img_seq_len]
-
             else:
                 logger.warning("CFG is disabled: only single KV cache available")
                 gen_params = BagelGenParams(
@@ -466,7 +366,13 @@ class BagelPipeline(nn.Module):
                 )
 
         else:
-            image_input = self._extract_image_input(first_prompt)
+            image_input = (
+                None if isinstance(first_prompt, str) else (first_prompt.get("multi_modal_data") or {}).get("image")
+            )
+            if image_input and not isinstance(image_input, list):
+                image_input = [image_input]
+            if image_input:
+                image_input = [Image.open(image) if isinstance(image, str) else image for image in image_input]
 
             if image_input:
                 # If we have an image, we prefill with it
@@ -475,13 +381,61 @@ class BagelPipeline(nn.Module):
                     def vit_transforms(img):
                         return self.image_processor(images=img, return_tensors="pt").pixel_values[0]
 
-                    image_input = self._resize_images_to_stride(image_input)
+                    stride = self.bagel.latent_downsample
+                    max_img_size = int(self.bagel.max_latent_size * stride)
+
+                    def _resize_to_stride(img):
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        w, h = img.size
+                        # Scale down if longest edge exceeds max
+                        scale = min(max_img_size / max(w, h), 1.0)
+                        # Scale up if shortest edge is too small (min 256)
+                        min_img_size = min(256, max_img_size)
+                        scale = max(scale, min_img_size / min(w, h))
+                        new_w = max(stride, int(round(w * scale / stride) * stride))
+                        new_h = max(stride, int(round(h * scale / stride) * stride))
+                        # Clamp to max
+                        new_w = min(new_w, max_img_size)
+                        new_h = min(new_h, max_img_size)
+                        if new_w != w or new_h != h:
+                            img = img.resize((new_w, new_h), Image.BICUBIC)
+                        return img
+
+                    image_input = [_resize_to_stride(img) for img in image_input]
 
                     resized_w, resized_h = image_input[0].size
                     image_shape = (resized_h, resized_w)
                     logger.info(f"img2img: resized image to {resized_w}x{resized_h}")
 
-                    gen_context = self._vae_encode_into_context(image_input, gen_context)
+                    def vae_transforms(img):
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        # Convert to [-1, 1] tensor (H, W, C) -> (C, H, W)
+                        arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
+                        return arr.permute(2, 0, 1)
+
+                    # Update gen_context with image (VAE + ViT)
+                    gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
+                        curr_kvlens=gen_context["kv_lens"],
+                        curr_rope=gen_context["ropes"],
+                        images=image_input,
+                        transforms=vae_transforms,
+                        new_token_ids=self.new_token_ids,
+                    )
+                    for k, v in gen_input_vae.items():
+                        if torch.is_tensor(v):
+                            gen_input_vae[k] = v.to(self.device)
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        enabled=self.device.type != "cpu",
+                        dtype=self.od_config.dtype,
+                    ):
+                        gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
+                            self.vae, gen_context["past_key_values"], **gen_input_vae
+                        )
+                    gen_context["kv_lens"] = newlens_vae
+                    gen_context["ropes"] = new_rope_vae
 
                     gen_input_img, newlens_img, new_rope_img = self.bagel.prepare_vit_images(
                         curr_kvlens=gen_context["kv_lens"],
