@@ -1,3 +1,4 @@
+from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from math import isqrt
 from typing import Any
@@ -413,8 +414,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         self._pending_img2img_info: list[tuple[int, int, int, int]] = []
         self._ropes_pending: list[dict[str, Any]] = []
         self._ropes_metadata: dict[str, dict[str, Any]] = {}
-        self._cached_img2img_info: tuple[int, int, int, int] | None = None
-        self._cfg_companions_remaining: int = 0
+        self._cfg_companion_queue: deque[tuple[tuple[int, int, int, int], int]] = deque()
 
         from transformers import AutoTokenizer
 
@@ -504,8 +504,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         self._ropes_pending.clear()
         self._ropes_metadata.clear()
         self._pending_img2img_info.clear()
-        self._cached_img2img_info = None
-        self._cfg_companions_remaining = 0
+        self._cfg_companion_queue.clear()
         self._vae_token_mask = None
 
     def get_kv_transfer_metadata(self, req_id: str) -> dict[str, Any] | None:
@@ -631,8 +630,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             num_vit = vit_emb.shape[0] + 2
             info = (num_vae, num_vit, int(H), int(W))
             self._pending_img2img_info.append(info)
-            self._cached_img2img_info = info
-            self._cfg_companions_remaining = 2  # cfg_text + cfg_img
+            self._cfg_companion_queue.append((info, 2))  # cfg_text + cfg_img
 
         return tuple(results)
 
@@ -651,9 +649,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             positions = self._adjust_positions_for_img2img(positions)
             use_mot = True
 
-        elif self._cfg_companions_remaining > 0 and self._cached_img2img_info is not None:
-            self._cfg_companions_remaining -= 1
-            cached = self._cached_img2img_info
+        elif self._cfg_companion_queue:
+            cached, remaining = self._cfg_companion_queue[0]
+            remaining -= 1
             num_vae, num_vit, img_H, img_W = cached
             num_img2img = num_vae + 1 + num_vit  # +1 separator
             seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
@@ -666,8 +664,10 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 rope = int(positions[seq_len - 1].item()) + 1
                 self._ropes_pending.append({"ropes": [rope]})
 
-            if self._cfg_companions_remaining == 0:
-                self._cached_img2img_info = None
+            if remaining == 0:
+                self._cfg_companion_queue.popleft()
+            else:
+                self._cfg_companion_queue[0] = (cached, remaining)
 
         if use_mot:
             return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
