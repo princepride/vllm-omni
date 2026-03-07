@@ -50,6 +50,13 @@ def parse_args():
     parser.add_argument(
         "--negative-prompt", type=str, default=None, help="Negative prompt for CFG (default: empty prompt)"
     )
+    parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="CFG parallel size: 1=batched (single GPU), 2=parallel with 2 branches (text CFG only), 3=parallel (3 GPUs).",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for generation.")
 
     args = parser.parse_args()
@@ -143,6 +150,7 @@ def main():
         if len(params_list) > 1:
             diffusion_params = params_list[1]
             diffusion_params.num_inference_steps = args.steps  # type: ignore
+            diffusion_params.cfg_parallel_size = args.cfg_parallel_size  # type: ignore
             if args.seed is not None:
                 diffusion_params.seed = args.seed  # type: ignore
             extra = {
