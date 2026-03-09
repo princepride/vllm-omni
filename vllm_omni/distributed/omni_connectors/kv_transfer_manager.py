@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec
+from .utils.kv_utils import normalize_layer_kv
 
 logger = init_logger(__name__)
 
@@ -252,7 +253,7 @@ class OmniKVTransferManager:
         value_cache: list[torch.Tensor | None] = [None] * num_layers
 
         for layer_idx, layer_kv in enumerate(kv_caches):
-            kv_pair = self._normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx)
+            kv_pair = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx)
             if kv_pair is None:
                 continue
             key_blocks, value_blocks = kv_pair
@@ -298,58 +299,6 @@ class OmniKVTransferManager:
                 **(custom_metadata or {}),
             },
         )
-
-    def _normalize_layer_kv(
-        self,
-        layer_kv: LayerKV,
-        req_id: str,
-        layer_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Normalize one layer KV cache to a `(key_blocks, value_blocks)` tuple.
-
-        Args:
-            layer_kv: The raw KV cache (tensor or tuple) for the layer
-            req_id: Request ID for logging
-            layer_idx: Layer index for logging
-
-        Returns:
-            Tuple of (key_blocks, value_blocks) if valid, None otherwise
-        """
-        if isinstance(layer_kv, torch.Tensor):
-            if layer_kv.ndim >= 3 and layer_kv.shape[0] == 2:
-                key_blocks = layer_kv[0]
-                value_blocks = layer_kv[1]
-            elif layer_kv.ndim >= 3 and layer_kv.shape[1] == 2:
-                key_blocks = layer_kv[:, 0]
-                value_blocks = layer_kv[:, 1]
-            else:
-                logger.warning(
-                    f"Layer {layer_idx} for request {req_id} has invalid stacked KV shape: "
-                    f"expected [2, ...] or [..., 2, ...] at dim 0/1, got {tuple(layer_kv.shape)}"
-                )
-                return None
-        elif isinstance(layer_kv, tuple):
-            if len(layer_kv) != 2:
-                logger.warning(
-                    f"Layer {layer_idx} for request {req_id} has KV pair length {len(layer_kv)} (expected 2)"
-                )
-                return None
-            key_blocks, value_blocks = layer_kv
-            if not isinstance(key_blocks, torch.Tensor) or not isinstance(value_blocks, torch.Tensor):
-                logger.warning(f"Layer {layer_idx} for request {req_id} has non-tensor KV pair entries")
-                return None
-        else:
-            logger.warning(f"Layer {layer_idx} for request {req_id} has unsupported KV type {type(layer_kv).__name__}")
-            return None
-        # ensure key/value blocks are at least 2D for block indexing
-        if key_blocks.ndim < 2 or value_blocks.ndim < 2:
-            logger.warning(
-                f"Layer {layer_idx} for request {req_id} has invalid KV block shape: "
-                f"got key={tuple(key_blocks.shape)} value={tuple(value_blocks.shape)}"
-            )
-            return None
-
-        return key_blocks, value_blocks
 
     def _transfer_kv_cache(self, kv_data: KVCacheTransferData, transfer_req_id: str) -> None:
         """Transfer KV cache data to downstream stage via OmniConnector.
