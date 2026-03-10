@@ -311,17 +311,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 negative_prompt = extra_body.get("negative_prompt")
 
                 engine_prompt_image: dict[str, Any] | None = None
+                is_img2img = False
                 if reference_images:
                     # Best-effort decode first reference image for i2i.
                     try:
                         img_bytes = base64.b64decode(reference_images[0])
                         img = Image.open(BytesIO(img_bytes))
-                        engine_prompt_image = {"image": img}
+                        engine_prompt_image = {"img2img": img}
+                        is_img2img = True
                     except Exception:
                         engine_prompt_image = None
 
                 # Override the prompts produced by chat-template preprocessing.
+                if is_img2img:
+                    extracted_prompt = f"<|fim_middle|>{extracted_prompt}"
                 tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
+                if is_img2img:
+                    tprompt["modalities"] = ["img2img"]
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
                 # GLM-Image's _call_hf_processor expects target_h/target_w in mm_processor_kwargs
