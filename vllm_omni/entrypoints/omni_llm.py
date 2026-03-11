@@ -41,8 +41,6 @@ class OmniLLM(LLM):
 
     Args:
         model: Model name or path to load
-        stage_configs_path: Optional path to YAML file containing stage
-            configurations. If None, configurations are loaded from the model.
         log_stats: Whether to enable statistics logging
         compilation_config: Optional compilation configuration. Can be an
             integer (compilation level), dict, or CompilationConfig instance.
