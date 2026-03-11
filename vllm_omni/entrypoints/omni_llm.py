@@ -25,8 +25,6 @@ from vllm_omni.engine.input_processor import OmniInputProcessor, reinject_omni_f
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.utils import (
     filter_dataclass_kwargs,
-    load_stage_configs_from_model,
-    load_stage_configs_from_yaml,
     resolve_model_config_path,
 )
 
@@ -68,7 +66,6 @@ class OmniLLM(LLM):
     def __init__(
         self,
         model: str,
-        stage_configs_path: str | None = None,
         log_stats: bool = False,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         hf_overrides: dict[str, Any] | None = None,
@@ -86,13 +83,8 @@ class OmniLLM(LLM):
         self.batch_timeout = batch_timeout
         self.log_stats: bool = bool(log_stats)
 
-        # Load stage configurations
-        if stage_configs_path is None:
-            self.config_path = resolve_model_config_path(model)
-            self.stage_configs = load_stage_configs_from_model(model)
-        else:
-            self.config_path = stage_configs_path
-            self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
+        # Resolve model config path for connectors
+        self.config_path = resolve_model_config_path(model)
 
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
@@ -154,6 +146,7 @@ class OmniLLM(LLM):
             compilation_config=compilation_config_instance,
             structured_outputs_config=structured_outputs_instance,
             omni_kv_config=omni_kv_config,
+            hf_overrides=hf_overrides or {},
             **filter_dataclass_kwargs(OmniEngineArgs, kwargs),
         )
 
