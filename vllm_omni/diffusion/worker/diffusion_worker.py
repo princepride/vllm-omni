@@ -75,7 +75,7 @@ class DiffusionWorker:
     def predict_resource_usage(od_config: OmniDiffusionConfig) -> dict[str, float]:
         from vllm.utils.mem_utils import GiB_bytes
 
-        total_params = 0
+        total_weight_bytes = 0
         estimate_source = "fallback"
         try:
             model_path = Path(getattr(od_config, "model", ""))
@@ -83,13 +83,15 @@ class DiffusionWorker:
             if index_file.exists():
                 with open(index_file) as f:
                     data = json.load(f)
-                    # metadata.total_size
-                    total_params = int(data.get("metadata", {}).get("total_size", 0))
-                    if total_params > 0:
+                    # metadata.total_size is already in bytes
+                    total_weight_bytes = int(data.get("metadata", {}).get("total_size", 0))
+                    if total_weight_bytes > 0:
                         estimate_source = "safetensors index"
         except Exception as e:
             logger.debug(f"Failed to parse safetensors metadata: {e}")
-        if total_params == 0:
+
+        if total_weight_bytes == 0:
+            # Fallback: estimate from known param counts × dtype size
             m_name = str(getattr(od_config, "model", "")).lower()
             if "bagel" in m_name:
                 total_params = MODEL_PARAM_COUNTS["bagel"]
@@ -100,23 +102,30 @@ class DiffusionWorker:
             else:
                 total_params = MODEL_PARAM_COUNTS["default"]
                 estimate_source = "default"
-        logger.info(f"VRAM Quota: Estimated {total_params / 1e9:.2f}B params using {estimate_source} logic")
 
-        dtype = getattr(od_config, "dtype", torch.bfloat16)
-        dtype_str = str(dtype).lower()
-        # Calculate the number of bytes per parameter
-        # based on different levels of precision.
-        if "int4" in dtype_str:
-            bytes_per_param = 0.5
-        elif any(kw in dtype_str for kw in ["float8", "int8"]):
-            bytes_per_param = 1
-        elif any(kw in dtype_str for kw in ["float16", "bfloat16", "half"]):
-            bytes_per_param = 2
-        elif any(kw in dtype_str for kw in ["float32", "int32"]):
-            bytes_per_param = 4
+            dtype = getattr(od_config, "dtype", torch.bfloat16)
+            dtype_str = str(dtype).lower()
+            if "int4" in dtype_str:
+                bytes_per_param = 0.5
+            elif any(kw in dtype_str for kw in ["float8", "int8"]):
+                bytes_per_param = 1
+            elif any(kw in dtype_str for kw in ["float16", "bfloat16", "half"]):
+                bytes_per_param = 2
+            elif any(kw in dtype_str for kw in ["float32", "int32"]):
+                bytes_per_param = 4
+            else:
+                bytes_per_param = 4
+            total_weight_bytes = int(total_params * bytes_per_param)
+            logger.info(
+                f"VRAM Quota: Estimated {total_params / 1e9:.2f}B params "
+                f"(dtype={dtype_str}, {bytes_per_param}B/param) using {estimate_source} logic"
+            )
         else:
-            bytes_per_param = 4
-        static_gb = (total_params * bytes_per_param) / GiB_bytes
+            logger.info(
+                f"VRAM Quota: Estimated {total_weight_bytes / 1e9:.2f} GB weight bytes using {estimate_source} logic"
+            )
+
+        static_gb = total_weight_bytes / GiB_bytes
         h, w = getattr(od_config, "height", 1024), getattr(od_config, "width", 1024)
         dynamic_gb = ACTIVATION_MEMORY_MULTIPLIER * (h * w / (1024 * 1024))
         return {
