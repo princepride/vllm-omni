@@ -470,8 +470,9 @@ class AsyncOmni(OmniBase):
                 logger.exception(f"[{self._name}] Request {request_id} Failed to finalized/build/log summary: {e}")
             finally:
                 self.request_states.pop(request_id, None)
-                for cid in [k for k, v in self._companion_to_parent.items() if v == request_id]:
-                    del self._companion_to_parent[cid]
+                if cfg.is_active:
+                    for cid in cfg.get_companion_request_ids(request_id).values():
+                        self._companion_to_parent.pop(cid, None)
         except (asyncio.CancelledError, GeneratorExit):
             await self.abort(request_id)
             logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
@@ -638,48 +639,34 @@ class AsyncOmni(OmniBase):
         cfg: CfgCompanionTracker | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
+            cfg_stage0 = stage_id == 0 and cfg is not None and cfg.is_active
             finished = False
 
-            if stage_id == 0 and cfg is not None and cfg.is_active:
-                parent_finished = False
-                while not parent_finished or (
-                    not cfg.all_companions_done(request_id) and not cfg.is_parent_failed(request_id)
+            while True:
+                if finished and (
+                    not cfg_stage0 or cfg.all_companions_done(request_id) or cfg.is_parent_failed(request_id)
                 ):
-                    result = await req_state.queue.get()
-                    result_req_id = result.get("request_id")
+                    break
 
-                    if cfg.is_companion(result_req_id):
+                result = await req_state.queue.get()
+
+                if cfg is not None and cfg.is_companion(result.get("request_id", "")):
+                    if cfg_stage0:
+                        rid = result.get("request_id")
                         if "error" in result:
-                            cfg.on_companion_error(result_req_id)
+                            cfg.on_companion_error(rid)
                         else:
-                            cfg.on_companion_completed(result_req_id)
-                        continue
+                            cfg.on_companion_completed(rid)
+                    continue
 
-                    assert stage_id == req_state.stage_id
-                    engine_outputs, parent_finished, output_to_yield = self._process_single_result(
-                        result,
-                        stage,
-                        stage_id,
-                        metrics,
-                    )
-                    if output_to_yield:
-                        yield output_to_yield
-                finished = True
-            else:
-                while not finished:
-                    result = await req_state.queue.get()
-                    # Skip stale companion results from stage-0 that may
-                    # arrive after CFG processing has already completed.
-                    if cfg is not None and cfg.is_companion(result.get("request_id", "")):
-                        continue
-                    engine_outputs, finished, output_to_yield = self._process_single_result(
-                        result,
-                        stage,
-                        stage_id,
-                        metrics,
-                    )
-                    if output_to_yield:
-                        yield output_to_yield
+                engine_outputs, finished, output_to_yield = self._process_single_result(
+                    result,
+                    stage,
+                    stage_id,
+                    metrics,
+                )
+                if output_to_yield:
+                    yield output_to_yield
 
             if not isinstance(engine_outputs, list):
                 engine_outputs = [engine_outputs]
@@ -688,21 +675,19 @@ class AsyncOmni(OmniBase):
             next_stage_id = stage_id + 1
             if next_stage_id <= final_stage_id_for_e2e:
                 next_stage: OmniStage = self.stage_list[next_stage_id]
-                # Derive inputs for the next stage, record postprocess time
                 with metrics.stage_postprocess_timer(stage_id, request_id):
                     next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
                 sp_next: SamplingParams = sampling_params_list[next_stage_id]
 
-                # Attach CFG KV request IDs if CFG companions succeeded
-                cfg_ok = cfg is not None and cfg.is_active and not cfg.is_parent_failed(request_id)
-                if cfg_ok and isinstance(sp_next, OmniDiffusionSamplingParams):
-                    sp_next = copy.deepcopy(sp_next)
-                    sp_next.cfg_kv_request_ids = cfg.get_companion_request_ids(request_id)
-                    logger.info(
-                        "Attaching cfg_kv_request_ids=%s to request %s",
-                        sp_next.cfg_kv_request_ids,
-                        request_id,
-                    )
+                if cfg is not None and cfg.is_active and not cfg.is_parent_failed(request_id):
+                    if isinstance(sp_next, OmniDiffusionSamplingParams):
+                        sp_next = copy.deepcopy(sp_next)
+                        sp_next.cfg_kv_request_ids = cfg.get_companion_request_ids(request_id)
+                        logger.info(
+                            "Attaching cfg_kv_request_ids=%s to request %s",
+                            sp_next.cfg_kv_request_ids,
+                            request_id,
+                        )
 
                 # Check if we have a connector for this edge
                 connector_key = (str(stage_id), str(next_stage_id))
