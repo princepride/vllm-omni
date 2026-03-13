@@ -667,7 +667,6 @@ class AsyncOmni(OmniBase):
                 )
                 if output_to_yield:
                     yield output_to_yield
-
             if not isinstance(engine_outputs, list):
                 engine_outputs = [engine_outputs]
             stage.set_engine_outputs(engine_outputs)
@@ -675,6 +674,7 @@ class AsyncOmni(OmniBase):
             next_stage_id = stage_id + 1
             if next_stage_id <= final_stage_id_for_e2e:
                 next_stage: OmniStage = self.stage_list[next_stage_id]
+                # Derive inputs for the next stage, record postprocess time
                 with metrics.stage_postprocess_timer(stage_id, request_id):
                     next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
                 sp_next: SamplingParams = sampling_params_list[next_stage_id]
@@ -708,6 +708,10 @@ class AsyncOmni(OmniBase):
                     )
 
                 if not sent_via_connector:
+                    # Fallback logic removed as we now enforce connector usage.
+                    # If no connector is found or send fails, we log an error and raise,
+                    # because continuing would cause the request to be silently dropped
+                    # and the orchestrator to hang waiting for completion.
                     error_msg = (
                         f"[{self._name}] Failed to send request {request_id} to stage-{next_stage_id} via connector. "
                         "Configure a connector for this edge or inspect connector logs for details."
