@@ -325,7 +325,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Override the prompts produced by chat-template preprocessing.
                 tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
                 if is_img2img:
-                    tprompt["prompt"] = f"<|fim_middle|>{extracted_prompt}"
                     tprompt["modalities"] = ["img2img"]
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
