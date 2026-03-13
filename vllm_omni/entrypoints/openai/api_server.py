@@ -67,7 +67,7 @@ from vllm.entrypoints.openai.speech_to_text.serving import (
 )
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
-from vllm.entrypoints.pooling.embed.serving import ServingEmbedding
+from vllm.entrypoints.pooling.embed.serving import OpenAIServingEmbedding
 from vllm.entrypoints.pooling.pooling.serving import OpenAIServingPooling
 from vllm.entrypoints.pooling.score.serving import ServingScores
 from vllm.entrypoints.serve.disagg.serving import ServingTokens
@@ -536,7 +536,13 @@ async def omni_init_app_state(
                             else vllm_config.model_config
                         )
                         io_processor_plugin = model_config.io_processor_plugin
-                        engine_client.io_processor = get_io_processor(vllm_config, io_processor_plugin)
+                        renderer = getattr(engine_client, "renderer", None)
+                        if renderer is None:
+                            from vllm.renderers import renderer_from_config
+
+                            renderer = renderer_from_config(vllm_config)
+                            engine_client.renderer = renderer
+                        engine_client.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
                         logger.info("Initialized io_processor for AsyncOmni")
                 else:
                     logger.warning("Cannot initialize processors: tokenizer is None. OpenAIServingModels may fail.")
@@ -627,7 +633,7 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_embedding = (
-        ServingEmbedding(
+        OpenAIServingEmbedding(
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,

@@ -238,7 +238,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
-        self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
+        if hasattr(self, "late_interaction_runner"):
+            self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -250,7 +251,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
-        if scheduler_output.new_block_ids_to_zero:
+        if hasattr(scheduler_output, "new_block_ids_to_zero") and scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Free the cached encoder outputs.
@@ -320,7 +321,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
-            self.late_interaction_runner.register_request(req_id, pooling_params)
+            if hasattr(self, "late_interaction_runner"):
+                self.late_interaction_runner.register_request(req_id, pooling_params)
 
             # If prompt embeddings are provided, decode and attach to inter_data
             try:
