@@ -103,14 +103,19 @@ class BagelOmniServer:
             start_new_session=True,
         )
 
-        if not _wait_for_port(self.host, self.port, timeout=600):
-            raise RuntimeError(f"Server failed to start within 600 seconds on {self.host}:{self.port}")
+        try:
+            if not _wait_for_port(self.host, self.port, timeout=600, proc=self.proc):
+                self.terminate()
+                raise RuntimeError(f"Server failed to start within 600 seconds on {self.host}:{self.port}")
+        except Exception:
+            self.terminate()
+            raise
 
     def __enter__(self):
         self._start_server()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def terminate(self) -> None:
         if self.proc:
             try:
                 os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
@@ -124,6 +129,10 @@ class BagelOmniServer:
                 except ProcessLookupError:
                     pass
                 self.proc.wait()
+            self.proc = None
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.terminate()
 
 
 def _find_free_port() -> int:
@@ -133,9 +142,12 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_for_port(host: str, port: int, timeout: int = 600) -> bool:
+def _wait_for_port(host: str, port: int, timeout: int = 600, proc: subprocess.Popen | None = None) -> bool:
     start = time.time()
     while time.time() - start < timeout:
+        if proc is not None and proc.poll() is not None:
+            # Server process exited early
+            return False
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
