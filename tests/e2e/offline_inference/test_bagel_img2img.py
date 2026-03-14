@@ -188,7 +188,3 @@ def test_bagel_img2img_shared_memory_connector():
         _validate_pixels(generated_image)
     finally:
         omni.close()
-
-
-if __name__ == "__main__":
-    test_bagel_img2img_shared_memory_connector()
