@@ -18,7 +18,6 @@ import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 
 import socket
 from pathlib import Path
