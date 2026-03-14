@@ -24,11 +24,11 @@ import socket
 from pathlib import Path
 from typing import Any
 
-# import pytest
+import pytest
 from PIL import Image
 from vllm.assets.image import ImageAsset
 
-# from tests.utils import hardware_test
+from tests.utils import hardware_test
 from vllm_omni.entrypoints.omni import Omni
 
 # Reference pixel data extracted from the known-good output image
@@ -174,9 +174,9 @@ def _generate_bagel_img2img(
     return generated_image
 
 
-# @pytest.mark.core_model
-# @pytest.mark.diffusion
-# @hardware_test(res={"cuda": "H100"})
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"})
 def test_bagel_img2img_shared_memory_connector():
     """Test Bagel img2img with shared memory connector."""
     input_image = _load_input_image()
