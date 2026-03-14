@@ -97,7 +97,6 @@ class BagelOmniServer:
             "300",
         ]
 
-        print(f"Launching BagelOmniServer: {' '.join(cmd)}")
         self.proc = subprocess.Popen(
             cmd,
             env=env,
@@ -106,7 +105,6 @@ class BagelOmniServer:
 
         if not _wait_for_port(self.host, self.port, timeout=600):
             raise RuntimeError(f"Server failed to start within 600 seconds on {self.host}:{self.port}")
-        print(f"Server ready on {self.host}:{self.port}")
 
     def __enter__(self):
         self._start_server()
@@ -220,7 +218,6 @@ def test_bagel_text2img_online():
 
         w, h = image.size
         assert w > 0 and h > 0, f"Invalid image size: {image.size}"
-        print(f"text2img generated image size: {image.size}")
 
 
 @pytest.mark.core_model
@@ -244,9 +241,3 @@ def test_bagel_img2img_online():
 
         w, h = image.size
         assert w > 0 and h > 0, f"Invalid image size: {image.size}"
-        print(f"img2img generated image size: {image.size}")
-
-
-if __name__ == "__main__":
-    test_bagel_text2img_online()
-    test_bagel_img2img_online()
