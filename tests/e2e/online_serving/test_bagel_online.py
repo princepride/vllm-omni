@@ -20,14 +20,8 @@ Equivalent to running:
         --image-url women.jpg
 """
 
-import os
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
-os.environ.setdefault("VLLM_IMAGE_FETCH_TIMEOUT", "60")
-
 import base64
+import os
 import signal
 import socket
 import subprocess
@@ -75,8 +69,6 @@ class BagelOmniServer:
 
     def _start_server(self) -> None:
         env = os.environ.copy()
-        env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        env["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
         if self.env_dict is not None:
             env.update(self.env_dict)
 

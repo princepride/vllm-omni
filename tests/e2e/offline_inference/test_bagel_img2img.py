@@ -14,11 +14,6 @@ Equivalent to running:
         --image-path 2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg
 """
 
-import os
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-
 import socket
 from pathlib import Path
 from typing import Any
