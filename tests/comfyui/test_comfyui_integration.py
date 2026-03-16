@@ -415,7 +415,12 @@ def mock_async_omni(server_case: ServerCase, sampling_case: SamplingCase):
         ]
         mock_instance.errored = False
         mock_instance.dead_error = RuntimeError("Mock engine error")
-        mock_instance.model_config = MagicMock(max_model_len=4096, io_processor_plugin=None)
+        mock_instance.model_config = MagicMock(
+            max_model_len=4096,
+            io_processor_plugin=None,
+            allowed_local_media_path=None,
+            allowed_media_domains=None,
+        )
         # Mimic Qwen3-TTS talker speaker config so CustomVoice validation passes.
         mock_instance.model_config.hf_config = MagicMock()
         mock_instance.model_config.hf_config.talker_config = MagicMock()
