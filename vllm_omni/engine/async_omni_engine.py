@@ -33,6 +33,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
 
+from vllm_omni.config.stage_config import StageConfigFactory
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.engine import (
     OmniEngineCoreRequest,
@@ -58,7 +59,7 @@ from vllm_omni.engine.stage_init import (
     setup_stage_devices,
 )
 from vllm_omni.entrypoints.utils import (
-    load_and_resolve_stage_configs,
+    load_stage_configs_from_yaml,
 )
 
 logger = init_logger(__name__)
@@ -739,13 +740,22 @@ class AsyncOmniEngine:
         # TTS-specific CLI overrides
         self.tts_max_instructions_length: int | None = kwargs.get("tts_max_instructions_length", None)
 
-        # Load stage configurations from YAML
-        config_path, stage_configs = load_and_resolve_stage_configs(
-            model,
-            stage_configs_path,
-            kwargs,
-            default_stage_cfg_factory=lambda: AsyncOmniEngine._create_default_diffusion_stage_cfg(kwargs),
-        )
+        # Resolve stage configurations without implicit fallback.
+        # - Explicit stage_configs_path: trust user-provided YAML.
+        # - Otherwise: require StageConfigFactory model pipeline resolution.
+        if stage_configs_path is not None:
+            config_path = stage_configs_path
+            stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=kwargs)
+        else:
+            config_path = ""
+            factory_stage_configs = StageConfigFactory.create_from_model(model, cli_overrides=kwargs)
+            if factory_stage_configs is None:
+                raise FileNotFoundError(
+                    "StageConfigFactory could not resolve a pipeline for model "
+                    f"{model!r}. Add model_executor/models/<model_dir>/pipeline.yaml "
+                    "or pass --stage-configs-path explicitly."
+                )
+            stage_configs = [stage.to_omegaconf() for stage in factory_stage_configs]
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
         for cfg in stage_configs:
