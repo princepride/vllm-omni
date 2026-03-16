@@ -24,11 +24,17 @@ import base64
 import os
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import pytest
+from PIL import Image
 from vllm.assets.image import ImageAsset
 
 from tests.conftest import OmniServerParams
+from tests.e2e.offline_inference.test_bagel_img2img import DEFAULT_PROMPT as IMG2IMG_PROMPT
+from tests.e2e.offline_inference.test_bagel_img2img import REFERENCE_PIXELS as IMG2IMG_REFERENCE_PIXELS
+from tests.e2e.offline_inference.test_bagel_text2img import DEFAULT_PROMPT as TEXT2IMG_PROMPT
+from tests.e2e.offline_inference.test_bagel_text2img import REFERENCE_PIXELS as TEXT2IMG_REFERENCE_PIXELS
 from tests.utils import hardware_test
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -39,8 +45,7 @@ STAGE_CONFIGS_PATH = str(
     Path(__file__).parent.parent / "offline_inference" / "stage_configs" / "bagel_sharedmemory_ci.yaml"
 )
 
-TEXT2IMG_PROMPT = "A cute cat"
-IMG2IMG_PROMPT = "Change the grass color to red"
+PIXEL_TOLERANCE = 5
 
 # Create parameter combinations for model and stage config
 test_params = [
@@ -78,6 +83,21 @@ def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
     ]
 
 
+def _validate_pixels(
+    image: Image.Image,
+    reference_pixels: list[dict[str, Any]],
+    tolerance: int = PIXEL_TOLERANCE,
+) -> None:
+    """Validate that image pixels match expected reference values."""
+    for ref in reference_pixels:
+        x, y = ref["position"]
+        expected = ref["rgb"]
+        actual = image.getpixel((x, y))[:3]
+        assert all(abs(a - e) <= tolerance for a, e in zip(actual, expected)), (
+            f"Pixel mismatch at ({x}, {y}): expected {expected}, got {actual}"
+        )
+
+
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
@@ -91,7 +111,15 @@ def test_bagel_text2img_online(omni_server, openai_client) -> None:
         "modalities": ["image"],
     }
 
-    openai_client.send_diffusion_request(request_config)
+    responses = openai_client.send_diffusion_request(request_config)
+    assert responses, "No responses received"
+
+    image = responses[0].images[0]
+    assert image is not None, "No image in response"
+
+    w, h = image.size
+    assert (w, h) == (1024, 1024), f"Expected 1024x1024, got {image.size}"
+    _validate_pixels(image, TEXT2IMG_REFERENCE_PIXELS)
 
 
 @pytest.mark.core_model
@@ -112,4 +140,12 @@ def test_bagel_img2img_online(omni_server, openai_client) -> None:
         "modalities": ["image"],
     }
 
-    openai_client.send_diffusion_request(request_config)
+    responses = openai_client.send_diffusion_request(request_config)
+    assert responses, "No responses received"
+
+    image = responses[0].images[0]
+    assert image is not None, "No image in response"
+
+    w, h = image.size
+    assert (w, h) == (1024, 672), f"Expected 1024x672, got {image.size}"
+    _validate_pixels(image, IMG2IMG_REFERENCE_PIXELS)

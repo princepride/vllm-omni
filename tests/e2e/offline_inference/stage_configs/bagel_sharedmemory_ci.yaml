@@ -33,7 +33,7 @@ stage_args:
       temperature: 0.4
       top_p: 0.9
       top_k: 1
-      max_tokens: 2048
+      max_tokens: 1
       seed: 52
       detokenize: True
       repetition_penalty: 1.05
@@ -64,6 +64,10 @@ stage_args:
     is_comprehension: false
     default_sampling_params:
       seed: 52
+      num_inference_steps: 15
+      extra_args:
+        cfg_text_scale: 4.0
+        cfg_img_scale: 1.5
 
 # Runtime edges
 runtime:
