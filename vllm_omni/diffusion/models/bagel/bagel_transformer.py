@@ -1701,6 +1701,29 @@ class Bagel(nn.Module):
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
             return unpacked_latent
 
+        # ── SP without CFG: direct single-branch loop ──
+        if use_sp:
+            for i, t in enumerate(timesteps):
+                timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+                v_t = self._forward_flow_single_branch(
+                    x_t=x_t,
+                    timestep=timestep,
+                    packed_vae_token_indexes=packed_vae_token_indexes,
+                    packed_vae_position_ids=packed_vae_position_ids,
+                    packed_text_ids=packed_text_ids,
+                    packed_text_indexes=packed_text_indexes,
+                    packed_indexes=packed_indexes,
+                    packed_position_ids=packed_position_ids,
+                    packed_seqlens=packed_seqlens,
+                    key_values_lens=key_values_lens,
+                    past_key_values=past_key_values,
+                    packed_key_value_indexes=packed_key_value_indexes,
+                )
+                x_t = x_t - v_t.to(x_t.device) * dts[i]
+
+            unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
+            return unpacked_latent
+
         # ── Batched CFG mode (cfg_parallel_size=1, no SP) ──
         cfg_batched = None
 
@@ -2128,21 +2151,7 @@ class Bagel(nn.Module):
         cfg_img_scale: float = 1.0,
         cfg_batched: dict | None = None,
     ):
-        use_sp = self._sp_size > 1
-        use_cfg = cfg_text_scale > 1.0
-
-        # When SP is active and batched CFG is needed, fall back to
-        # sequential single-branch forwards via the generate_image_parallel
-        # path. This path should not normally be reached because the pipeline
-        # selects _generate_image_parallel when SP is active.
-        if use_sp and use_cfg and cfg_batched is not None:
-            raise NotImplementedError(
-                "SP + batched CFG in _forward_flow is not supported. "
-                "Use CFG parallel mode (_generate_image_parallel) when SP is enabled."
-            )
-
         # Build query sequence (identical for all CFG branches)
-        x_t_raw = x_t
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
@@ -2159,6 +2168,7 @@ class Bagel(nn.Module):
         if self.use_moe:
             extra_inputs["mode"] = "gen"
 
+        use_cfg = cfg_text_scale > 1.0
         cfg_text_v_t = None
         cfg_img_v_t = None
 
@@ -2205,42 +2215,24 @@ class Bagel(nn.Module):
                 ]
         else:
             # ── Single forward (no CFG or outside cfg_interval) ──
-            if use_sp:
-                # Delegate to SP-aware single-branch path (use raw x_t,
-                # _forward_flow_single_branch does its own embedding)
-                v_t = self._forward_flow_single_branch(
-                    x_t=x_t_raw,
-                    timestep=timestep,
-                    packed_vae_token_indexes=packed_vae_token_indexes,
-                    packed_vae_position_ids=packed_vae_position_ids,
-                    packed_text_ids=packed_text_ids,
-                    packed_text_indexes=packed_text_indexes,
-                    packed_indexes=packed_indexes,
-                    packed_position_ids=packed_position_ids,
-                    packed_seqlens=packed_seqlens,
-                    key_values_lens=key_values_lens,
-                    past_key_values=past_key_values,
-                    packed_key_value_indexes=packed_key_value_indexes,
-                )
-            else:
-                if self.use_moe:
-                    extra_inputs["packed_vae_token_indexes"] = packed_vae_token_indexes
-                    extra_inputs["packed_text_indexes"] = packed_text_indexes
+            if self.use_moe:
+                extra_inputs["packed_vae_token_indexes"] = packed_vae_token_indexes
+                extra_inputs["packed_text_indexes"] = packed_text_indexes
 
-                output = self.language_model.forward(
-                    packed_query_sequence=packed_sequence,
-                    query_lens=packed_seqlens,
-                    packed_query_position_ids=packed_position_ids,
-                    packed_query_indexes=packed_indexes,
-                    past_key_values=past_key_values,
-                    key_values_lens=key_values_lens,
-                    packed_key_value_indexes=packed_key_value_indexes,
-                    update_past_key_values=False,
-                    is_causal=False,
-                    **extra_inputs,
-                )
-                v_t = self.llm2vae(output.packed_query_sequence)
-                v_t = v_t[packed_vae_token_indexes]
+            output = self.language_model.forward(
+                packed_query_sequence=packed_sequence,
+                query_lens=packed_seqlens,
+                packed_query_position_ids=packed_position_ids,
+                packed_query_indexes=packed_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=False,
+                is_causal=False,
+                **extra_inputs,
+            )
+            v_t = self.llm2vae(output.packed_query_sequence)
+            v_t = v_t[packed_vae_token_indexes]
 
         # ── CFG combination ──
         if use_cfg:
