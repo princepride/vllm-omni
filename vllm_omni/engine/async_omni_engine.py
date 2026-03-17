@@ -43,7 +43,7 @@ from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
-from vllm_omni.engine.stage_init import (
+from vllm_omni.engine.stage_init_utils import (
     StartedLlmStage,
     acquire_device_locks,
     build_engine_args_dict,

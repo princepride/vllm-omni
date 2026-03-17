@@ -393,8 +393,6 @@ class Orchestrator:
         next_client = self.stage_clients[next_stage_id]
         params = req_state.sampling_params_list[next_stage_id]
 
-        # TODO: current we don't have model in this situation, verify next.
-        # Diffusion next stage: use custom_process_input_func or raw prompt
         if next_client.stage_type == "diffusion":
             self.stage_clients[stage_id].set_engine_outputs([output])
             if next_client.custom_process_input_func is not None:
