@@ -15,7 +15,9 @@ RUN uv pip uninstall --system -y vllm || true
 
 # Install vLLM from source at the selected commit using precompiled artifacts
 ENV VLLM_PRECOMPILED_WHEEL_COMMIT=0a0a1a198be88e1782b52fa31738896468200a76
-RUN uv pip install --system --force-reinstall --prerelease=allow vllm --extra-index-url https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}
+RUN uv pip install --system --force-reinstall --prerelease=allow vllm \
+    --index-url https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT} \
+    --extra-index-url https://pypi.org/simple/
 
 RUN uv pip install --system ".[dev]"
 
