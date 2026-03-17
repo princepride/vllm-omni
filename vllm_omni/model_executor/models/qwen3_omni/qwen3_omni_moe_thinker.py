@@ -161,6 +161,7 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
             cu_seqlens,
             self.hidden_size,
             self.tp_size,
+            self.device,
         )
         cu_seqlens = torch.from_numpy(cu_seqlens).to(self.device, non_blocking=True)
 
