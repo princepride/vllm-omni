@@ -217,4 +217,3 @@ class OmniEngineArgs(EngineArgs):
         omni_config.hf_config.architectures = omni_config.architectures
 
         return omni_config
-
