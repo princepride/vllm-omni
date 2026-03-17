@@ -12,7 +12,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient
 
-from vllm_omni.engine.stage_init import StageMetadata
+from vllm_omni.engine.stage_init_utils import StageMetadata
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutput
@@ -47,7 +47,7 @@ class StageEngineCoreClient(AsyncMPClient):
 
         All heavy init (config extraction, plugin loading, device setup,
         engine args building, device locking) is done by the Orchestrator
-        via helpers in stage_init.py.  This constructor just stores metadata
+        via helpers in stage_init_utils.py. This constructor just stores metadata
         and calls super().__init__().
         """
         # -------- Stage metadata (public fields used at runtime) --------
