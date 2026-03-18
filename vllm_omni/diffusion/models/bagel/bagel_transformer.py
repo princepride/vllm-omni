@@ -995,11 +995,6 @@ class Bagel(nn.Module):
     config_class = BagelConfig
     base_model_prefix = "bagel"
 
-    # Empty _sp_plan: signals SP support to the registry so that
-    # sp_plan_hooks_applied=True and sp_active is controlled by _sp_shard_depth.
-    # Actual SP logic is handled manually in the denoising methods.
-    _sp_plan = {}
-
     def __init__(
         self,
         language_model,
@@ -1046,18 +1041,6 @@ class Bagel(nn.Module):
         sp = self.parallel_config.sequence_parallel_size
         return sp if sp is not None and sp > 1 else 1
 
-    def _sp_enter(self):
-        """Signal that we are entering an SP-sharded region (denoising)."""
-        if self._sp_size > 1:
-            ctx = get_forward_context()
-            ctx._sp_shard_depth += 1
-
-    def _sp_exit(self):
-        """Signal that we are leaving an SP-sharded region."""
-        if self._sp_size > 1:
-            ctx = get_forward_context()
-            ctx._sp_shard_depth -= 1
-
     def _split_vae_for_sp(
         self,
         x_t: torch.Tensor,
@@ -1084,24 +1067,18 @@ class Bagel(nn.Module):
         local_vae_pos_ids = packed_vae_position_ids[start:end]
 
         # Rebuild local packed indices:
-        # packed sequence = [text_marker_0, local_vae_tokens..., text_marker_1]
-        # (for single-sample case with start_of_image / end_of_image markers)
+        # packed sequence = [start_of_image, local_vae_tokens..., end_of_image]
+        # BAGEL always has exactly 2 text markers (start/end_of_image).
         num_text = packed_text_indexes.shape[0]
+        assert num_text == 2, f"Expected exactly 2 text markers (start/end_of_image), got {num_text}"
+        assert packed_seqlens.numel() == 1, (
+            f"SP currently supports single-image batches only, got {packed_seqlens.numel()} sequences"
+        )
         local_vae_len = chunk
         local_total = num_text + local_vae_len
 
-        # For the typical case: [start_img(0), vae_0(1), ..., vae_N(N), end_img(N+1)]
-        if num_text == 2:
-            local_text_indexes = torch.tensor([0, local_vae_len + 1], device=packed_text_indexes.device)
-            local_vae_indexes = torch.arange(1, 1 + local_vae_len, device=packed_vae_token_indexes.device)
-        else:
-            local_text_indexes = torch.arange(0, num_text, device=packed_text_indexes.device, dtype=torch.long)
-            local_vae_indexes = torch.arange(
-                num_text // 2,
-                num_text // 2 + local_vae_len,
-                device=packed_vae_token_indexes.device,
-                dtype=torch.long,
-            )
+        local_text_indexes = torch.tensor([0, local_vae_len + 1], device=packed_text_indexes.device)
+        local_vae_indexes = torch.arange(1, 1 + local_vae_len, device=packed_vae_token_indexes.device)
 
         local_seqlens = torch.tensor([local_total], device=packed_seqlens.device, dtype=packed_seqlens.dtype)
 
@@ -2059,9 +2036,17 @@ class Bagel(nn.Module):
                 x_t_emb = x_t_emb.to(packed_sequence.dtype)
             packed_sequence[local_vae_indexes] = x_t_emb
 
-            # Build local packed_indexes for KV cache merging
+            # Build local packed_indexes for KV cache merging.
+            # In the denoising loop packed_indexes is always contiguous
+            # (arange(kv_len, kv_len + total)), so we can safely build
+            # the local slice from scratch.
             local_total = int(local_seqlens.sum())
             kv_len = int(key_values_lens.sum())
+            original_total = int(packed_seqlens.sum())
+            assert torch.equal(
+                packed_indexes,
+                torch.arange(kv_len, kv_len + original_total, device=packed_indexes.device, dtype=packed_indexes.dtype),
+            ), "packed_indexes must be contiguous for SP; non-contiguous layout not supported"
             local_packed_indexes = torch.arange(
                 kv_len,
                 kv_len + local_total,
@@ -2075,22 +2060,18 @@ class Bagel(nn.Module):
                 extra_inputs["packed_vae_token_indexes"] = local_vae_indexes
                 extra_inputs["packed_text_indexes"] = local_text_indexes
 
-            self._sp_enter()
-            try:
-                output = self.language_model.forward(
-                    packed_query_sequence=packed_sequence,
-                    query_lens=local_seqlens,
-                    packed_query_position_ids=local_position_ids,
-                    packed_query_indexes=local_packed_indexes,
-                    past_key_values=past_key_values,
-                    key_values_lens=key_values_lens,
-                    packed_key_value_indexes=packed_key_value_indexes,
-                    update_past_key_values=False,
-                    is_causal=False,
-                    **extra_inputs,
-                )
-            finally:
-                self._sp_exit()
+            output = self.language_model.forward(
+                packed_query_sequence=packed_sequence,
+                query_lens=local_seqlens,
+                packed_query_position_ids=local_position_ids,
+                packed_query_indexes=local_packed_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=False,
+                is_causal=False,
+                **extra_inputs,
+            )
 
             local_v_t = self.llm2vae(output.packed_query_sequence)
             local_v_t = local_v_t[local_vae_indexes]
