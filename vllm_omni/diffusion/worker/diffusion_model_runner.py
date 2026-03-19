@@ -200,9 +200,7 @@ class DiffusionModelRunner:
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            # Receive KV cache from upstream stage.
-            # Uses broadcast-aware variant so multi-GPU stages (e.g. SP)
-            # correctly distribute the cache from rank 0 to all workers.
+            # The manager handles the check for need_recv_cache internally
             self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                 req,
                 cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
