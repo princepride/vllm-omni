@@ -278,6 +278,7 @@ steps:
     commands:
       - |
         timeout 55m bash -c '
+          set -e
           export VLLM_WORKER_MULTIPROC_METHOD=spawn
           export VLLM_TEST_CLEAN_GPU_MEMORY=1
           export VLLM_IMAGE_FETCH_TIMEOUT=60
