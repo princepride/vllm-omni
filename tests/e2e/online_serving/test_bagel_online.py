@@ -36,6 +36,7 @@ import requests
 from PIL import Image
 from vllm.assets.image import ImageAsset
 
+from tests.conftest import modify_stage_config
 from tests.utils import hardware_test
 
 MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
@@ -45,6 +46,25 @@ STAGE_CONFIGS_PATH = str(
 
 TEXT2IMG_PROMPT = "A cute cat"
 IMG2IMG_PROMPT = "Change the grass color to red"
+
+
+def _resolve_stage_config(config_path: str, run_level: str) -> str:
+    """Resolve stage config based on run level.
+
+    For advanced_model (real weights), strip load_format: dummy so the model
+    falls back to loading real weights from HuggingFace.
+    """
+    if run_level == "advanced_model":
+        return modify_stage_config(
+            config_path,
+            deletes={
+                "stage_args": {
+                    0: ["engine_args.load_format"],
+                    1: ["engine_args.load_format"],
+                }
+            },
+        )
+    return config_path
 
 
 class BagelOmniServer:
@@ -205,11 +225,13 @@ def _extract_image_from_response(data: dict[str, Any]) -> Image.Image | None:
 
 
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
-def test_bagel_text2img_online():
+def test_bagel_text2img_online(run_level):
     """Test Bagel text2img via OpenAI-compatible chat completions API."""
-    with BagelOmniServer() as server:
+    stage_config = _resolve_stage_config(STAGE_CONFIGS_PATH, run_level)
+    with BagelOmniServer(stage_configs_path=stage_config) as server:
         response_data = _send_chat_request(
             server.base_url,
             TEXT2IMG_PROMPT,
@@ -225,13 +247,15 @@ def test_bagel_text2img_online():
 
 
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
-def test_bagel_img2img_online():
+def test_bagel_img2img_online(run_level):
     """Test Bagel img2img via OpenAI-compatible chat completions API."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
 
-    with BagelOmniServer() as server:
+    stage_config = _resolve_stage_config(STAGE_CONFIGS_PATH, run_level)
+    with BagelOmniServer(stage_configs_path=stage_config) as server:
         response_data = _send_chat_request(
             server.base_url,
             IMG2IMG_PROMPT,
