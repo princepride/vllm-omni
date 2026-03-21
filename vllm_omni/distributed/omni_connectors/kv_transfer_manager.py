@@ -576,6 +576,10 @@ class OmniKVTransferManager:
                             kv_payload[f"sp.{key}"] = val
 
             payload_list = [kv_payload]
+            # Use broadcast_object_list (pickle-based) instead of broadcast_tensor_dict
+            # because the KV cache is a heterogeneous nested structure (NaiveCache objects
+            # with metadata + tensors), not a flat tensor dict.  This runs once before
+            # the denoising loop so the serialization cost is negligible.
             torch.distributed.broadcast_object_list(payload_list, src=world.ranks[0], group=world.cpu_group)
             kv_payload = payload_list[0]
         else:
