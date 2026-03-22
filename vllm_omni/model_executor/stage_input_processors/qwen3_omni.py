@@ -63,6 +63,37 @@ def _ensure_list(x):
     return list(x)
 
 
+def _extract_voice_type(request_or_prompt) -> str | None:
+    """Extract voice_type from a request's additional_information.
+
+    Supports both raw dict prompts and serialized OmniEngineCoreRequest.
+    Returns None if voice_type is not specified.
+    """
+    # Raw dict prompt (non-async path)
+    if isinstance(request_or_prompt, dict):
+        ai = request_or_prompt.get("additional_information")
+        if isinstance(ai, dict):
+            vt = ai.get("voice_type")
+            # voice_type is stored as a list for serialization compatibility
+            if isinstance(vt, list) and len(vt) >= 1:
+                return str(vt[0])
+            if isinstance(vt, str):
+                return vt
+        return None
+
+    # OmniEngineCoreRequest (async_chunk path)
+    ai = getattr(request_or_prompt, "additional_information", None)
+    if ai is None:
+        return None
+    entries = getattr(ai, "entries", None)
+    if entries is None or "voice_type" not in entries:
+        return None
+    entry = entries["voice_type"]
+    if entry.list_data is not None and len(entry.list_data) >= 1:
+        return str(entry.list_data[0])
+    return None
+
+
 def _validate_stage_inputs(stage_list, engine_input_source):
     if not engine_input_source:
         raise ValueError("engine_input_source cannot be empty")
@@ -97,6 +128,8 @@ def thinker2talker_async_chunk(
     """
 
     request_id = request.external_req_id
+    # Extract per-request voice_type from the thinker request's additional_information.
+    voice_type = _extract_voice_type(request)
     chunk_id = transfer_manager.put_req_chunk[request_id]
     if chunk_id == 0:
         all_token_ids = request.all_token_ids  # prefill + decode
@@ -115,6 +148,8 @@ def thinker2talker_async_chunk(
             "tts_pad_embed": pooling_output.get("tts_pad_embed").detach().cpu(),
             "finished": torch.tensor(is_finished, dtype=torch.bool),
         }
+        if voice_type is not None:
+            talker_additional_info["voice_type"] = voice_type
         if transfer_manager.request_payload.get(request_id) is None:
             if not is_finished:
                 transfer_manager.request_payload[request_id] = talker_additional_info
@@ -179,6 +214,9 @@ def thinker2talker(
 
     device = torch.device(current_platform.device_type)
 
+    # Extract per-request voice_type from the original prompt.
+    voice_type = _extract_voice_type(prompt)
+
     # Process each thinker output
     for thinker_output in thinker_outputs:
         output = thinker_output.outputs[0]
@@ -195,6 +233,10 @@ def thinker2talker(
             "tts_eos_embed": output.multimodal_output["tts_eos_embed"].detach().to(device=device, dtype=torch.float),
             "tts_pad_embed": output.multimodal_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float),
         }
+        if voice_type is not None:
+            # Wrap in list for AdditionalInformationPayload serialization
+            # compatibility (only tensors and lists are supported).
+            info["voice_type"] = [voice_type]
 
         prompt_len = _compute_talker_prompt_ids_length(info, device=device)
 

@@ -361,6 +361,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             _image_gen_height = None
             _image_gen_width = None
 
+        # Extract per-request voice_type from extra_body for audio output.
+        # Passed as additional_information so Qwen3-Omni's talker stage can
+        # select the speaker on a per-request basis.
+        _voice_type: str | None = None
+        if request.modalities and "audio" in request.modalities:
+            extra_body = getattr(request, "extra_body", None)
+            if not extra_body:
+                extra_body = getattr(request, "model_extra", None) or {}
+            _voice_type = extra_body.get("voice_type") or extra_body.get("voice")
+
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
@@ -379,6 +389,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             sp.height = _image_gen_height
                         if hasattr(sp, "width") and _image_gen_width is not None:
                             sp.width = _image_gen_width
+
+                # Inject voice_type into the engine prompt's additional_information
+                # so it flows through thinker → talker stage transition.
+                if _voice_type is not None and isinstance(engine_prompt, dict):
+                    ai = engine_prompt.setdefault("additional_information", {})
+                    # Use a list wrapper so the serializer accepts the value
+                    # (AdditionalInformationPayload only supports tensors and lists).
+                    ai["voice_type"] = [_voice_type]
 
                 self._log_inputs(
                     request_id,

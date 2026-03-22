@@ -322,9 +322,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             if inputs_embeds is None and input_ids is not None:
                 inputs_embeds = self.talker.embed_input_ids(input_ids)
 
-            # TODO(Peiqi): temporal hack here to support voice_type.
-            if not hasattr(self, "voice_type"):
-                self.voice_type = voice_type
+            # voice_type is now resolved per-request in talker_preprocess_prefill
+            # via info_dict["voice_type"]. No instance-level caching needed.
 
             # Run talker forward
             with torch.inference_mode():
@@ -678,8 +677,11 @@ class Qwen3OmniMoeForConditionalGeneration(
     def talker_preprocess_prefill(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
         # Containers to return per-request updates (e.g., code_predictor_hidden_per_request)
         update_dict: dict[str, dict] = {}
-        # TODO(Peiqi): add voice_type support
-        voice_type = self.voice_type
+        # Per-request voice_type: read from additional_information passed by
+        # the stage input processor, falling back to the model default.
+        vt_raw = info_dict.get("voice_type", self.default_tts_text_spk_type)
+        # voice_type may arrive as a single-element list from serialization.
+        voice_type = vt_raw[0] if isinstance(vt_raw, list) and vt_raw else vt_raw
         start_index = info_dict.get("num_processed_tokens", 0)
         end_index = start_index + input_embeds.shape[0]
         # Read thinker outputs for prefill
