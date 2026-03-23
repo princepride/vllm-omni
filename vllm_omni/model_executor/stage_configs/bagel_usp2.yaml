@@ -1,4 +1,4 @@
-# Stage config for BAGEL SP: ulysses=2, ring=2 (4 GPUs)
+# Stage config for BAGEL SP: ulysses=2 (2 GPUs)
 
 stage_args:
   - stage_id: 0
