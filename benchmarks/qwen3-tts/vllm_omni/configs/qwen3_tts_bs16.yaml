@@ -1,8 +1,6 @@
-# Stage config for running Qwen3-TTS with 2-stage architecture
-# Stage 0: Talker (text -> 8-layer RVQ codec codes)
-# Stage 1: Code2Wav (codec codes -> audio waveform)
-#
-# The following config has been verified on 1x H100-80G GPU.
+# Qwen3-TTS max_num_seqs=16 config (streaming with async_chunk)
+# High-throughput concurrent request processing
+# 2-stage pipeline: Talker -> Code2Wav
 async_chunk: true
 stage_args:
   - stage_id: 0
@@ -10,20 +8,20 @@ stage_args:
     is_comprehension: true
     runtime:
       devices: "0"
-      max_batch_size: 4
     engine_args:
+      max_num_seqs: 16
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       enforce_eager: false
       trust_remote_code: true
-      async_scheduling: false
+      async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: latent
       gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 512
+      max_num_batched_tokens: 4096
       max_model_len: 4096
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     output_connectors:
@@ -41,20 +39,20 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 4
     engine_args:
+      max_num_seqs: 16
       model_stage: code2wav
       model_arch: Qwen3TTSCode2Wav
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
       trust_remote_code: true
-      async_scheduling: false
+      async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: audio
       gpu_memory_utilization: 0.2
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 8192
+      max_num_batched_tokens: 16384
       max_model_len: 32768
     engine_input_source: [0]
     final_output: true
@@ -76,7 +74,7 @@ runtime:
   enabled: true
   defaults:
     window_size: -1
-    max_inflight: 4
+    max_inflight: 16
 
   connectors:
     connector_of_shared_memory:
