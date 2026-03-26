@@ -127,10 +127,12 @@ class OmniEngineArgs(EngineArgs):
 
         # If the stage config specifies model_arch, ensure architectures is
         # set in hf_overrides so vLLM's ModelConfig can resolve the model
-        # class. This is a no-op when the model already has architectures
-        # in config.json (hf_overrides merges, existing values take priority).
-        if self.model_arch and not self.hf_overrides:
-            self.hf_overrides = {"architectures": [self.model_arch]}
+        # class during __init__ (before OmniModelConfig wraps it).
+        if self.model_arch and isinstance(self.hf_overrides, dict):
+            self.hf_overrides = {
+                "architectures": [self.model_arch],
+                **self.hf_overrides,
+            }
 
         # Build the vLLM config first, then use it to create the Omni config.
         model_config = super().create_model_config()
