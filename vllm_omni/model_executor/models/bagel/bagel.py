@@ -57,8 +57,9 @@ from vllm_omni.diffusion.models.bagel.pipeline_bagel import default_ae_params
 class OmniBagelProcessor(BagelProcessor):
     def __call__(self, text=None, images=None, **kwargs):
         is_img2img = kwargs.pop("is_img2img", False)
-
         if is_img2img and images is not None:
+            kwargs.pop("target_h", None)
+            kwargs.pop("target_w", None)
             image_kwargs = kwargs.copy()
             image_kwargs["do_resize"] = False
             image_kwargs["do_rescale"] = True
