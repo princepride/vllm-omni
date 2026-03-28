@@ -7,40 +7,1386 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
 
 import numpy as np
 import torch
 import torch.nn as nn
-from diffusers.utils import load_image
+import whisper
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.schedulers.scheduling_utils import (
+    KarrasDiffusionSchedulers,
+    SchedulerMixin,
+    SchedulerOutput,
+)
+from diffusers.utils import deprecate, load_image
+from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
+from einops import rearrange
 from PIL import Image
+from safetensors.torch import load_file
 from torch.nn import functional as F
+from torch.nn.utils import weight_norm
 from transformers import AutoTokenizer
 from transformers.models.t5gemma import T5GemmaEncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
-from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
+    DistributedAutoencoderKLWan,
+)
+from vllm_omni.diffusion.model_loader.diffusers_loader import (
+    DiffusersPipelineLoader,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
+    DiffusionPipelineProfilerMixin,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
-from .magi_human_audio_utils import load_audio_and_encode
-from .magi_human_audio_vae import SAAudioFeatureExtractor
-from .magi_human_data_proxy import MagiDataProxy
-from .magi_human_dit import DiTModel, MagiHumanDiTConfig
-from .magi_human_scheduler import FlowUniPCMultistepScheduler
+from .magi_human_dit import (
+    DiTModel,
+    FFAHandler,
+    MagiHumanDiTConfig,
+    Modality,
+    VarlenHandler,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# EvalInput – the intermediary structure fed to DiT via MagiDataProxy
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Scheduler (ported from daVinci-MagiHuman inference/pipeline/scheduler_unipc.py)
+# ===========================================================================
+class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
+    _compatibles = [e.name for e in KarrasDiffusionSchedulers]
+    order = 1
+
+    @register_to_config
+    def __init__(
+        self,
+        num_train_timesteps: int = 1000,
+        solver_order: int = 2,
+        prediction_type: str = "flow_prediction",
+        shift: float = 1.0,
+        use_dynamic_shifting=False,
+        thresholding: bool = False,
+        dynamic_thresholding_ratio: float = 0.995,
+        sample_max_value: float = 1.0,
+        predict_x0: bool = True,
+        solver_type: str = "bh2",
+        lower_order_final: bool = True,
+        disable_corrector: list[int] = [],
+        solver_p: SchedulerMixin = None,
+        timestep_spacing: str = "linspace",
+        steps_offset: int = 0,
+        final_sigmas_type: str | None = "zero",
+    ):
+        if solver_type not in ["bh1", "bh2"]:
+            if solver_type in ["midpoint", "heun", "logrho"]:
+                self.register_to_config(solver_type="bh2")
+            else:
+                raise NotImplementedError(f"{solver_type} is not implemented for {self.__class__}")
+
+        self.predict_x0 = predict_x0
+        self.num_inference_steps = None
+        alphas = np.linspace(1, 1 / num_train_timesteps, num_train_timesteps)[::-1].copy()
+        sigmas = 1.0 - alphas
+        sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32)
+
+        if not use_dynamic_shifting:
+            sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+
+        self.sigmas = sigmas
+        self.timesteps = sigmas * num_train_timesteps
+
+        self.model_outputs = [None] * solver_order
+        self.timestep_list = [None] * solver_order
+        self.lower_order_nums = 0
+        self.disable_corrector = disable_corrector
+        self.solver_p = solver_p
+        self.last_sample = None
+        self._step_index: int | None = None
+        self._begin_index: int | None = None
+
+        self.sigmas = self.sigmas.to("cpu")
+        self.sigma_min = self.sigmas[-1].item()
+        self.sigma_max = self.sigmas[0].item()
+
+    @property
+    def step_index(self):
+        return self._step_index
+
+    @property
+    def begin_index(self):
+        return self._begin_index
+
+    def set_begin_index(self, begin_index: int = 0):
+        self._begin_index = begin_index
+
+    def set_timesteps(
+        self,
+        num_inference_steps: int | None = None,
+        device: str | torch.device = None,
+        sigmas: list[float] | None = None,
+        mu: float | None | None = None,
+        shift: float | None | None = None,
+    ):
+        if self.config.use_dynamic_shifting and mu is None:
+            raise ValueError(" you have to pass a value for `mu` when `use_dynamic_shifting` is set to be `True`")
+
+        if sigmas is None:
+            sigmas = np.linspace(self.sigma_max, self.sigma_min, num_inference_steps + 1).copy()[:-1]
+
+        if self.config.use_dynamic_shifting:
+            sigmas = self.time_shift(mu, 1.0, sigmas)
+        else:
+            if shift is None:
+                shift = self.config.shift
+            sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+
+        if self.config.final_sigmas_type == "sigma_min":
+            sigma_last = ((1 - self.alphas_cumprod[0]) / self.alphas_cumprod[0]) ** 0.5
+        elif self.config.final_sigmas_type == "zero":
+            sigma_last = 0
+        else:
+            raise ValueError(
+                f"`final_sigmas_type` must be one of 'zero', or 'sigma_min', but got {self.config.final_sigmas_type}"
+            )
+
+        timesteps = sigmas * self.config.num_train_timesteps
+        sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)
+
+        self.sigmas = torch.from_numpy(sigmas)
+        self.timesteps = torch.from_numpy(timesteps).to(device=device, dtype=torch.int64)
+
+        self.num_inference_steps = len(timesteps)
+
+        self.model_outputs = [None] * self.config.solver_order
+        self.lower_order_nums = 0
+        self.last_sample = None
+        if self.solver_p:
+            self.solver_p.set_timesteps(self.num_inference_steps, device=device)
+
+        self._step_index = None
+        self._begin_index = None
+        self.sigmas = self.sigmas.to("cpu")
+
+    def _threshold_sample(self, sample: torch.Tensor) -> torch.Tensor:
+        dtype = sample.dtype
+        batch_size, channels, *remaining_dims = sample.shape
+
+        if dtype not in (torch.float32, torch.float64):
+            sample = sample.float()
+
+        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims))
+        abs_sample = sample.abs()
+        s = torch.quantile(abs_sample, self.config.dynamic_thresholding_ratio, dim=1)
+        s = torch.clamp(s, min=1, max=self.config.sample_max_value)
+        s = s.unsqueeze(1)
+        sample = torch.clamp(sample, -s, s) / s
+        sample = sample.reshape(batch_size, channels, *remaining_dims)
+        return sample.to(dtype)
+
+    def _sigma_to_t(self, sigma):
+        return sigma * self.config.num_train_timesteps
+
+    def _sigma_to_alpha_sigma_t(self, sigma):
+        return 1 - sigma, sigma
+
+    def time_shift(self, mu: float, sigma: float, t: torch.Tensor):
+        return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
+
+    def convert_model_output(
+        self, model_output: torch.Tensor, *args, sample: torch.Tensor = None, **kwargs
+    ) -> torch.Tensor:
+        timestep = args[0] if len(args) > 0 else kwargs.pop("timestep", None)
+        if sample is None:
+            if len(args) > 1:
+                sample = args[1]
+            else:
+                raise ValueError("missing `sample` as a required keyword argument")
+        if timestep is not None:
+            deprecate(
+                "timesteps",
+                "1.0.0",
+                "Passing `timesteps` is deprecated and has no effect as model output "
+                "conversion is now handled via an internal counter `self.step_index`",
+            )
+
+        sigma = self.sigmas[self.step_index]
+        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
+
+        if self.predict_x0:
+            if self.config.prediction_type == "flow_prediction":
+                sigma_t = self.sigmas[self.step_index]
+                x0_pred = sample - sigma_t * model_output
+            else:
+                raise ValueError(
+                    f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`,"
+                    " `v_prediction` or `flow_prediction` for the UniPCMultistepScheduler."
+                )
+            if self.config.thresholding:
+                x0_pred = self._threshold_sample(x0_pred)
+            return x0_pred
+        else:
+            if self.config.prediction_type == "flow_prediction":
+                sigma_t = self.sigmas[self.step_index]
+                epsilon = sample - (1 - sigma_t) * model_output
+            else:
+                raise ValueError(
+                    f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`,"
+                    " `v_prediction` or `flow_prediction` for the UniPCMultistepScheduler."
+                )
+            if self.config.thresholding:
+                sigma_t = self.sigmas[self.step_index]
+                x0_pred = sample - sigma_t * model_output
+                x0_pred = self._threshold_sample(x0_pred)
+                epsilon = model_output + x0_pred
+            return epsilon
+
+    def multistep_uni_p_bh_update(
+        self,
+        model_output: torch.Tensor,
+        *args,
+        sample: torch.Tensor | None = None,
+        order: int | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        prev_timestep = args[0] if len(args) > 0 else kwargs.pop("prev_timestep", None)
+        if sample is None:
+            if len(args) > 1:
+                sample = args[1]
+            else:
+                raise ValueError(" missing `sample` as a required keyword argument")
+        if order is None:
+            if len(args) > 2:
+                order = args[2]
+            else:
+                raise ValueError(" missing `order` as a required keyword argument")
+        if prev_timestep is not None:
+            deprecate("prev_timestep", "1.0.0", "Passing `prev_timestep` is deprecated and has no effect.")
+
+        model_output_list = self.model_outputs
+        s0 = self.timestep_list[-1]
+        m0 = model_output_list[-1]
+        x = sample
+
+        if self.solver_p:
+            return self.solver_p.step(model_output, s0, x).prev_sample
+
+        sigma_t, sigma_s0 = self.sigmas[self.step_index + 1], self.sigmas[self.step_index]
+        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
+        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
+
+        lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
+        lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
+        h = lambda_t - lambda_s0
+        device = sample.device
+
+        rks = []
+        D1s: list[Any] | None = []
+        for i in range(1, order):
+            si = self.step_index - i
+            mi = model_output_list[-(i + 1)]
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
+            lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
+            rk = (lambda_si - lambda_s0) / h
+            rks.append(rk)
+            D1s.append((mi - m0) / rk)
+
+        rks.append(1.0)
+        rks = torch.tensor(rks, device=device)
+
+        R = []
+        b = []
+        hh = -h if self.predict_x0 else h
+        h_phi_1 = torch.expm1(hh)
+        h_phi_k = h_phi_1 / hh - 1
+        factorial_i = 1
+
+        if self.config.solver_type == "bh1":
+            B_h = hh
+        elif self.config.solver_type == "bh2":
+            B_h = torch.expm1(hh)
+        else:
+            raise NotImplementedError()
+
+        for i in range(1, order + 1):
+            R.append(torch.pow(rks, i - 1))
+            b.append(h_phi_k * factorial_i / B_h)
+            factorial_i *= i + 1
+            h_phi_k = h_phi_k / hh - 1 / factorial_i
+
+        R = torch.stack(R)
+        b = torch.tensor(b, device=device)
+
+        if len(D1s) > 0:
+            D1s = torch.stack(D1s, dim=1)
+            if order == 2:
+                rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
+            else:
+                rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)
+        else:
+            D1s = None
+
+        if self.predict_x0:
+            x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
+            pred_res = torch.einsum("k,bkc...->bc...", rhos_p, D1s) if D1s is not None else 0
+            x_t = x_t_ - alpha_t * B_h * pred_res
+        else:
+            x_t_ = alpha_t / alpha_s0 * x - sigma_t * h_phi_1 * m0
+            pred_res = torch.einsum("k,bkc...->bc...", rhos_p, D1s) if D1s is not None else 0
+            x_t = x_t_ - sigma_t * B_h * pred_res
+
+        return x_t.to(x.dtype)
+
+    def multistep_uni_c_bh_update(
+        self,
+        this_model_output: torch.Tensor,
+        *args,
+        last_sample: torch.Tensor = None,
+        this_sample: torch.Tensor = None,
+        order: int | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        this_timestep = args[0] if len(args) > 0 else kwargs.pop("this_timestep", None)
+        if last_sample is None:
+            if len(args) > 1:
+                last_sample = args[1]
+            else:
+                raise ValueError(" missing`last_sample` as a required keyword argument")
+        if this_sample is None:
+            if len(args) > 2:
+                this_sample = args[2]
+            else:
+                raise ValueError(" missing`this_sample` as a required keyword argument")
+        if order is None:
+            if len(args) > 3:
+                order = args[3]
+            else:
+                raise ValueError(" missing`order` as a required keyword argument")
+        if this_timestep is not None:
+            deprecate("this_timestep", "1.0.0", "Passing `this_timestep` is deprecated and has no effect.")
+
+        model_output_list = self.model_outputs
+        m0 = model_output_list[-1]
+        x = last_sample
+        x_t = this_sample
+        model_t = this_model_output
+
+        sigma_t, sigma_s0 = self.sigmas[self.step_index], self.sigmas[self.step_index - 1]
+        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
+        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
+
+        lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
+        lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
+        h = lambda_t - lambda_s0
+        device = this_sample.device
+
+        rks = []
+        D1s: list[Any] | None = []
+        for i in range(1, order):
+            si = self.step_index - (i + 1)
+            mi = model_output_list[-(i + 1)]
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
+            lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
+            rk = (lambda_si - lambda_s0) / h
+            rks.append(rk)
+            D1s.append((mi - m0) / rk)
+
+        rks.append(1.0)
+        rks = torch.tensor(rks, device=device)
+
+        R = []
+        b = []
+        hh = -h if self.predict_x0 else h
+        h_phi_1 = torch.expm1(hh)
+        h_phi_k = h_phi_1 / hh - 1
+        factorial_i = 1
+
+        if self.config.solver_type == "bh1":
+            B_h = hh
+        elif self.config.solver_type == "bh2":
+            B_h = torch.expm1(hh)
+        else:
+            raise NotImplementedError()
+
+        for i in range(1, order + 1):
+            R.append(torch.pow(rks, i - 1))
+            b.append(h_phi_k * factorial_i / B_h)
+            factorial_i *= i + 1
+            h_phi_k = h_phi_k / hh - 1 / factorial_i
+
+        R = torch.stack(R)
+        b = torch.tensor(b, device=device)
+
+        if len(D1s) > 0:
+            D1s = torch.stack(D1s, dim=1)
+        else:
+            D1s = None
+
+        if order == 1:
+            rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
+        else:
+            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+
+        if self.predict_x0:
+            x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
+            corr_res = torch.einsum("k,bkc...->bc...", rhos_c[:-1], D1s) if D1s is not None else 0
+            D1_t = model_t - m0
+            x_t = x_t_ - alpha_t * B_h * (corr_res + rhos_c[-1] * D1_t)
+        else:
+            x_t_ = alpha_t / alpha_s0 * x - sigma_t * h_phi_1 * m0
+            corr_res = torch.einsum("k,bkc...->bc...", rhos_c[:-1], D1s) if D1s is not None else 0
+            D1_t = model_t - m0
+            x_t = x_t_ - sigma_t * B_h * (corr_res + rhos_c[-1] * D1_t)
+        return x_t.to(x.dtype)
+
+    def index_for_timestep(self, timestep, schedule_timesteps=None):
+        if schedule_timesteps is None:
+            schedule_timesteps = self.timesteps
+        indices = (schedule_timesteps == timestep).nonzero()
+        pos = 1 if len(indices) > 1 else 0
+        return indices[pos].item()
+
+    def _init_step_index(self, timestep):
+        if self.begin_index is None:
+            if isinstance(timestep, torch.Tensor):
+                timestep = timestep.to(self.timesteps.device)
+            self._step_index = self.index_for_timestep(timestep)
+        else:
+            self._step_index = self._begin_index
+
+    def step(
+        self,
+        model_output: torch.Tensor,
+        timestep: int | torch.Tensor,
+        sample: torch.Tensor,
+        return_dict: bool = True,
+        generator=None,
+    ) -> SchedulerOutput | tuple:
+        if self.num_inference_steps is None:
+            raise ValueError(
+                "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
+            )
+
+        if self.step_index is None:
+            self._init_step_index(timestep)
+
+        use_corrector = (
+            self.step_index > 0 and self.step_index - 1 not in self.disable_corrector and self.last_sample is not None
+        )
+
+        model_output_convert = self.convert_model_output(model_output, sample=sample)
+        if use_corrector:
+            sample = self.multistep_uni_c_bh_update(
+                this_model_output=model_output_convert,
+                last_sample=self.last_sample,
+                this_sample=sample,
+                order=self.this_order,
+            )
+
+        for i in range(self.config.solver_order - 1):
+            self.model_outputs[i] = self.model_outputs[i + 1]
+            self.timestep_list[i] = self.timestep_list[i + 1]
+
+        self.model_outputs[-1] = model_output_convert
+        self.timestep_list[-1] = timestep
+
+        if self.config.lower_order_final:
+            this_order = min(self.config.solver_order, len(self.timesteps) - self.step_index)
+        else:
+            this_order = self.config.solver_order
+
+        self.this_order = min(this_order, self.lower_order_nums + 1)
+        assert self.this_order > 0
+
+        self.last_sample = sample
+        prev_sample = self.multistep_uni_p_bh_update(model_output=model_output, sample=sample, order=self.this_order)
+
+        if self.lower_order_nums < self.config.solver_order:
+            self.lower_order_nums += 1
+
+        self._step_index += 1
+
+        if not return_dict:
+            return (prev_sample,)
+        return SchedulerOutput(prev_sample=prev_sample)
+
+    def step_ddim(
+        self,
+        velocity: torch.FloatTensor,
+        t: int,
+        curr_state: torch.FloatTensor,
+        prev_state: torch.FloatTensor | None = None,
+        generator: torch.Generator | None = None,
+    ):
+        device = curr_state.device
+        curr_t = self.sigmas[t]
+        prev_t = self.sigmas[t + 1]
+        variance_noise = randn_tensor(curr_state.shape, generator=generator, device=device, dtype=curr_state.dtype)
+        cur_clean_ = curr_state - curr_t * velocity
+        return prev_t * variance_noise + (1 - prev_t) * cur_clean_
+
+    def step_sde(
+        self,
+        velocity: torch.FloatTensor,
+        t: int,
+        curr_state: torch.FloatTensor,
+        noise_theta: float = 1.0,
+        prev_state: torch.FloatTensor | None = None,
+        generator: torch.Generator | None = None,
+    ):
+        device = curr_state.device
+        curr_t = self.sigmas[t]
+        prev_t = self.sigmas[t + 1]
+        cos = torch.cos(torch.tensor(noise_theta) * torch.pi / 2).to(device)
+        sin = torch.sin(torch.tensor(noise_theta) * torch.pi / 2).to(device)
+        prev_sample_mean = (1 - prev_t + prev_t * cos) * (curr_state - curr_t * velocity) + prev_t * cos * velocity
+        std_dev_t = prev_t * sin
+        std_dev_t = torch.ones((1, 1)).to(curr_state) * std_dev_t
+        if prev_state is None:
+            variance_noise = randn_tensor(curr_state.shape, generator=generator, device=device, dtype=curr_state.dtype)
+            prev_state = prev_sample_mean + std_dev_t * variance_noise
+        else:
+            prev_state = prev_sample_mean + (prev_state - prev_sample_mean.detach())
+        return prev_state
+
+    def scale_model_input(self, sample: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        return sample
+
+    def add_noise(
+        self, original_samples: torch.Tensor, noise: torch.Tensor, timesteps: torch.IntTensor
+    ) -> torch.Tensor:
+        sigmas = self.sigmas.to(device=original_samples.device, dtype=original_samples.dtype)
+        if original_samples.device.type == "mps" and torch.is_floating_point(timesteps):
+            schedule_timesteps = self.timesteps.to(original_samples.device, dtype=torch.float32)
+            timesteps = timesteps.to(original_samples.device, dtype=torch.float32)
+        else:
+            schedule_timesteps = self.timesteps.to(original_samples.device)
+            timesteps = timesteps.to(original_samples.device)
+
+        if self.begin_index is None:
+            step_indices = [self.index_for_timestep(t, schedule_timesteps) for t in timesteps]
+        elif self.step_index is not None:
+            step_indices = [self.step_index] * timesteps.shape[0]
+        else:
+            step_indices = [self.begin_index] * timesteps.shape[0]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < len(original_samples.shape):
+            sigma = sigma.unsqueeze(-1)
+
+        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
+        return alpha_t * original_samples + sigma_t * noise
+
+    def __len__(self):
+        return self.config.num_train_timesteps
+
+
+# ===========================================================================
+# Audio VAE (ported from daVinci-MagiHuman inference/model/sa_audio/)
+# ===========================================================================
+def _snake_beta(x, alpha, beta):
+    return x + (1.0 / (beta + 1e-9)) * torch.pow(torch.sin(x * alpha), 2)
+
+
+class _SnakeBeta(nn.Module):
+    def __init__(self, in_features: int, alpha: float = 1.0, alpha_trainable: bool = True, alpha_logscale: bool = True):
+        super().__init__()
+        self.alpha_logscale = alpha_logscale
+        if self.alpha_logscale:
+            self.alpha = nn.Parameter(torch.zeros(in_features) * alpha)
+            self.beta = nn.Parameter(torch.zeros(in_features) * alpha)
+        else:
+            self.alpha = nn.Parameter(torch.ones(in_features) * alpha)
+            self.beta = nn.Parameter(torch.ones(in_features) * alpha)
+        self.alpha.requires_grad = alpha_trainable
+        self.beta.requires_grad = alpha_trainable
+
+    def forward(self, x):
+        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)
+        beta = self.beta.unsqueeze(0).unsqueeze(-1)
+        if self.alpha_logscale:
+            alpha = torch.exp(alpha)
+            beta = torch.exp(beta)
+        return _snake_beta(x, alpha, beta)
+
+
+def _vae_sample(mean, scale):
+    stdev = F.softplus(scale) + 1e-4
+    var = stdev * stdev
+    logvar = torch.log(var)
+    latents = torch.randn_like(mean) * stdev + mean
+    kl = (mean * mean + var - logvar - 1).sum(1).mean()
+    return latents, kl
+
+
+class _VAEBottleneck(nn.Module):
+    def encode(self, x, return_info=False, **kwargs):
+        info = {}
+        mean, scale = x.chunk(2, dim=1)
+        x, kl = _vae_sample(mean, scale)
+        info["kl"] = kl
+        return (x, info) if return_info else x
+
+    def decode(self, x):
+        return x
+
+
+def _WNConv1d(*args, **kwargs):
+    return weight_norm(nn.Conv1d(*args, **kwargs))
+
+
+def _WNConvTranspose1d(*args, **kwargs):
+    return weight_norm(nn.ConvTranspose1d(*args, **kwargs))
+
+
+def _checkpoint(function, *args, **kwargs):
+    kwargs.setdefault("use_reentrant", False)
+    return torch.utils.checkpoint.checkpoint(function, *args, **kwargs)
+
+
+def _get_activation(activation: Literal["elu", "snake", "none"], antialias: bool = False, channels=None) -> nn.Module:
+    if antialias:
+        raise NotImplementedError("antialias activation not supported")
+    if activation == "elu":
+        return nn.ELU()
+    if activation == "snake":
+        return _SnakeBeta(channels)
+    if activation == "none":
+        return nn.Identity()
+    raise ValueError(f"Unknown activation {activation}")
+
+
+class _ResidualUnit(nn.Module):
+    def __init__(self, in_channels, out_channels, dilation, use_snake=False, antialias_activation=False):
+        super().__init__()
+        padding = (dilation * (7 - 1)) // 2
+        self.layers = nn.Sequential(
+            _get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=out_channels),
+            _WNConv1d(in_channels, out_channels, kernel_size=7, dilation=dilation, padding=padding),
+            _get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=out_channels),
+            _WNConv1d(out_channels, out_channels, kernel_size=1),
+        )
+
+    def forward(self, x):
+        return (_checkpoint(self.layers, x) if self.training else self.layers(x)) + x
+
+
+class _EncoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride, use_snake=False, antialias_activation=False):
+        super().__init__()
+        self.layers = nn.Sequential(
+            _ResidualUnit(in_channels, in_channels, 1, use_snake=use_snake),
+            _ResidualUnit(in_channels, in_channels, 3, use_snake=use_snake),
+            _ResidualUnit(in_channels, in_channels, 9, use_snake=use_snake),
+            _get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=in_channels),
+            _WNConv1d(in_channels, out_channels, kernel_size=2 * stride, stride=stride, padding=math.ceil(stride / 2)),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class _DecoderBlock(nn.Module):
+    def __init__(
+        self, in_channels, out_channels, stride, use_snake=False, antialias_activation=False, use_nearest_upsample=False
+    ):
+        super().__init__()
+        if use_nearest_upsample:
+            upsample_layer = nn.Sequential(
+                nn.Upsample(scale_factor=stride, mode="nearest"),
+                _WNConv1d(in_channels, out_channels, kernel_size=2 * stride, stride=1, bias=False, padding="same"),
+            )
+        else:
+            upsample_layer = _WNConvTranspose1d(
+                in_channels, out_channels, kernel_size=2 * stride, stride=stride, padding=math.ceil(stride / 2)
+            )
+        self.layers = nn.Sequential(
+            _get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=in_channels),
+            upsample_layer,
+            _ResidualUnit(out_channels, out_channels, 1, use_snake=use_snake),
+            _ResidualUnit(out_channels, out_channels, 3, use_snake=use_snake),
+            _ResidualUnit(out_channels, out_channels, 9, use_snake=use_snake),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class _OobleckEncoder(nn.Module):
+    def __init__(
+        self,
+        in_channels=2,
+        channels=128,
+        latent_dim=32,
+        c_mults=[1, 2, 4, 8],
+        strides=[2, 4, 8, 8],
+        use_snake=False,
+        antialias_activation=False,
+    ):
+        super().__init__()
+        c_mults = [1] + c_mults
+        depth = len(c_mults)
+        layers = [_WNConv1d(in_channels, c_mults[0] * channels, kernel_size=7, padding=3)]
+        for i in range(depth - 1):
+            layers.append(
+                _EncoderBlock(c_mults[i] * channels, c_mults[i + 1] * channels, strides[i], use_snake=use_snake)
+            )
+        layers.extend(
+            [
+                _get_activation(
+                    "snake" if use_snake else "elu", antialias=antialias_activation, channels=c_mults[-1] * channels
+                ),
+                _WNConv1d(c_mults[-1] * channels, latent_dim, kernel_size=3, padding=1),
+            ]
+        )
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class _OobleckDecoder(nn.Module):
+    def __init__(
+        self,
+        out_channels=2,
+        channels=128,
+        latent_dim=32,
+        c_mults=[1, 2, 4, 8],
+        strides=[2, 4, 8, 8],
+        use_snake=False,
+        antialias_activation=False,
+        use_nearest_upsample=False,
+        final_tanh=True,
+    ):
+        super().__init__()
+        c_mults = [1] + c_mults
+        depth = len(c_mults)
+        layers = [_WNConv1d(latent_dim, c_mults[-1] * channels, kernel_size=7, padding=3)]
+        for i in range(depth - 1, 0, -1):
+            layers.append(
+                _DecoderBlock(
+                    c_mults[i] * channels,
+                    c_mults[i - 1] * channels,
+                    strides[i - 1],
+                    use_snake=use_snake,
+                    antialias_activation=antialias_activation,
+                    use_nearest_upsample=use_nearest_upsample,
+                )
+            )
+        layers.extend(
+            [
+                _get_activation(
+                    "snake" if use_snake else "elu", antialias=antialias_activation, channels=c_mults[0] * channels
+                ),
+                _WNConv1d(c_mults[0] * channels, out_channels, kernel_size=7, padding=3, bias=False),
+                nn.Tanh() if final_tanh else nn.Identity(),
+            ]
+        )
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class _AudioAutoencoder(nn.Module):
+    def __init__(
+        self,
+        encoder,
+        decoder,
+        latent_dim,
+        downsampling_ratio,
+        sample_rate,
+        io_channels=2,
+        bottleneck=None,
+        in_channels=None,
+        out_channels=None,
+        soft_clip=False,
+    ):
+        super().__init__()
+        self.downsampling_ratio = downsampling_ratio
+        self.sample_rate = sample_rate
+        self.latent_dim = latent_dim
+        self.io_channels = io_channels
+        self.in_channels = in_channels if in_channels is not None else io_channels
+        self.out_channels = out_channels if out_channels is not None else io_channels
+        self.bottleneck = bottleneck
+        self.encoder = encoder
+        self.decoder = decoder
+        self.soft_clip = soft_clip
+
+    def encode(self, audio, skip_bottleneck=False, return_info=False, **kwargs):
+        info = {}
+        latents = self.encoder(audio)
+        info["pre_bottleneck_latents"] = latents
+        if self.bottleneck is not None and not skip_bottleneck:
+            latents, bottleneck_info = self.bottleneck.encode(latents, return_info=True, **kwargs)
+            info.update(bottleneck_info)
+        return (latents, info) if return_info else latents
+
+    def decode(self, latents, skip_bottleneck=False, **kwargs):
+        if self.bottleneck is not None and not skip_bottleneck:
+            latents = self.bottleneck.decode(latents)
+        decoded = self.decoder(latents, **kwargs)
+        if self.soft_clip:
+            decoded = torch.tanh(decoded)
+        return decoded
+
+
+def _create_encoder_from_config(cfg: dict[str, Any]):
+    assert cfg.get("type") == "oobleck", f"Only 'oobleck' encoder supported, got: {cfg.get('type')}"
+    enc = _OobleckEncoder(**cfg["config"])
+    if not cfg.get("requires_grad", True):
+        for p in enc.parameters():
+            p.requires_grad = False
+    return enc
+
+
+def _create_decoder_from_config(cfg: dict[str, Any]):
+    assert cfg.get("type") == "oobleck", f"Only 'oobleck' decoder supported, got: {cfg.get('type')}"
+    dec = _OobleckDecoder(**cfg["config"])
+    if not cfg.get("requires_grad", True):
+        for p in dec.parameters():
+            p.requires_grad = False
+    return dec
+
+
+def _create_bottleneck_from_config(cfg: dict[str, Any]):
+    assert cfg.get("type") == "vae", f"Only 'vae' bottleneck supported, got: {cfg.get('type')}"
+    bn = _VAEBottleneck()
+    if not cfg.get("requires_grad", True):
+        for p in bn.parameters():
+            p.requires_grad = False
+    return bn
+
+
+def _create_autoencoder_from_config(config: dict[str, Any]):
+    ae_config = config["model"]
+    if ae_config.get("pretransform") is not None:
+        raise NotImplementedError("Nested pretransform not supported")
+    encoder = _create_encoder_from_config(ae_config["encoder"])
+    decoder = _create_decoder_from_config(ae_config["decoder"])
+    bottleneck_cfg = ae_config.get("bottleneck")
+    bottleneck = _create_bottleneck_from_config(bottleneck_cfg) if bottleneck_cfg else None
+    return _AudioAutoencoder(
+        encoder=encoder,
+        decoder=decoder,
+        latent_dim=ae_config["latent_dim"],
+        downsampling_ratio=ae_config["downsampling_ratio"],
+        sample_rate=config["sample_rate"],
+        io_channels=ae_config["io_channels"],
+        bottleneck=bottleneck,
+        in_channels=ae_config.get("in_channels"),
+        out_channels=ae_config.get("out_channels"),
+        soft_clip=ae_config["decoder"].get("soft_clip", False),
+    )
+
+
+class SAAudioFeatureExtractor:
+    def __init__(self, device, model_path):
+        self.device = device
+        self.vae_model, self.sample_rate = self._load_vae(model_path)
+        self.resampler = None
+
+    def _load_vae(self, model_path):
+        if not (isinstance(model_path, str) and Path(model_path).is_dir()):
+            raise ValueError("model_path must be a local directory")
+
+        model_config_path = os.path.join(model_path, "model_config.json")
+        with open(model_config_path) as f:
+            full_config = json.load(f)
+
+        vae_config = full_config["model"]["pretransform"]["config"]
+        sample_rate = full_config["sample_rate"]
+
+        autoencoder_config = {
+            "model_type": "autoencoder",
+            "sample_rate": sample_rate,
+            "model": vae_config,
+        }
+        vae_model = _create_autoencoder_from_config(autoencoder_config)
+
+        weights_path = Path(model_path) / "model.safetensors"
+        if not weights_path.exists():
+            raise FileNotFoundError(f"Weight file does not exist: {weights_path}")
+
+        full_state_dict = load_file(weights_path, device=str(self.device))
+        vae_state_dict = {}
+        for key, value in full_state_dict.items():
+            if key.startswith("pretransform.model."):
+                vae_state_dict[key[len("pretransform.model.") :]] = value
+
+        model_keys = set(vae_model.state_dict().keys())
+        vae_keys = set(vae_state_dict.keys())
+        missing = model_keys - vae_keys
+        extra = vae_keys - model_keys
+        if missing:
+            logger.warning("Audio VAE missing keys (%d): %s", len(missing), list(missing)[:5])
+        if extra:
+            logger.warning("Audio VAE unexpected keys (%d): %s", len(extra), list(extra)[:5])
+
+        vae_model.load_state_dict(vae_state_dict)
+        vae_model.to(self.device)
+        return vae_model, sample_rate
+
+    def decode(self, latents):
+        with torch.no_grad():
+            return self.vae_model.decode(latents)
+
+    def encode(self, waveform):
+        with torch.no_grad():
+            return self.vae_model.encode(waveform)
+
+
+# ===========================================================================
+# Audio utilities (ported from daVinci-MagiHuman inference/pipeline/video_process.py)
+# ===========================================================================
+_SAMPLE_RATE = 51200
+_AUDIO_CHUNK_DURATION = 29
+_OVERLAP_RATIO = 0.5
+
+
+def _merge_overlapping_vae_features(audio_feats: list[torch.Tensor], overlap_ratio: float = 0.5) -> torch.Tensor | None:
+    if not audio_feats:
+        return None
+    if len(audio_feats) == 1:
+        return audio_feats[0]
+
+    batch_size, total_frames, feature_dim = audio_feats[0].shape
+    overlap_frames = int(total_frames * overlap_ratio)
+    step_frames = total_frames - overlap_frames
+    final_length = (len(audio_feats) - 1) * step_frames + total_frames
+    output_feat = torch.zeros(
+        batch_size, final_length, feature_dim, device=audio_feats[0].device, dtype=audio_feats[0].dtype
+    )
+
+    for block_idx, current_feat in enumerate(audio_feats):
+        output_start = block_idx * step_frames
+        if block_idx == 0:
+            output_feat[:, output_start : output_start + total_frames, :] = current_feat
+            continue
+
+        non_overlap_start = output_start + overlap_frames
+        non_overlap_end = output_start + total_frames
+        output_feat[:, non_overlap_start:non_overlap_end, :] = current_feat[:, overlap_frames:, :]
+
+        for frame_idx in range(overlap_frames):
+            output_pos = output_start + frame_idx
+            prev_weight = (overlap_frames - frame_idx) / overlap_frames
+            curr_weight = frame_idx / overlap_frames
+            output_feat[:, output_pos, :] = (
+                prev_weight * output_feat[:, output_pos, :] + curr_weight * current_feat[:, frame_idx, :]
+            )
+    return output_feat
+
+
+def load_audio_and_encode(audio_vae, audio_path: str, seconds: int | None = None) -> torch.Tensor:
+    """Load audio from file and encode to latent space using the Stable Audio VAE."""
+    audio_full = whisper.load_audio(audio_path, sr=_SAMPLE_RATE)
+    if seconds is not None:
+        audio_full = audio_full[: min(int(seconds * _SAMPLE_RATE), audio_full.shape[0])]
+    total_samples = audio_full.shape[0]
+
+    window_size = int(_AUDIO_CHUNK_DURATION * _SAMPLE_RATE)
+    step_size = int(window_size * (1 - _OVERLAP_RATIO))
+    if total_samples <= window_size:
+        audio = torch.from_numpy(audio_full).cuda()
+        audio = audio.unsqueeze(0).expand(2, -1)
+        return audio_vae.vae_model.encode(audio)
+
+    encoded_chunks = []
+    latent_to_audio_ratio = None
+    for offset_start in range(0, total_samples, step_size):
+        offset_end = min(offset_start + window_size, total_samples)
+        chunk = whisper.pad_or_trim(audio_full[offset_start:offset_end], length=window_size)
+        chunk_tensor = torch.from_numpy(chunk).cuda().unsqueeze(0).expand(2, -1)
+        encoded_chunk = audio_vae.vae_model.encode(chunk_tensor)
+
+        if latent_to_audio_ratio is None:
+            latent_to_audio_ratio = encoded_chunk.shape[-1] / window_size
+
+        encoded_chunks.append(encoded_chunk.permute(0, 2, 1))
+        if offset_end >= total_samples:
+            break
+
+    final_feat = _merge_overlapping_vae_features(encoded_chunks, overlap_ratio=_OVERLAP_RATIO).permute(0, 2, 1)
+    final_target_len = math.ceil(total_samples * latent_to_audio_ratio)
+    return final_feat[:, :, :final_target_len]
+
+
+# ===========================================================================
+# Data proxy (ported from daVinci-MagiHuman inference/pipeline/data_proxy.py)
+# ===========================================================================
+def _unfold_3d(x: torch.Tensor, kernel_size: tuple[int, int, int], stride: tuple[int, int, int]) -> torch.Tensor:
+    """Pure-PyTorch 3D unfold matching UnfoldAnd behavior.
+
+    After N unfold ops the shape is (batch, C, oD, oH, oW, kD, kH, kW).
+    UnfoldAnd permutes kernel dims next to channel before reshape so that the
+    col_dim axis is ordered as (C, kD, kH, kW) -- matching F.unfold semantics.
+    Without this permute, .view() interleaves spatial and kernel positions.
+
+    Args:
+        x: (N, C, D, H, W)
+        kernel_size: (kD, kH, kW)
+        stride: (sD, sH, sW)
+    Returns:
+        (N, C*kD*kH*kW, L) where L = product of output spatial dims.
+    """
+    ndim = len(kernel_size)
+    for d in range(ndim):
+        x = x.unfold(d + 2, kernel_size[d], stride[d])
+    perm = [0, 1] + list(range(ndim + 2, 2 * ndim + 2)) + list(range(2, ndim + 2))
+    x = x.permute(*perm).contiguous()
+
+    batch_size = x.shape[0]
+    col_dim = 1
+    for i in range(1, ndim + 2):
+        col_dim *= x.shape[i]
+    spatial = 1
+    for i in range(ndim + 2, 2 * ndim + 2):
+        spatial *= x.shape[i]
+    return x.view(batch_size, col_dim, spatial)
+
+
+def _calc_local_qk_range(num_video_tokens, num_audio_and_txt_tokens, num_frames, frame_receptive_field):
+    token_per_frame = num_video_tokens // num_frames
+    total_tokens = num_video_tokens + num_audio_and_txt_tokens
+
+    q_range_list = []
+    k_range_list = []
+    for i in range(num_frames):
+        q_range_list.append(torch.tensor([i * token_per_frame, (i + 1) * token_per_frame]))
+        k_range_list.append(
+            torch.tensor(
+                [
+                    (i - frame_receptive_field) * token_per_frame,
+                    (i + frame_receptive_field + 1) * token_per_frame,
+                ]
+            )
+        )
+    local_q_range = torch.stack(q_range_list, dim=0)
+    local_k_range = torch.stack(k_range_list, dim=0)
+
+    local_k_range[local_k_range < 0] = 0
+    local_k_range[local_k_range > num_video_tokens] = num_video_tokens
+
+    video_q_range = torch.tensor([[0, num_video_tokens]])
+    video_k_range = torch.tensor([[num_video_tokens, num_video_tokens + num_audio_and_txt_tokens]])
+
+    at_q_ranges = torch.tensor([[num_video_tokens, total_tokens]])
+    at_k_ranges = torch.tensor([[0, total_tokens]])
+
+    q_ranges = (
+        torch.cat([local_q_range, video_q_range, at_q_ranges], dim=0).to(torch.int32).to("cuda", non_blocking=True)
+    )
+    k_ranges = (
+        torch.cat([local_k_range, video_k_range, at_k_ranges], dim=0).to(torch.int32).to("cuda", non_blocking=True)
+    )
+    return q_ranges, k_ranges
+
+
+def _calc_local_attn_ffa_handler(num_video_tokens, num_audio_and_txt_tokens, num_frames, frame_receptive_field):
+    q_ranges, k_ranges = _calc_local_qk_range(
+        num_video_tokens, num_audio_and_txt_tokens, num_frames, frame_receptive_field
+    )
+    total = num_video_tokens + num_audio_and_txt_tokens
+    return FFAHandler(
+        q_ranges=q_ranges,
+        k_ranges=k_ranges,
+        max_seqlen_q=total,
+        max_seqlen_k=total,
+        attn_type_map=torch.zeros([q_ranges.shape[0]], device="cuda", dtype=torch.int32),
+        softmax_scale=None,
+    )
+
+
+def _get_coords(
+    shape: list[int],
+    ref_feat_shape: list[int],
+    offset_thw: list[int] | None = None,
+    device: torch.device = torch.device("cpu"),
+    dtype: torch.dtype = torch.float32,
+):
+    if offset_thw is None:
+        offset_thw = [0, 0, 0]
+    ori_t, ori_h, ori_w = shape
+    ref_t, ref_h, ref_w = ref_feat_shape
+
+    offset_t, offset_h, offset_w = offset_thw
+    time_rng = torch.arange(ori_t, device=device, dtype=dtype) + offset_t
+    height_rng = torch.arange(ori_h, device=device, dtype=dtype) + offset_h
+    width_rng = torch.arange(ori_w, device=device, dtype=dtype) + offset_w
+
+    time_grid, height_grid, width_grid = torch.meshgrid(time_rng, height_rng, width_rng, indexing="ij")
+    coords_flat = torch.stack([time_grid, height_grid, width_grid], dim=-1).reshape(-1, 3)
+
+    meta = torch.tensor([ori_t, ori_h, ori_w, ref_t, ref_h, ref_w], device=device, dtype=dtype)
+    meta_expanded = meta.expand(coords_flat.size(0), -1)
+    return torch.cat([coords_flat, meta_expanded], dim=-1)
+
+
+@dataclass
+class _SingleData:
+    video_x_t: torch.Tensor
+    audio_x_t: torch.Tensor
+    audio_feat_len: int
+    txt_feat: torch.Tensor
+    txt_feat_len: int
+    t: int
+    h: int
+    w: int
+    patch_size: int
+    t_patch_size: int
+    spatial_rope_interpolation: Literal["inter", "extra"]
+    ref_audio_offset: int
+    text_offset: int
+    coords_style: Literal["v1", "v2"] = "v1"
+
+    def __post_init__(self):
+        self.video_token_num = self.video_x_t.shape[0]
+        self.audio_x_t = self.audio_x_t[: self.audio_feat_len]
+        self.txt_feat = self.txt_feat[: self.txt_feat_len]
+        self.video_channel = self.video_x_t.shape[-1]
+        self.audio_channel = self.audio_x_t.shape[-1]
+        self.txt_channel = self.txt_feat.shape[-1]
+
+    @property
+    def device(self):
+        return self.video_x_t.device
+
+    @property
+    def default_dtype(self):
+        return self.video_x_t.dtype
+
+    @property
+    def total_token_num(self):
+        return self.video_token_num + self.audio_feat_len + self.txt_feat_len
+
+    @property
+    def token_sequence(self):
+        tensors = [self.video_x_t, self.audio_x_t, self.txt_feat]
+        max_channel = max(t.shape[-1] for t in tensors)
+        padded = [F.pad(t, (0, max_channel - t.shape[-1])) for t in tensors]
+        return torch.cat(padded, dim=0)
+
+    @property
+    def modality_mapping(self):
+        v_map = torch.full((self.video_token_num,), Modality.VIDEO, dtype=torch.int64, device=self.device)
+        a_map = torch.full((self.audio_feat_len,), Modality.AUDIO, dtype=torch.int64, device=self.device)
+        t_map = torch.full((self.txt_feat_len,), Modality.TEXT, dtype=torch.int64, device=self.device)
+        return torch.cat([v_map, a_map, t_map], dim=0)
+
+    def _default_coords(self, shape, ref_feat_shape, offset_thw=None):
+        if offset_thw is None:
+            offset_thw = [0, 0, 0]
+        return _get_coords(
+            shape=shape,
+            ref_feat_shape=ref_feat_shape,
+            offset_thw=offset_thw,
+            device=self.device,
+            dtype=self.default_dtype,
+        )
+
+    @property
+    def coords_mapping(self):
+        if self.spatial_rope_interpolation == "inter":
+            video_ref_feat_shape = (self.t // self.t_patch_size, 32, 32)
+        else:
+            video_ref_feat_shape = (self.t // self.t_patch_size, self.h // self.patch_size, self.w // self.patch_size)
+
+        video_coords = self._default_coords(
+            shape=(self.t // self.t_patch_size, self.h // self.patch_size, self.w // self.patch_size),
+            ref_feat_shape=video_ref_feat_shape,
+        )
+
+        if self.coords_style == "v1":
+            audio_coords = self._default_coords(
+                shape=(self.audio_feat_len, 1, 1),
+                ref_feat_shape=(self.t // self.t_patch_size, 1, 1),
+            )
+            text_coords = self._default_coords(
+                shape=(self.txt_feat_len, 1, 1),
+                ref_feat_shape=(2, 1, 1),
+                offset_thw=[self.text_offset, 0, 0],
+            )
+        elif self.coords_style == "v2":
+            magic_audio_ref_t = (self.audio_feat_len - 1) // 4 + 1
+            audio_coords = self._default_coords(
+                shape=(self.audio_feat_len, 1, 1),
+                ref_feat_shape=(magic_audio_ref_t // self.t_patch_size, 1, 1),
+            )
+            text_coords = self._default_coords(
+                shape=(self.txt_feat_len, 1, 1),
+                ref_feat_shape=(1, 1, 1),
+                offset_thw=[-self.txt_feat_len, 0, 0],
+            )
+        else:
+            raise ValueError(f"Unknown coords_style: {self.coords_style}")
+
+        return torch.cat([video_coords, audio_coords, text_coords], dim=0)
+
+    def depack_token_sequence(self, token_sequence):
+        video_x_t = token_sequence[: self.video_token_num, : self.video_channel]
+        video_x_t = rearrange(
+            video_x_t,
+            "(T H W) (pT pH pW C) -> C (T pT) (H pH) (W pW)",
+            H=self.h // self.patch_size,
+            W=self.w // self.patch_size,
+            pT=self.t_patch_size,
+            pH=self.patch_size,
+            pW=self.patch_size,
+        ).contiguous()
+        audio_x_t = token_sequence[
+            self.video_token_num : self.video_token_num + self.audio_feat_len, : self.audio_channel
+        ]
+        return video_x_t, audio_x_t
+
+
+@dataclass
+class _SimplePackedData:
+    items: list[_SingleData]
+
+    @property
+    def token_sequence(self):
+        return torch.cat([item.token_sequence for item in self.items], dim=0)
+
+    @property
+    def modality_mapping(self):
+        return torch.cat([item.modality_mapping for item in self.items], dim=0)
+
+    @property
+    def coords_mapping(self):
+        return torch.cat([item.coords_mapping for item in self.items], dim=0)
+
+    @property
+    def total_token_num(self):
+        return sum(item.total_token_num for item in self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+    @property
+    def cu_seqlen(self):
+        cu = torch.cumsum(torch.tensor([item.total_token_num for item in self.items]), dim=0)
+        return F.pad(cu, (1, 0))
+
+    @property
+    def max_seqlen(self):
+        return torch.tensor(max(item.total_token_num for item in self.items))
+
+    def depack_token_sequence(self, token_sequence):
+        video_list, audio_list = [], []
+        parts = torch.split(token_sequence, [item.total_token_num for item in self.items], dim=0)
+        for item, part in zip(self.items, parts):
+            v, a = item.depack_token_sequence(part)
+            video_list.append(v)
+            audio_list.append(a)
+        return torch.stack(video_list, dim=0), torch.stack(audio_list, dim=0)
+
+
+class MagiDataProxy:
+    def __init__(
+        self,
+        patch_size: int = 2,
+        t_patch_size: int = 1,
+        frame_receptive_field: int = 11,
+        spatial_rope_interpolation: str = "extra",
+        ref_audio_offset: int = 1000,
+        text_offset: int = 0,
+        coords_style: str = "v2",
+    ):
+        self.patch_size = patch_size
+        self.t_patch_size = t_patch_size
+        self.frame_receptive_field = frame_receptive_field
+        self.spatial_rope_interpolation = spatial_rope_interpolation
+        self.ref_audio_offset = ref_audio_offset
+        self.text_offset = text_offset
+        self.coords_style = coords_style
+        self._kernel = (t_patch_size, patch_size, patch_size)
+        self._stride = (t_patch_size, patch_size, patch_size)
+        self._saved_data: dict[str, Any] = {}
+
+    def saved_for_output(self, **kwargs):
+        self._saved_data.update(kwargs)
+
+    def get_saved_data(self, key: str):
+        return self._saved_data[key]
+
+    def img2tokens(self, x_t: torch.Tensor):
+        x_t_unfolded = _unfold_3d(x_t, self._kernel, self._stride)
+        return rearrange(x_t_unfolded, "N col_dim num_tokens -> N num_tokens col_dim").contiguous()
+
+    def process_input(self, transported_data: EvalInput):
+        batch_size, _, t, h, w = transported_data.x_t.shape
+        x_t = self.img2tokens(transported_data.x_t)
+        audio_x_t = transported_data.audio_x_t.contiguous()
+        text_in = transported_data.txt_feat.contiguous()
+
+        simple_packed_data = _SimplePackedData(items=[])
+        for i in range(batch_size):
+            single_data = _SingleData(
+                video_x_t=x_t[i],
+                audio_x_t=audio_x_t[i],
+                audio_feat_len=transported_data.audio_feat_len[i],
+                txt_feat=text_in[i],
+                txt_feat_len=transported_data.txt_feat_len[i],
+                t=t,
+                h=h,
+                w=w,
+                patch_size=self.patch_size,
+                t_patch_size=self.t_patch_size,
+                spatial_rope_interpolation=self.spatial_rope_interpolation,
+                ref_audio_offset=self.ref_audio_offset,
+                text_offset=self.text_offset,
+                coords_style=self.coords_style,
+            )
+            simple_packed_data.items.append(single_data)
+
+        if self.frame_receptive_field != -1:
+            assert batch_size == 1, "local attention only supports batch size 1"
+            local_attn_handler = _calc_local_attn_ffa_handler(
+                num_video_tokens=simple_packed_data[0].video_token_num,
+                num_audio_and_txt_tokens=simple_packed_data[0].audio_feat_len + simple_packed_data[0].txt_feat_len,
+                num_frames=t,
+                frame_receptive_field=self.frame_receptive_field,
+            )
+            if isinstance(local_attn_handler.max_seqlen_k, torch.Tensor):
+                local_attn_handler.max_seqlen_k = local_attn_handler.max_seqlen_k.item()
+            if isinstance(local_attn_handler.max_seqlen_q, torch.Tensor):
+                local_attn_handler.max_seqlen_q = local_attn_handler.max_seqlen_q.item()
+        else:
+            local_attn_handler = None
+
+        varlen_handler = VarlenHandler(
+            cu_seqlens_q=simple_packed_data.cu_seqlen.to(torch.int32).cuda(),
+            cu_seqlens_k=simple_packed_data.cu_seqlen.to(torch.int32).cuda(),
+            max_seqlen_q=simple_packed_data.max_seqlen.to(torch.int32).cuda(),
+            max_seqlen_k=simple_packed_data.max_seqlen.to(torch.int32).cuda(),
+        )
+
+        self.saved_for_output(simple_packed_data=simple_packed_data)
+
+        x = simple_packed_data.token_sequence
+        coords_mapping = simple_packed_data.coords_mapping
+        modality_mapping = simple_packed_data.modality_mapping
+        return (x, coords_mapping, modality_mapping, varlen_handler, local_attn_handler)
+
+    def process_output(self, x: torch.Tensor):
+        simple_packed_data: _SimplePackedData = self.get_saved_data("simple_packed_data")
+        return simple_packed_data.depack_token_sequence(x)
+
+
+# ===========================================================================
+# Pipeline helpers
+# ===========================================================================
 @dataclass
 class EvalInput:
     x_t: torch.Tensor
@@ -50,9 +1396,6 @@ class EvalInput:
     txt_feat_len: torch.Tensor | list[int]
 
 
-# ---------------------------------------------------------------------------
-# Text encoder wrapper (cached singleton within pipeline)
-# ---------------------------------------------------------------------------
 class _T5GemmaEncoder:
     def __init__(self, model_path: str, device: str, weight_dtype: torch.dtype):
         self.device = device
@@ -106,9 +1449,6 @@ def _resizecrop(img: Image.Image, target_height: int, target_width: int) -> Imag
     return resized_image.crop((left, top, left + target_width, top + target_height))
 
 
-# ---------------------------------------------------------------------------
-# Scheduling helper
-# ---------------------------------------------------------------------------
 def _schedule_latent_step(
     *,
     video_scheduler: FlowUniPCMultistepScheduler,
@@ -145,9 +1485,6 @@ def _schedule_latent_step(
     return latent_video, latent_audio
 
 
-# ---------------------------------------------------------------------------
-# Negative prompt (same as original)
-# ---------------------------------------------------------------------------
 _NEGATIVE_PROMPT = (
     "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, "
     "overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, "
@@ -170,9 +1507,9 @@ _NEGATIVE_PROMPT = (
 )
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Pre/post process funcs (registered in registry)
-# ---------------------------------------------------------------------------
+# ===========================================================================
 def get_magi_human_pre_process_func(*args, **kwargs):
     def pre_process(request: OmniDiffusionRequest):
         return request
@@ -187,9 +1524,9 @@ def get_magi_human_post_process_func(*args, **kwargs):
     return post_process
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Main Pipeline
-# ---------------------------------------------------------------------------
+# ===========================================================================
 class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMixin):
     def __init__(self, od_config: OmniDiffusionConfig, **kwargs):
         super().__init__()
@@ -269,24 +1606,15 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             ),
         ]
 
-    # ------------------------------------------------------------------
-    # Weight loading (AutoWeightsLoader)
-    # ------------------------------------------------------------------
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 
-    # ------------------------------------------------------------------
-    # DiT forward pass through data proxy
-    # ------------------------------------------------------------------
     def _dit_forward(self, eval_input: EvalInput) -> tuple[torch.Tensor, torch.Tensor]:
         packed = self.data_proxy.process_input(eval_input)
         noise_pred = self.dit(*packed)
         return self.data_proxy.process_output(noise_pred)
 
-    # ------------------------------------------------------------------
-    # Denoising loop (from original evaluate_with_latent)
-    # ------------------------------------------------------------------
     @torch.inference_mode()
     def _evaluate_with_latent(
         self,
@@ -370,9 +1698,6 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             latent_video[:, :, :1] = latent_image[:, :, :1]
         return latent_video, latent_audio
 
-    # ------------------------------------------------------------------
-    # Image encoding (via diffusers VAE)
-    # ------------------------------------------------------------------
     def _encode_image(self, image: Image.Image, height: int, width: int) -> torch.Tensor:
         image = load_image(image)
         image = _resizecrop(image, height, width)
@@ -383,9 +1708,6 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             return vae_out.latent_dist.mode().to(torch.float32)
         return vae_out.to(torch.float32)
 
-    # ------------------------------------------------------------------
-    # Decode video latents → numpy
-    # ------------------------------------------------------------------
     def _decode_video(self, latent: torch.Tensor) -> list[np.ndarray]:
         videos = self.vae.decode(latent.to(self.dtype))
         if hasattr(videos, "sample"):
@@ -394,9 +1716,6 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         videos = [v.float().cpu().permute(1, 2, 3, 0) * 255 for v in videos]
         return [v.numpy().astype(np.uint8) for v in videos]
 
-    # ------------------------------------------------------------------
-    # Decode audio latents → numpy
-    # ------------------------------------------------------------------
     def _decode_audio(self, latent_audio: torch.Tensor) -> np.ndarray:
         latent_audio = latent_audio.squeeze(0).to(self.dtype)
         audio_output = self.audio_vae.decode(latent_audio.T)
@@ -406,9 +1725,6 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
 
         return resample(audio_np, target_len)
 
-    # ------------------------------------------------------------------
-    # Main forward – called by vllm-omni scheduler
-    # ------------------------------------------------------------------
     @torch.inference_mode()
     def forward(
         self,

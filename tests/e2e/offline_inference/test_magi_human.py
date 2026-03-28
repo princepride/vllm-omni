@@ -100,8 +100,10 @@ class TestDataProxy:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_data_proxy_roundtrip(self):
-        from vllm_omni.diffusion.models.magi_human.magi_human_data_proxy import MagiDataProxy
-        from vllm_omni.diffusion.models.magi_human.pipeline_magi_human import EvalInput
+        from vllm_omni.diffusion.models.magi_human.pipeline_magi_human import (
+            EvalInput,
+            MagiDataProxy,
+        )
 
         proxy = MagiDataProxy(
             patch_size=2,
@@ -148,7 +150,7 @@ class TestScheduler:
     """Test scheduler."""
 
     def test_scheduler_set_timesteps(self):
-        from vllm_omni.diffusion.models.magi_human.magi_human_scheduler import FlowUniPCMultistepScheduler
+        from vllm_omni.diffusion.models.magi_human.pipeline_magi_human import FlowUniPCMultistepScheduler
 
         scheduler = FlowUniPCMultistepScheduler()
         scheduler.set_timesteps(32, device="cpu", shift=5.0)
@@ -157,7 +159,7 @@ class TestScheduler:
         assert scheduler.timesteps[0] > scheduler.timesteps[-1]
 
     def test_scheduler_step(self):
-        from vllm_omni.diffusion.models.magi_human.magi_human_scheduler import FlowUniPCMultistepScheduler
+        from vllm_omni.diffusion.models.magi_human.pipeline_magi_human import FlowUniPCMultistepScheduler
 
         scheduler = FlowUniPCMultistepScheduler()
         scheduler.set_timesteps(4, device="cpu", shift=5.0)
@@ -169,7 +171,7 @@ class TestScheduler:
         assert result[0].shape == sample.shape
 
     def test_scheduler_step_ddim(self):
-        from vllm_omni.diffusion.models.magi_human.magi_human_scheduler import FlowUniPCMultistepScheduler
+        from vllm_omni.diffusion.models.magi_human.pipeline_magi_human import FlowUniPCMultistepScheduler
 
         scheduler = FlowUniPCMultistepScheduler()
         scheduler.set_timesteps(4, device="cpu", shift=5.0)
