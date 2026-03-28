@@ -1,41 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Ported from daVinci-MagiHuman DiT model.
 # Copyright (c) 2026 SandAI. All Rights Reserved.
+# Ported from daVinci-MagiHuman inference/model/dit/dit_module.py
+# Adaptations: removed Ulysses context-parallelism, inlined Modality/VarlenHandler.
+
+from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Any
 
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
+from magi_compiler import magi_compile
+from magi_compiler.api import magi_register_custom_op
+from magi_compiler.config import CompileConfig
 from torch.nn import Parameter
-
-# ---------------------------------------------------------------------------
-# Optional dependencies: magi_compiler & magi_attention
-# ---------------------------------------------------------------------------
-HAS_MAGI_COMPILER = importlib.util.find_spec("magi_compiler") is not None
-HAS_MAGI_ATTENTION = importlib.util.find_spec("magi_attention") is not None
-HAS_FA3 = importlib.util.find_spec("flash_attn_interface") is not None
-HAS_FA2 = importlib.util.find_spec("flash_attn") is not None
-
-
-def _is_hopper_arch() -> bool:
-    """Check if the current GPU is Hopper architecture (sm_90+)."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        major, _ = torch.cuda.get_device_capability()
-        return major >= 9
-    except Exception:
-        return False
+from vllm.vllm_flash_attn import flash_attn_varlen_func as _vllm_fa_varlen
 
 
 # ---------------------------------------------------------------------------
-# Local data types (previously from inference.common)
+# Inlined from inference/common/sequence_schema.py
 # ---------------------------------------------------------------------------
 class Modality(IntEnum):
     VIDEO = 0
@@ -51,6 +38,15 @@ class VarlenHandler:
     max_seqlen_k: int
 
 
+def _is_hopper_arch() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] == 9
+
+
+# ---------------------------------------------------------------------------
+# FFA handler for local / flex attention
+# ---------------------------------------------------------------------------
 @dataclass
 class FFAHandler:
     q_ranges: torch.Tensor
@@ -58,11 +54,11 @@ class FFAHandler:
     max_seqlen_q: int
     max_seqlen_k: int
     attn_type_map: torch.Tensor
-    softmax_scale: float | None
+    softmax_scale: float
 
 
 # ---------------------------------------------------------------------------
-# Activation functions
+# Activation helpers
 # ---------------------------------------------------------------------------
 class MLPActivationType(Enum):
     SWIGLU7 = "swiglu7"
@@ -98,7 +94,7 @@ def create_activation_func(activation_type: MLPActivationType) -> Callable:
 
 
 # ---------------------------------------------------------------------------
-# Modality dispatcher
+# Modality dispatcher (permutation helper)
 # ---------------------------------------------------------------------------
 class ModalityDispatcher:
     permuted_modality_mapping: torch.Tensor
@@ -119,8 +115,7 @@ class ModalityDispatcher:
         return modality_mapping[self.permute_mapping]
 
     def dispatch(self, x: torch.Tensor) -> list[torch.Tensor]:
-        grouped_tensors = torch.split(x, self.group_size_cpu, dim=0)
-        return list(grouped_tensors)
+        return list(torch.split(x, self.group_size_cpu, dim=0))
 
     def undispatch(self, *processed_groups: list[torch.Tensor]) -> torch.Tensor:
         return torch.cat(processed_groups, dim=0)
@@ -135,14 +130,13 @@ class ModalityDispatcher:
 
 
 # ---------------------------------------------------------------------------
-# RoPE utilities
+# Positional / rotary embedding helpers
 # ---------------------------------------------------------------------------
 def freq_bands(
     num_bands: int, temperature: float = 10000.0, step: int = 2, device: torch.device | None = None
 ) -> torch.Tensor:
     exp = torch.arange(0, num_bands, step, dtype=torch.int64, device=device).to(torch.float32) / num_bands
-    bands = 1.0 / (temperature**exp)
-    return bands
+    return 1.0 / (temperature**exp)
 
 
 def rotate_half(x, interleaved=False):
@@ -162,6 +156,9 @@ def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
     return torch.cat([x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin, x[..., ro_dim:]], dim=-1)
 
 
+# ---------------------------------------------------------------------------
+# Fourier positional embedding
+# ---------------------------------------------------------------------------
 class ElementWiseFourierEmbed(nn.Module):
     def __init__(
         self,
@@ -171,7 +168,7 @@ class ElementWiseFourierEmbed(nn.Module):
         in_pixels: bool = True,
         linear_bands: bool = False,
         learnable: bool = False,
-        device: torch.device = None,
+        device: torch.device = torch.device("cpu"),
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
@@ -184,41 +181,39 @@ class ElementWiseFourierEmbed(nn.Module):
         self.device = device
         self.dtype = dtype
         bands = self.get_default_bands()
-        if self.learnable:
-            self.bands = nn.Parameter(bands)
-        else:
-            self.bands = nn.Parameter(bands, requires_grad=False)
+        self.bands = nn.Parameter(bands, requires_grad=self.learnable)
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         coords_xyz = coords[:, :3]
         sizes = coords[:, 3:6]
         refs = coords[:, 6:9]
+
         scales = (refs - 1) / (sizes - 1)
         scales[(refs == 1) & (sizes == 1)] = 1
         assert not scales.isnan().any(), "scales has nan"
         assert not scales.isinf().any(), "scales has inf"
+
         centers = (sizes - 1) / 2
         centers[:, 0] = 0
         coords_xyz = coords_xyz - centers
-        proj = coords_xyz.unsqueeze(-1) * scales.unsqueeze(-1) * self.bands
+
+        bands = self.bands.to(coords.device, coords.dtype)
+        proj = coords_xyz.unsqueeze(-1) * scales.unsqueeze(-1) * bands
         sin_proj = proj.sin()
         cos_proj = proj.cos()
         return torch.cat((sin_proj, cos_proj), dim=1).flatten(1)
 
     def reset_parameters(self):
-        bands = self.get_default_bands()
-        self.bands.copy_(bands)
+        self.bands.copy_(self.get_default_bands())
 
     def get_default_bands(self):
         if self.in_pixels:
             raise NotImplementedError("in_pixels are not implemented yet")
-        else:
-            bands = freq_bands(self.dim // 8, temperature=self.temperature, step=1, device=self.device).to(self.dtype)
-        return bands
+        return freq_bands(self.dim // 8, temperature=self.temperature, step=1, device=self.device).to(self.dtype)
 
 
 # ---------------------------------------------------------------------------
-# Normalization
+# Multi-modality RMSNorm
 # ---------------------------------------------------------------------------
 class MultiModalityRMSNorm(nn.Module):
     __constants__ = ["dim", "eps", "num_modality"]
@@ -228,7 +223,7 @@ class MultiModalityRMSNorm(nn.Module):
         self.dim = dim
         self.eps = eps
         self.num_modality = num_modality
-        self.weight = torch.nn.Parameter(torch.zeros(dim * num_modality, device=device, dtype=torch.float32))
+        self.weight = nn.Parameter(torch.zeros(dim * num_modality, device=device, dtype=torch.float32))
         if num_modality > 1:
             self.forward = self.forward_multi_experts
         else:
@@ -240,8 +235,7 @@ class MultiModalityRMSNorm(nn.Module):
 
     def rms(self, x: torch.Tensor) -> torch.Tensor:
         t = x.float()
-        t = t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + self.eps)
-        return t
+        return t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + self.eps)
 
     def forward_multi_experts(self, x: torch.Tensor, modality_dispatcher: ModalityDispatcher) -> torch.Tensor:
         original_dtype = x.dtype
@@ -262,7 +256,7 @@ class MultiModalityRMSNorm(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Linear layers (BF16 compute + MoE per modality)
+# Linear layers with bf16 compute and MoE dispatch
 # ---------------------------------------------------------------------------
 class _BF16ComputeLinear(torch.autograd.Function):
     @staticmethod
@@ -278,8 +272,7 @@ class _BF16ComputeLinear(torch.autograd.Function):
         weight_cast = weight.to(compute_dtype)
         output = torch.matmul(input_cast, weight_cast.t())
         if bias is not None:
-            bias_cast = bias.to(compute_dtype)
-            output = output + bias_cast
+            output = output + bias.to(compute_dtype)
         return output.to(output_dtype)
 
 
@@ -320,7 +313,7 @@ class NativeMoELinear(BaseLinear):
         modality_dispatcher: ModalityDispatcher | None = None,
     ) -> torch.Tensor:
         output_dtype = input.dtype if output_dtype is None else output_dtype
-        input_list = modality_dispatcher.dispatch(input)
+        input_list = modality_dispatcher.dispatch(input)  # type: ignore
         weight_chunked = self.weight.chunk(self.num_experts, dim=0)
         if self.bias is not None:
             bias_chunked = self.bias.chunk(self.num_experts, dim=0)
@@ -332,7 +325,7 @@ class NativeMoELinear(BaseLinear):
                 output_dtype,
                 torch.bfloat16,
             )
-        return modality_dispatcher.undispatch(*input_list)
+        return modality_dispatcher.undispatch(*input_list)  # type: ignore
 
 
 def create_linear(
@@ -345,31 +338,41 @@ def create_linear(
 
 
 # ---------------------------------------------------------------------------
-# Flash Attention wrappers (no CP support in this version)
+# Flash attention (no context-parallelism) — uses vllm's flash attention
 # ---------------------------------------------------------------------------
+
+HAS_MAGI_ATTENTION = importlib.util.find_spec("magi_attention") is not None
+
+
+def _fa_varlen_simple(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    had_batch = query.ndim == 4
+    if had_batch:
+        query = query.squeeze(0)
+        key = key.squeeze(0)
+        value = value.squeeze(0)
+    seq_len = query.shape[0]
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=query.device)
+    out = _vllm_fa_varlen(
+        q=query,
+        k=key,
+        v=value,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=seq_len,
+        max_seqlen_k=seq_len,
+    )
+    if had_batch:
+        out = out.unsqueeze(0)
+    return out
+
+
+@magi_register_custom_op(name="infra::flash_attn_func", is_subgraph_boundary=True)
 def flash_attn_func(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-    """Standard flash attention - tries FA3 on Hopper, falls back to FA2."""
-    if HAS_FA3 and _is_hopper_arch():
-        from flash_attn_interface import flash_attn_func as fa3_flash_attn_func
-
-        return fa3_flash_attn_func(query, key, value)
-    elif HAS_FA2:
-        from flash_attn.flash_attn_interface import flash_attn_func as fa2_flash_attn_func
-
-        return fa2_flash_attn_func(query, key, value)
-    else:
-        # Fallback to PyTorch scaled_dot_product_attention
-        # query/key/value: (batch, seq, heads, dim) -> (batch, heads, seq, dim)
-        q = query.transpose(1, 2)
-        k = key.transpose(1, 2)
-        v = value.transpose(1, 2)
-        # Handle GQA: repeat KV heads to match Q heads
-        if q.shape[1] != k.shape[1]:
-            n_rep = q.shape[1] // k.shape[1]
-            k = k.repeat_interleave(n_rep, dim=1)
-            v = v.repeat_interleave(n_rep, dim=1)
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        return out.transpose(1, 2)
+    return _fa_varlen_simple(query, key, value)
 
 
 def _split_q_range_with_no_overlap(
@@ -403,40 +406,28 @@ def _flash_attn_with_correction(
     output = torch.zeros_like(query)
     output_lse = torch.zeros((query.shape[0], query.shape[1]), dtype=torch.float32, device=query.device)
 
-    if HAS_FA2:
-        from flash_attn.flash_attn_interface import flash_attn_func
-    else:
-        flash_attn_func = None
-
     for q_range, k_ranges in zip(q_ranges, k_range_list):
         q_start, q_end = q_range
         qo_out, qo_lse = None, None
         for k_range in k_ranges:
             k_start, k_end = k_range
-            if flash_attn_func is not None:
-                cur_qo_out, cur_qo_lse, _ = flash_attn_func(
-                    query[q_start:q_end].unsqueeze(0),
-                    key[k_start:k_end].unsqueeze(0),
-                    value[k_start:k_end].unsqueeze(0),
-                    return_attn_probs=True,
-                )
-                cur_qo_out, cur_qo_lse = cur_qo_out.squeeze(0), cur_qo_lse.squeeze(0)
-            else:
-                # Fallback: scaled_dot_product_attention per chunk
-                q_chunk = query[q_start:q_end].unsqueeze(0).transpose(1, 2)
-                k_chunk = key[k_start:k_end].unsqueeze(0).transpose(1, 2)
-                v_chunk = value[k_start:k_end].unsqueeze(0).transpose(1, 2)
-                # Handle GQA: repeat KV heads to match Q heads
-                if q_chunk.shape[1] != k_chunk.shape[1]:
-                    n_rep = q_chunk.shape[1] // k_chunk.shape[1]
-                    k_chunk = k_chunk.repeat_interleave(n_rep, dim=1)
-                    v_chunk = v_chunk.repeat_interleave(n_rep, dim=1)
-                cur_qo_out = torch.nn.functional.scaled_dot_product_attention(q_chunk, k_chunk, v_chunk)
-                cur_qo_out = cur_qo_out.transpose(1, 2).squeeze(0)
-                cur_qo_lse = torch.zeros(
-                    (cur_qo_out.shape[1], cur_qo_out.shape[0]), dtype=torch.float32, device=query.device
-                )
-
+            q_chunk = query[q_start:q_end]
+            k_chunk = key[k_start:k_end]
+            v_chunk = value[k_start:k_end]
+            q_len = q_chunk.shape[0]
+            k_len = k_chunk.shape[0]
+            cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=query.device)
+            cu_k = torch.tensor([0, k_len], dtype=torch.int32, device=query.device)
+            cur_qo_out = _vllm_fa_varlen(
+                q=q_chunk,
+                k=k_chunk,
+                v=v_chunk,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=q_len,
+                max_seqlen_k=k_len,
+            )
+            cur_qo_lse = torch.zeros((q_len, query.shape[1]), dtype=torch.float32, device=query.device)
             if qo_out is None:
                 qo_out = cur_qo_out
                 qo_lse = cur_qo_lse
@@ -444,23 +435,35 @@ def _flash_attn_with_correction(
                 qo_lse[qo_lse == torch.inf] = -torch.inf
                 cur_qo_lse[cur_qo_lse == torch.inf] = -torch.inf
                 max_lse = torch.max(qo_lse, cur_qo_lse)
-                qo_se, cur_qo_se = torch.exp(qo_lse - max_lse), torch.exp(cur_qo_lse - max_lse)
+                qo_se = torch.exp(qo_lse - max_lse)
+                cur_qo_se = torch.exp(cur_qo_lse - max_lse)
                 sum_se = qo_se + cur_qo_se
-                qo_scale, cur_qo_scale = qo_se / sum_se, cur_qo_se / sum_se
-                qo_out = qo_out * qo_scale.permute(1, 0).unsqueeze(-1) + cur_qo_out * cur_qo_scale.permute(
-                    1, 0
-                ).unsqueeze(-1)
+                qo_out = qo_out * (qo_se / sum_se).permute(1, 0).unsqueeze(-1) + cur_qo_out * (
+                    cur_qo_se / sum_se
+                ).permute(1, 0).unsqueeze(-1)
                 qo_lse = torch.log(sum_se) + max_lse
-
         output[q_start:q_end] = qo_out
         output_lse[q_start:q_end, :] = qo_lse.permute(1, 0)
     return output, output_lse
 
 
+def _flex_flash_attn_func_infer_output_meta(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_ranges: torch.Tensor, k_ranges: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output = torch.empty_like(query)
+    output_lse = torch.empty((query.shape[0], query.shape[1]), dtype=torch.float32, device=query.device)
+    return output, output_lse
+
+
+@magi_register_custom_op(
+    name="infra::flex_flash_attn_func",
+    mutates_args=(),
+    infer_output_meta_fn=_flex_flash_attn_func_infer_output_meta,
+    is_subgraph_boundary=True,
+)
 def flex_flash_attn_func(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, q_ranges: torch.Tensor, k_ranges: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Flexible flash attention with custom Q/K ranges (local attention)."""
     if HAS_MAGI_ATTENTION and _is_hopper_arch():
         from magi_attention.api import flex_flash_attn_func as magi_flex_flash_attn_func
 
@@ -471,7 +474,6 @@ def flex_flash_attn_func(
 
 
 def flash_attn_no_cp(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Flash attention without context parallelism."""
     q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
     return flash_attn_func(q, k, v).squeeze(0)
 
@@ -483,14 +485,13 @@ def flex_flash_attn_no_cp(
     q_ranges: torch.Tensor,
     k_ranges: torch.Tensor,
 ) -> torch.Tensor:
-    """Flexible flash attention without context parallelism."""
     q, k, v = q.to(torch.bfloat16).squeeze(0), k.to(torch.bfloat16).squeeze(0), v.to(torch.bfloat16).squeeze(0)
     out, _ = flex_flash_attn_func(q, k, v, q_ranges=q_ranges, k_ranges=k_ranges)
     return out
 
 
 # ---------------------------------------------------------------------------
-# Attention module
+# Attention module (no context-parallelism)
 # ---------------------------------------------------------------------------
 @dataclass
 class AttentionConfig:
@@ -577,8 +578,7 @@ class Attention(torch.nn.Module):
             self_attn_out = self_attn_out * torch.sigmoid(g)
 
         self_attn_out = self_attn_out.view(-1, self.config.num_heads_q * self.config.head_dim).to(torch.bfloat16)
-        out = self.linear_proj(self_attn_out, modality_dispatcher=modality_dispatcher)
-        return out
+        return self.linear_proj(self_attn_out, modality_dispatcher=modality_dispatcher)
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +603,6 @@ class MLP(torch.nn.Module):
         num_experts = config.num_modality
         self.pre_norm = MultiModalityRMSNorm(config.hidden_size, num_modality=config.num_modality)
         intermediate_size_up = config.intermediate_size * 2 if config.gated_act else config.intermediate_size
-
         self.up_gate_proj = create_linear(
             config.hidden_size,
             intermediate_size_up,
@@ -631,7 +630,7 @@ class MLP(torch.nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Adapter (input embedding)
+# Adapter (per-modality embedders + RoPE)
 # ---------------------------------------------------------------------------
 @dataclass
 class AdapterConfig:
@@ -656,26 +655,26 @@ class Adapter(torch.nn.Module):
             config.hidden_size // config.num_attention_heads, in_pixels=False, learnable=False
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        coords_mapping: torch.Tensor,
-        video_mask: torch.Tensor,
-        audio_mask: torch.Tensor,
-        text_mask: torch.Tensor,
-    ):
-        rope = self.rope(coords_mapping.float())
-        embed_dtype = self.video_embedder.weight.dtype
-        x = x.to(embed_dtype)
+    def forward(self, x, coords_mapping, video_mask, audio_mask, text_mask):
+        rope = self.rope(coords_mapping)
+
+        text_input = x[text_mask, : self.config.text_in_channels]
+        audio_input = x[audio_mask, : self.config.audio_in_channels]
+        video_input = x[video_mask, : self.config.video_in_channels]
+
+        text_out = self.text_embedder(text_input)
+        audio_out = self.audio_embedder(audio_input)
+        video_out = self.video_embedder(video_input)
+
         output_x = torch.zeros(x.shape[0], self.config.hidden_size, device=x.device, dtype=x.dtype)
-        output_x[text_mask] = self.text_embedder(x[text_mask, : self.config.text_in_channels])
-        output_x[audio_mask] = self.audio_embedder(x[audio_mask, : self.config.audio_in_channels])
-        output_x[video_mask] = self.video_embedder(x[video_mask, : self.config.video_in_channels])
+        output_x[text_mask] = text_out
+        output_x[audio_mask] = audio_out
+        output_x[video_mask] = video_out
         return output_x, rope
 
 
 # ---------------------------------------------------------------------------
-# Transformer layer & block
+# Transformer layer (no CP)
 # ---------------------------------------------------------------------------
 class TransFormerLayer(torch.nn.Module):
     def __init__(self, config: Any, layer_idx: int):
@@ -748,6 +747,24 @@ class TransFormerLayer(torch.nn.Module):
         return hidden_states
 
 
+# ---------------------------------------------------------------------------
+# TransformerBlock with magi_compile
+# ---------------------------------------------------------------------------
+is_base_model = True
+
+
+def config_patch(compile_config: CompileConfig) -> CompileConfig:
+    global is_base_model
+    if is_base_model:
+        is_base_model = False
+    else:
+        compile_config.offload_config.gpu_resident_weight_ratio = 0.0
+    return compile_config
+
+
+@magi_compile(
+    config_patch=config_patch, dynamic_arg_dims={"x": 0, "rope": 0, "permute_mapping": 0, "inv_permute_mapping": 0}
+)
 class TransformerBlock(torch.nn.Module):
     def __init__(self, model_config: Any):
         super().__init__()
@@ -767,19 +784,13 @@ class TransformerBlock(torch.nn.Module):
     ) -> torch.Tensor:
         for layer in self.layers:
             x = layer(
-                x,
-                rope,
-                permute_mapping,
-                inv_permute_mapping,
-                varlen_handler,
-                local_attn_handler,
-                modality_dispatcher,
+                x, rope, permute_mapping, inv_permute_mapping, varlen_handler, local_attn_handler, modality_dispatcher
             )
         return x
 
 
 # ---------------------------------------------------------------------------
-# Main DiT Model
+# Internal config for TransformerBlock / DiTModel construction
 # ---------------------------------------------------------------------------
 @dataclass
 class TransformerConfig:
@@ -791,6 +802,9 @@ class TransformerConfig:
     post_process_dtype: torch.dtype
 
 
+# ---------------------------------------------------------------------------
+# DiTModel (no context-parallelism)
+# ---------------------------------------------------------------------------
 class DiTModel(torch.nn.Module):
     config: TransformerConfig
 
@@ -831,7 +845,6 @@ class DiTModel(torch.nn.Module):
         varlen_handler: VarlenHandler,
         local_attn_handler: FFAHandler | None,
     ):
-        # No CP dispatch/undispatch in this version
         modality_dispatcher = ModalityDispatcher(modality_mapping, 3)
         permute_mapping = modality_dispatcher.permute_mapping
         inv_permute_mapping = modality_dispatcher.inv_permute_mapping
@@ -840,8 +853,10 @@ class DiTModel(torch.nn.Module):
         text_mask = modality_mapping == Modality.TEXT
 
         x, rope = self.adapter(x, coords_mapping, video_mask, audio_mask, text_mask)
+
         x = x.to(self.config.params_dtype)
         x = ModalityDispatcher.permute(x, permute_mapping)
+
         x = self.block(
             x,
             rope,
@@ -851,6 +866,7 @@ class DiTModel(torch.nn.Module):
             local_attn_handler=local_attn_handler,
             modality_dispatcher=modality_dispatcher,
         )
+
         x = ModalityDispatcher.inv_permute(x, inv_permute_mapping)
 
         x_video = x[video_mask].to(self.final_norm_video.weight.dtype)
@@ -874,12 +890,10 @@ class DiTModel(torch.nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Model config dataclass for building DiTModel
+# Public config dataclass for building DiTModel from JSON
 # ---------------------------------------------------------------------------
 @dataclass
 class MagiHumanDiTConfig:
-    """Configuration for building DiTModel, matching the original ModelConfig fields."""
-
     num_layers: int = 40
     hidden_size: int = 5120
     head_dim: int = 128
@@ -889,21 +903,12 @@ class MagiHumanDiTConfig:
     text_in_channels: int = 3584
     checkpoint_qk_layernorm_rope: bool = False
     params_dtype: torch.dtype = torch.float32
-    mm_layers: list = None
-    local_attn_layers: list = None
+    mm_layers: list = field(default_factory=lambda: [0, 1, 2, 3, 36, 37, 38, 39])
+    local_attn_layers: list = field(default_factory=list)
     enable_attn_gating: bool = True
-    gelu7_layers: list = None
-    post_norm_layers: list = None
+    gelu7_layers: list = field(default_factory=lambda: [0, 1, 2, 3])
+    post_norm_layers: list = field(default_factory=list)
 
     def __post_init__(self):
-        if self.mm_layers is None:
-            self.mm_layers = [0, 1, 2, 3, 36, 37, 38, 39]
-        if self.local_attn_layers is None:
-            self.local_attn_layers = []
-        if self.gelu7_layers is None:
-            self.gelu7_layers = [0, 1, 2, 3]
-        if self.post_norm_layers is None:
-            self.post_norm_layers = []
-        # Computed fields
         self.num_heads_q = self.hidden_size // self.head_dim
         self.num_heads_kv = self.num_query_groups

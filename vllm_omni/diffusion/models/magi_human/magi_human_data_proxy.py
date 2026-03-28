@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Ported from daVinci-MagiHuman data proxy.
 # Copyright (c) 2026 SandAI. All Rights Reserved.
+# Ported from daVinci-MagiHuman inference/pipeline/data_proxy.py
+# Adaptations: replaced UnfoldAnd with pure-PyTorch _unfold_3d, inlined types.
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -16,23 +18,61 @@ if TYPE_CHECKING:
     from .pipeline_magi_human import EvalInput
 
 
-def calc_local_qk_range(num_video_tokens, num_audio_and_txt_tokens, num_frames, frame_receptive_field, device="cuda"):
+def _unfold_3d(x: torch.Tensor, kernel_size: tuple[int, int, int], stride: tuple[int, int, int]) -> torch.Tensor:
+    """Pure-PyTorch 3D unfold matching UnfoldAnd behavior.
+
+    After N unfold ops the shape is (batch, C, oD, oH, oW, kD, kH, kW).
+    UnfoldAnd permutes kernel dims next to channel before reshape so that the
+    col_dim axis is ordered as (C, kD, kH, kW) -- matching F.unfold semantics.
+    Without this permute, .view() interleaves spatial and kernel positions.
+
+    Args:
+        x: (N, C, D, H, W)
+        kernel_size: (kD, kH, kW)
+        stride: (sD, sH, sW)
+    Returns:
+        (N, C*kD*kH*kW, L) where L = product of output spatial dims.
+    """
+    ndim = len(kernel_size)
+    for d in range(ndim):
+        x = x.unfold(d + 2, kernel_size[d], stride[d])
+    # x: (N, C, oD, oH, oW, kD, kH, kW)
+    # Permute to (N, C, kD, kH, kW, oD, oH, oW) so that view groups correctly
+    perm = [0, 1] + list(range(ndim + 2, 2 * ndim + 2)) + list(range(2, ndim + 2))
+    x = x.permute(*perm).contiguous()
+
+    batch_size = x.shape[0]
+    col_dim = 1
+    for i in range(1, ndim + 2):
+        col_dim *= x.shape[i]
+    spatial = 1
+    for i in range(ndim + 2, 2 * ndim + 2):
+        spatial *= x.shape[i]
+    return x.view(batch_size, col_dim, spatial)
+
+
+# ---------------------------------------------------------------------------
+# Local / flex attention helpers
+# ---------------------------------------------------------------------------
+def calc_local_qk_range(num_video_tokens, num_audio_and_txt_tokens, num_frames, frame_receptive_field):
     token_per_frame = num_video_tokens // num_frames
     total_tokens = num_video_tokens + num_audio_and_txt_tokens
 
     q_range_list = []
     k_range_list = []
-
     for i in range(num_frames):
-        local_q_range = torch.tensor([i * token_per_frame, (i + 1) * token_per_frame])
-        local_k_range = torch.tensor(
-            [(i - frame_receptive_field) * token_per_frame, (i + frame_receptive_field + 1) * token_per_frame]
+        q_range_list.append(torch.tensor([i * token_per_frame, (i + 1) * token_per_frame]))
+        k_range_list.append(
+            torch.tensor(
+                [
+                    (i - frame_receptive_field) * token_per_frame,
+                    (i + frame_receptive_field + 1) * token_per_frame,
+                ]
+            )
         )
-        q_range_list.append(local_q_range)
-        k_range_list.append(local_k_range)
-
     local_q_range = torch.stack(q_range_list, dim=0)
     local_k_range = torch.stack(k_range_list, dim=0)
+
     local_k_range[local_k_range < 0] = 0
     local_k_range[local_k_range > num_video_tokens] = num_video_tokens
 
@@ -43,58 +83,60 @@ def calc_local_qk_range(num_video_tokens, num_audio_and_txt_tokens, num_frames, 
     at_k_ranges = torch.tensor([[0, total_tokens]])
 
     q_ranges = (
-        torch.cat([local_q_range, video_q_range, at_q_ranges], dim=0).to(torch.int32).to(device, non_blocking=True)
+        torch.cat([local_q_range, video_q_range, at_q_ranges], dim=0).to(torch.int32).to("cuda", non_blocking=True)
     )
     k_ranges = (
-        torch.cat([local_k_range, video_k_range, at_k_ranges], dim=0).to(torch.int32).to(device, non_blocking=True)
+        torch.cat([local_k_range, video_k_range, at_k_ranges], dim=0).to(torch.int32).to("cuda", non_blocking=True)
     )
+    return q_ranges, k_ranges
 
-    return (q_ranges, k_ranges)
 
-
-def calc_local_attn_ffa_handler(
-    num_video_tokens, num_audio_and_txt_tokens, num_frames, frame_receptive_field, device="cuda"
-):
+def calc_local_attn_ffa_handler(num_video_tokens, num_audio_and_txt_tokens, num_frames, frame_receptive_field):
     q_ranges, k_ranges = calc_local_qk_range(
-        num_video_tokens, num_audio_and_txt_tokens, num_frames, frame_receptive_field, device=device
+        num_video_tokens, num_audio_and_txt_tokens, num_frames, frame_receptive_field
     )
-    max_seqlen_q = num_video_tokens + num_audio_and_txt_tokens
-    max_seqlen_k = num_video_tokens + num_audio_and_txt_tokens
-    attn_type_map = torch.zeros([q_ranges.shape[0]], device=device, dtype=torch.int32)
-
+    total = num_video_tokens + num_audio_and_txt_tokens
     return FFAHandler(
         q_ranges=q_ranges,
         k_ranges=k_ranges,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        attn_type_map=attn_type_map,
+        max_seqlen_q=total,
+        max_seqlen_k=total,
+        attn_type_map=torch.zeros([q_ranges.shape[0]], device="cuda", dtype=torch.int32),
         softmax_scale=None,
     )
 
 
+# ---------------------------------------------------------------------------
+# Coordinate helpers
+# ---------------------------------------------------------------------------
 def get_coords(
     shape: list[int],
     ref_feat_shape: list[int],
-    offset_thw: list[int] = [0, 0, 0],
+    offset_thw: list[int] | None = None,
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.float32,
 ):
+    if offset_thw is None:
+        offset_thw = [0, 0, 0]
     ori_t, ori_h, ori_w = shape
     ref_t, ref_h, ref_w = ref_feat_shape
+
     offset_t, offset_h, offset_w = offset_thw
     time_rng = torch.arange(ori_t, device=device, dtype=dtype) + offset_t
     height_rng = torch.arange(ori_h, device=device, dtype=dtype) + offset_h
     width_rng = torch.arange(ori_w, device=device, dtype=dtype) + offset_w
 
     time_grid, height_grid, width_grid = torch.meshgrid(time_rng, height_rng, width_rng, indexing="ij")
-    coords_grid = torch.stack([time_grid, height_grid, width_grid], dim=-1)
-    coords_flat = coords_grid.reshape(-1, 3)
+    coords_flat = torch.stack([time_grid, height_grid, width_grid], dim=-1).reshape(-1, 3)
 
     meta = torch.tensor([ori_t, ori_h, ori_w, ref_t, ref_h, ref_w], device=device, dtype=dtype)
     meta_expanded = meta.expand(coords_flat.size(0), -1)
     return torch.cat([coords_flat, meta_expanded], dim=-1)
 
 
+# ---------------------------------------------------------------------------
+# Packing data structures
+# ---------------------------------------------------------------------------
 @dataclass
 class SingleData:
     video_x_t: torch.Tensor
@@ -134,10 +176,10 @@ class SingleData:
 
     @property
     def token_sequence(self):
-        tensors_to_concat = [self.video_x_t, self.audio_x_t, self.txt_feat]
-        max_channel = max(tensor.shape[-1] for tensor in tensors_to_concat)
-        padded_tensors = [F.pad(t, (0, max_channel - t.shape[-1])) for t in tensors_to_concat]
-        return torch.cat(padded_tensors, dim=0)
+        tensors = [self.video_x_t, self.audio_x_t, self.txt_feat]
+        max_channel = max(t.shape[-1] for t in tensors)
+        padded = [F.pad(t, (0, max_channel - t.shape[-1])) for t in tensors]
+        return torch.cat(padded, dim=0)
 
     @property
     def modality_mapping(self):
@@ -146,7 +188,9 @@ class SingleData:
         t_map = torch.full((self.txt_feat_len,), Modality.TEXT, dtype=torch.int64, device=self.device)
         return torch.cat([v_map, a_map, t_map], dim=0)
 
-    def default_coords(self, shape, ref_feat_shape, offset_thw=[0, 0, 0]):
+    def default_coords(self, shape, ref_feat_shape, offset_thw=None):
+        if offset_thw is None:
+            offset_thw = [0, 0, 0]
         return get_coords(
             shape=shape,
             ref_feat_shape=ref_feat_shape,
@@ -228,48 +272,33 @@ class SimplePackedData:
 
     @property
     def total_token_num(self):
-        return sum([item.total_token_num for item in self.items])
+        return sum(item.total_token_num for item in self.items)
 
     def __getitem__(self, index):
         return self.items[index]
 
     @property
     def cu_seqlen(self):
-        cu_seqlen = torch.cumsum(torch.tensor([item.total_token_num for item in self.items]), dim=0)
-        return torch.nn.functional.pad(cu_seqlen, (1, 0))
+        cu = torch.cumsum(torch.tensor([item.total_token_num for item in self.items]), dim=0)
+        return F.pad(cu, (1, 0))
 
     @property
     def max_seqlen(self):
-        return torch.tensor(max([item.total_token_num for item in self.items]))
+        return torch.tensor(max(item.total_token_num for item in self.items))
 
     def depack_token_sequence(self, token_sequence):
-        video_x_t_list = []
-        audio_x_t_list = []
-        token_sequence_list = torch.split(token_sequence, [item.total_token_num for item in self.items], dim=0)
-        for item, ts in zip(self.items, token_sequence_list):
-            video_x_t, audio_x_t = item.depack_token_sequence(ts)
-            video_x_t_list.append(video_x_t)
-            audio_x_t_list.append(audio_x_t)
-        return torch.stack(video_x_t_list, dim=0), torch.stack(audio_x_t_list, dim=0)
+        video_list, audio_list = [], []
+        parts = torch.split(token_sequence, [item.total_token_num for item in self.items], dim=0)
+        for item, part in zip(self.items, parts):
+            v, a = item.depack_token_sequence(part)
+            video_list.append(v)
+            audio_list.append(a)
+        return torch.stack(video_list, dim=0), torch.stack(audio_list, dim=0)
 
 
-def _unfold_3d(x: torch.Tensor, kernel_size: tuple, stride: tuple) -> torch.Tensor:
-    """Pure PyTorch 3D unfold replacement for unfoldAnd.
-    x: (N, C, T, H, W) -> (N, C*kT*kH*kW, num_patches)
-    """
-    N, C, T, H, W = x.shape
-    kT, kH, kW = kernel_size
-    sT, sH, sW = stride
-    oT = (T - kT) // sT + 1
-    oH = (H - kH) // sH + 1
-    oW = (W - kW) // sW + 1
-    # Use unfold along each dimension sequentially
-    x = x.unfold(2, kT, sT).unfold(3, kH, sH).unfold(4, kW, sW)
-    # x: (N, C, oT, oH, oW, kT, kH, kW)
-    x = x.contiguous().view(N, C * kT * kH * kW, oT * oH * oW)
-    return x
-
-
+# ---------------------------------------------------------------------------
+# Main data proxy
+# ---------------------------------------------------------------------------
 class MagiDataProxy:
     def __init__(
         self,
@@ -288,6 +317,8 @@ class MagiDataProxy:
         self.ref_audio_offset = ref_audio_offset
         self.text_offset = text_offset
         self.coords_style = coords_style
+        self._kernel = (t_patch_size, patch_size, patch_size)
+        self._stride = (t_patch_size, patch_size, patch_size)
         self._saved_data: dict[str, Any] = {}
 
     def saved_for_output(self, **kwargs):
@@ -297,16 +328,10 @@ class MagiDataProxy:
         return self._saved_data[key]
 
     def img2tokens(self, x_t: torch.Tensor):
-        """Convert image latents to tokens via 3D unfold."""
-        x_t_unfolded = _unfold_3d(
-            x_t,
-            kernel_size=(self.t_patch_size, self.patch_size, self.patch_size),
-            stride=(self.t_patch_size, self.patch_size, self.patch_size),
-        )
-        x_t = rearrange(x_t_unfolded, "N col_dim num_tokens -> N num_tokens col_dim").contiguous()
-        return x_t
+        x_t_unfolded = _unfold_3d(x_t, self._kernel, self._stride)
+        return rearrange(x_t_unfolded, "N col_dim num_tokens -> N num_tokens col_dim").contiguous()
 
-    def process_input(self, transported_data: "EvalInput"):
+    def process_input(self, transported_data: EvalInput):
         batch_size, _, t, h, w = transported_data.x_t.shape
         x_t = self.img2tokens(transported_data.x_t)
         audio_x_t = transported_data.audio_x_t.contiguous()
@@ -332,8 +357,6 @@ class MagiDataProxy:
             )
             simple_packed_data.items.append(single_data)
 
-        device = transported_data.x_t.device
-
         if self.frame_receptive_field != -1:
             assert batch_size == 1, "local attention only supports batch size 1"
             local_attn_handler = calc_local_attn_ffa_handler(
@@ -341,7 +364,6 @@ class MagiDataProxy:
                 num_audio_and_txt_tokens=simple_packed_data[0].audio_feat_len + simple_packed_data[0].txt_feat_len,
                 num_frames=t,
                 frame_receptive_field=self.frame_receptive_field,
-                device=device,
             )
             if isinstance(local_attn_handler.max_seqlen_k, torch.Tensor):
                 local_attn_handler.max_seqlen_k = local_attn_handler.max_seqlen_k.item()
@@ -351,10 +373,10 @@ class MagiDataProxy:
             local_attn_handler = None
 
         varlen_handler = VarlenHandler(
-            cu_seqlens_q=simple_packed_data.cu_seqlen.to(torch.int32).to(device),
-            cu_seqlens_k=simple_packed_data.cu_seqlen.to(torch.int32).to(device),
-            max_seqlen_q=simple_packed_data.max_seqlen.to(torch.int32).to(device),
-            max_seqlen_k=simple_packed_data.max_seqlen.to(torch.int32).to(device),
+            cu_seqlens_q=simple_packed_data.cu_seqlen.to(torch.int32).cuda(),
+            cu_seqlens_k=simple_packed_data.cu_seqlen.to(torch.int32).cuda(),
+            max_seqlen_q=simple_packed_data.max_seqlen.to(torch.int32).cuda(),
+            max_seqlen_k=simple_packed_data.max_seqlen.to(torch.int32).cuda(),
         )
 
         self.saved_for_output(simple_packed_data=simple_packed_data)
@@ -362,10 +384,8 @@ class MagiDataProxy:
         x = simple_packed_data.token_sequence
         coords_mapping = simple_packed_data.coords_mapping
         modality_mapping = simple_packed_data.modality_mapping
-
         return (x, coords_mapping, modality_mapping, varlen_handler, local_attn_handler)
 
     def process_output(self, x: torch.Tensor):
         simple_packed_data: SimplePackedData = self.get_saved_data("simple_packed_data")
-        x_video, x_audio = simple_packed_data.depack_token_sequence(x)
-        return (x_video, x_audio)
+        return simple_packed_data.depack_token_sequence(x)

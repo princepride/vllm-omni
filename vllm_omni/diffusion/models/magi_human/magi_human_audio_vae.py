@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Ported from daVinci-MagiHuman sa_audio_model + sa_audio_module.
 # Copyright (c) 2026 SandAI. All Rights Reserved.
+# Ported from daVinci-MagiHuman inference/model/sa_audio/
 
 from __future__ import annotations
 
@@ -13,9 +12,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from safetensors.torch import load_file
+from torch import nn
+from torch.nn import functional as F
 from torch.nn.utils import weight_norm
 
 logger = logging.getLogger(__name__)
@@ -65,9 +64,7 @@ class VAEBottleneck(nn.Module):
         mean, scale = x.chunk(2, dim=1)
         x, kl = vae_sample(mean, scale)
         info["kl"] = kl
-        if return_info:
-            return x, info
-        return x
+        return (x, info) if return_info else x
 
     def decode(self, x):
         return x
@@ -81,9 +78,14 @@ def WNConvTranspose1d(*args, **kwargs):
     return weight_norm(nn.ConvTranspose1d(*args, **kwargs))
 
 
+def _checkpoint(function, *args, **kwargs):
+    kwargs.setdefault("use_reentrant", False)
+    return torch.utils.checkpoint.checkpoint(function, *args, **kwargs)
+
+
 def get_activation(activation: Literal["elu", "snake", "none"], antialias: bool = False, channels=None) -> nn.Module:
     if antialias:
-        raise NotImplementedError("antialias activation is not supported")
+        raise NotImplementedError("antialias activation not supported")
     if activation == "elu":
         return nn.ELU()
     if activation == "snake":
@@ -97,28 +99,28 @@ def get_activation(activation: Literal["elu", "snake", "none"], antialias: bool 
 # Encoder / Decoder blocks
 # ---------------------------------------------------------------------------
 class ResidualUnit(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, dilation: int, use_snake: bool = False, **_):
+    def __init__(self, in_channels, out_channels, dilation, use_snake=False, antialias_activation=False):
         super().__init__()
         padding = (dilation * (7 - 1)) // 2
         self.layers = nn.Sequential(
-            get_activation("snake" if use_snake else "elu", channels=out_channels),
+            get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=out_channels),
             WNConv1d(in_channels, out_channels, kernel_size=7, dilation=dilation, padding=padding),
-            get_activation("snake" if use_snake else "elu", channels=out_channels),
+            get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=out_channels),
             WNConv1d(out_channels, out_channels, kernel_size=1),
         )
 
     def forward(self, x):
-        return self.layers(x) + x
+        return (_checkpoint(self.layers, x) if self.training else self.layers(x)) + x
 
 
 class EncoderBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, stride: int, use_snake: bool = False, **_):
+    def __init__(self, in_channels, out_channels, stride, use_snake=False, antialias_activation=False):
         super().__init__()
         self.layers = nn.Sequential(
             ResidualUnit(in_channels, in_channels, 1, use_snake=use_snake),
             ResidualUnit(in_channels, in_channels, 3, use_snake=use_snake),
             ResidualUnit(in_channels, in_channels, 9, use_snake=use_snake),
-            get_activation("snake" if use_snake else "elu", channels=in_channels),
+            get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=in_channels),
             WNConv1d(in_channels, out_channels, kernel_size=2 * stride, stride=stride, padding=math.ceil(stride / 2)),
         )
 
@@ -128,13 +130,7 @@ class EncoderBlock(nn.Module):
 
 class DecoderBlock(nn.Module):
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        stride: int,
-        use_snake: bool = False,
-        use_nearest_upsample: bool = False,
-        **_,
+        self, in_channels, out_channels, stride, use_snake=False, antialias_activation=False, use_nearest_upsample=False
     ):
         super().__init__()
         if use_nearest_upsample:
@@ -144,15 +140,10 @@ class DecoderBlock(nn.Module):
             )
         else:
             upsample_layer = WNConvTranspose1d(
-                in_channels,
-                out_channels,
-                kernel_size=2 * stride,
-                stride=stride,
-                padding=math.ceil(stride / 2),
+                in_channels, out_channels, kernel_size=2 * stride, stride=stride, padding=math.ceil(stride / 2)
             )
-
         self.layers = nn.Sequential(
-            get_activation("snake" if use_snake else "elu", channels=in_channels),
+            get_activation("snake" if use_snake else "elu", antialias=antialias_activation, channels=in_channels),
             upsample_layer,
             ResidualUnit(out_channels, out_channels, 1, use_snake=use_snake),
             ResidualUnit(out_channels, out_channels, 3, use_snake=use_snake),
@@ -184,7 +175,9 @@ class OobleckEncoder(nn.Module):
             )
         layers.extend(
             [
-                get_activation("snake" if use_snake else "elu", channels=c_mults[-1] * channels),
+                get_activation(
+                    "snake" if use_snake else "elu", antialias=antialias_activation, channels=c_mults[-1] * channels
+                ),
                 WNConv1d(c_mults[-1] * channels, latent_dim, kernel_size=3, padding=1),
             ]
         )
@@ -218,12 +211,15 @@ class OobleckDecoder(nn.Module):
                     c_mults[i - 1] * channels,
                     strides[i - 1],
                     use_snake=use_snake,
+                    antialias_activation=antialias_activation,
                     use_nearest_upsample=use_nearest_upsample,
                 )
             )
         layers.extend(
             [
-                get_activation("snake" if use_snake else "elu", channels=c_mults[0] * channels),
+                get_activation(
+                    "snake" if use_snake else "elu", antialias=antialias_activation, channels=c_mults[0] * channels
+                ),
                 WNConv1d(c_mults[0] * channels, out_channels, kernel_size=7, padding=3, bias=False),
                 nn.Tanh() if final_tanh else nn.Identity(),
             ]
@@ -234,6 +230,9 @@ class OobleckDecoder(nn.Module):
         return self.layers(x)
 
 
+# ---------------------------------------------------------------------------
+# Audio autoencoder
+# ---------------------------------------------------------------------------
 class AudioAutoencoder(nn.Module):
     def __init__(
         self,
@@ -267,9 +266,7 @@ class AudioAutoencoder(nn.Module):
         if self.bottleneck is not None and not skip_bottleneck:
             latents, bottleneck_info = self.bottleneck.encode(latents, return_info=True, **kwargs)
             info.update(bottleneck_info)
-        if return_info:
-            return latents, info
-        return latents
+        return (latents, info) if return_info else latents
 
     def decode(self, latents, skip_bottleneck=False, **kwargs):
         if self.bottleneck is not None and not skip_bottleneck:
@@ -281,26 +278,39 @@ class AudioAutoencoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Factory helpers
+# Factories
 # ---------------------------------------------------------------------------
 def _create_encoder_from_config(cfg: dict[str, Any]):
-    assert cfg.get("type") == "oobleck"
-    return OobleckEncoder(**cfg["config"])
+    assert cfg.get("type") == "oobleck", f"Only 'oobleck' encoder supported, got: {cfg.get('type')}"
+    enc = OobleckEncoder(**cfg["config"])
+    if not cfg.get("requires_grad", True):
+        for p in enc.parameters():
+            p.requires_grad = False
+    return enc
 
 
 def _create_decoder_from_config(cfg: dict[str, Any]):
-    assert cfg.get("type") == "oobleck"
-    decoder = OobleckDecoder(**cfg["config"])
-    return decoder
+    assert cfg.get("type") == "oobleck", f"Only 'oobleck' decoder supported, got: {cfg.get('type')}"
+    dec = OobleckDecoder(**cfg["config"])
+    if not cfg.get("requires_grad", True):
+        for p in dec.parameters():
+            p.requires_grad = False
+    return dec
 
 
 def _create_bottleneck_from_config(cfg: dict[str, Any]):
-    assert cfg.get("type") == "vae"
-    return VAEBottleneck()
+    assert cfg.get("type") == "vae", f"Only 'vae' bottleneck supported, got: {cfg.get('type')}"
+    bn = VAEBottleneck()
+    if not cfg.get("requires_grad", True):
+        for p in bn.parameters():
+            p.requires_grad = False
+    return bn
 
 
 def _create_autoencoder_from_config(config: dict[str, Any]):
     ae_config = config["model"]
+    if ae_config.get("pretransform") is not None:
+        raise NotImplementedError("Nested pretransform not supported")
     encoder = _create_encoder_from_config(ae_config["encoder"])
     decoder = _create_decoder_from_config(ae_config["decoder"])
     bottleneck_cfg = ae_config.get("bottleneck")
@@ -319,26 +329,18 @@ def _create_autoencoder_from_config(config: dict[str, Any]):
     )
 
 
-def create_model_from_config(model_config: dict[str, Any]):
-    assert model_config.get("model_type") == "autoencoder"
-    return _create_autoencoder_from_config(model_config)
-
-
 # ---------------------------------------------------------------------------
-# SAAudioFeatureExtractor — main public class
+# Public loader
 # ---------------------------------------------------------------------------
 class SAAudioFeatureExtractor:
-    """Stable Audio Feature Extractor that loads model once and reuses it."""
-
-    def __init__(self, device: str, model_path: str):
+    def __init__(self, device, model_path):
         self.device = device
-        self.vae_model, self.sample_rate = self._get_vae_only(model_path)
+        self.vae_model, self.sample_rate = self._load_vae(model_path)
+        self.resampler = None
 
-    def _get_vae_only(self, model_path: str):
-        """Load VAE only from local Stable Audio directory."""
-        model_path = str(model_path)
-        if not Path(model_path).is_dir():
-            raise RuntimeError(f"Audio VAE model path is not a directory: {model_path}")
+    def _load_vae(self, model_path):
+        if not (isinstance(model_path, str) and Path(model_path).is_dir()):
+            raise ValueError("model_path must be a local directory")
 
         model_config_path = os.path.join(model_path, "model_config.json")
         with open(model_config_path) as f:
@@ -352,21 +354,17 @@ class SAAudioFeatureExtractor:
             "sample_rate": sample_rate,
             "model": vae_config,
         }
-
-        vae_model = create_model_from_config(autoencoder_config)
+        vae_model = _create_autoencoder_from_config(autoencoder_config)
 
         weights_path = Path(model_path) / "model.safetensors"
         if not weights_path.exists():
             raise FileNotFoundError(f"Weight file does not exist: {weights_path}")
 
-        full_state_dict = load_file(str(weights_path), device=self.device)
-
-        # Filter VAE-related weights (prefix: pretransform.model)
+        full_state_dict = load_file(weights_path, device=str(self.device))
         vae_state_dict = {}
         for key, value in full_state_dict.items():
             if key.startswith("pretransform.model."):
-                vae_key = key[len("pretransform.model.") :]
-                vae_state_dict[vae_key] = value
+                vae_state_dict[key[len("pretransform.model.") :]] = value
 
         model_keys = set(vae_model.state_dict().keys())
         vae_keys = set(vae_state_dict.keys())
@@ -375,7 +373,7 @@ class SAAudioFeatureExtractor:
         if missing:
             logger.warning("Audio VAE missing keys (%d): %s", len(missing), list(missing)[:5])
         if extra:
-            logger.warning("Audio VAE extra keys (%d): %s", len(extra), list(extra)[:5])
+            logger.warning("Audio VAE unexpected keys (%d): %s", len(extra), list(extra)[:5])
 
         vae_model.load_state_dict(vae_state_dict)
         vae_model.to(self.device)
