@@ -1554,6 +1554,11 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         self.vae = DistributedAutoencoderKLWan.from_pretrained(model_path, subfolder="vae")
         self.vae.to(device)
         self.vae.eval()
+        vae_config_path = os.path.join(model_path, "vae", "config.json")
+        with open(vae_config_path) as f:
+            vae_cfg = json.load(f)
+        self.vae_latent_mean = torch.tensor(vae_cfg["latents_mean"], dtype=torch.float32)
+        self.vae_latent_std = torch.tensor(vae_cfg["latents_std"], dtype=torch.float32)
 
         self.audio_vae = SAAudioFeatureExtractor(device=device, model_path=os.path.join(model_path, "audio_vae"))
 
@@ -1709,6 +1714,10 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         return vae_out.to(torch.float32)
 
     def _decode_video(self, latent: torch.Tensor) -> list[np.ndarray]:
+        mean = self.vae_latent_mean.to(latent.device, dtype=latent.dtype).view(1, -1, 1, 1, 1)
+        std = self.vae_latent_std.to(latent.device, dtype=latent.dtype).view(1, -1, 1, 1, 1)
+        latent = latent * std + mean
+
         videos = self.vae.decode(latent.to(self.dtype))
         if hasattr(videos, "sample"):
             videos = videos.sample
