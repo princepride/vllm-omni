@@ -1692,8 +1692,8 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         )
         self.video_processor = VideoProcessor(vae_scale_factor=16)
 
-        # SR DiT model (loaded from the 1080p_sr/ subdirectory)
-        sr_dit_subfolder = eval_cfg.get("sr_dit_subfolder", "1080p_sr")
+        # SR DiT model (loaded from the sr/ subdirectory)
+        sr_dit_subfolder = eval_cfg.get("sr_dit_subfolder", "sr")
         sr_dit_config_path = os.path.join(model_path, sr_dit_subfolder, "config.json")
         with open(sr_dit_config_path) as f:
             sr_dit_json = json.load(f)
