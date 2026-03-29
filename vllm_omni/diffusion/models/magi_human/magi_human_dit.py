@@ -409,42 +409,29 @@ def _flash_attn_with_correction(
 
     for q_range, k_ranges in zip(q_ranges, k_range_list):
         q_start, q_end = q_range
-        qo_out, qo_lse = None, None
-        for k_range in k_ranges:
-            k_start, k_end = k_range
-            q_chunk = query[q_start:q_end]
-            k_chunk = key[k_start:k_end]
-            v_chunk = value[k_start:k_end]
-            q_len = q_chunk.shape[0]
-            k_len = k_chunk.shape[0]
-            cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=query.device)
-            cu_k = torch.tensor([0, k_len], dtype=torch.int32, device=query.device)
-            cur_qo_out = _vllm_fa_varlen(
-                q=q_chunk,
-                k=k_chunk,
-                v=v_chunk,
-                cu_seqlens_q=cu_q,
-                cu_seqlens_k=cu_k,
-                max_seqlen_q=q_len,
-                max_seqlen_k=k_len,
-            )
-            cur_qo_lse = torch.zeros((q_len, query.shape[1]), dtype=torch.float32, device=query.device)
-            if qo_out is None:
-                qo_out = cur_qo_out
-                qo_lse = cur_qo_lse
-            else:
-                qo_lse[qo_lse == torch.inf] = -torch.inf
-                cur_qo_lse[cur_qo_lse == torch.inf] = -torch.inf
-                max_lse = torch.max(qo_lse, cur_qo_lse)
-                qo_se = torch.exp(qo_lse - max_lse)
-                cur_qo_se = torch.exp(cur_qo_lse - max_lse)
-                sum_se = qo_se + cur_qo_se
-                qo_out = qo_out * (qo_se / sum_se).permute(1, 0).unsqueeze(-1) + cur_qo_out * (
-                    cur_qo_se / sum_se
-                ).permute(1, 0).unsqueeze(-1)
-                qo_lse = torch.log(sum_se) + max_lse
+        q_chunk = query[q_start:q_end]
+        q_len = q_chunk.shape[0]
+
+        # Concatenate all k_ranges into a single key/value block, then run one
+        # flash-attention call.  This avoids the need to merge per-chunk LSEs.
+        k_parts = [key[ks:ke] for ks, ke in k_ranges]
+        v_parts = [value[ks:ke] for ks, ke in k_ranges]
+        k_combined = torch.cat(k_parts, dim=0) if len(k_parts) > 1 else k_parts[0]
+        v_combined = torch.cat(v_parts, dim=0) if len(v_parts) > 1 else v_parts[0]
+        k_len = k_combined.shape[0]
+
+        cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=query.device)
+        cu_k = torch.tensor([0, k_len], dtype=torch.int32, device=query.device)
+        qo_out = _vllm_fa_varlen(
+            q=q_chunk,
+            k=k_combined,
+            v=v_combined,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=q_len,
+            max_seqlen_k=k_len,
+        )
         output[q_start:q_end] = qo_out
-        output_lse[q_start:q_end, :] = qo_lse.permute(1, 0)
     return output, output_lse
 
 

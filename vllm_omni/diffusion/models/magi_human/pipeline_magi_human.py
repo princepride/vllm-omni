@@ -1449,6 +1449,72 @@ def _resizecrop(img: Image.Image, target_height: int, target_width: int) -> Imag
     return resized_image.crop((left, top, left + target_width, top + target_height))
 
 
+class ZeroSNRDDPMDiscretization:
+    """ZeroSNR DDPM sigma schedule, ported from daVinci-MagiHuman.
+    Used to compute sigma values for SR noise injection.
+    """
+
+    def __init__(
+        self,
+        linear_start: float = 0.00085,
+        linear_end: float = 0.0120,
+        num_timesteps: int = 1000,
+        shift_scale: float = 1.0,
+        keep_start: bool = False,
+        post_shift: bool = False,
+    ):
+        from functools import partial
+
+        if keep_start and not post_shift:
+            linear_start = linear_start / (shift_scale + (1 - shift_scale) * linear_start)
+        self.num_timesteps = num_timesteps
+        betas = torch.linspace(linear_start**0.5, linear_end**0.5, num_timesteps, dtype=torch.float64) ** 2
+        alphas = 1.0 - betas.cpu().numpy()
+        self.alphas_cumprod = np.cumprod(alphas, axis=0)
+        self.to_torch = partial(torch.tensor, dtype=torch.float32)
+        if not post_shift:
+            self.alphas_cumprod = self.alphas_cumprod / (shift_scale + (1 - shift_scale) * self.alphas_cumprod)
+        self.post_shift = post_shift
+        self.shift_scale = shift_scale
+
+    def __call__(
+        self,
+        n: int,
+        do_append_zero: bool = True,
+        device: str = "cpu",
+        flip: bool = False,
+        return_idx: bool = False,
+    ):
+        from functools import partial
+
+        if n < self.num_timesteps:
+            timesteps = np.linspace(self.num_timesteps - 1, 0, n, endpoint=False).astype(int)[::-1]
+            alphas_cumprod = self.alphas_cumprod[timesteps]
+        elif n == self.num_timesteps:
+            alphas_cumprod = self.alphas_cumprod
+        else:
+            raise ValueError(f"n={n} > num_timesteps={self.num_timesteps}")
+
+        to_torch = partial(torch.tensor, dtype=torch.float32, device=device)
+        alphas_cumprod = to_torch(alphas_cumprod)
+        alphas_cumprod_sqrt = alphas_cumprod.sqrt()
+        alphas_cumprod_sqrt_0 = alphas_cumprod_sqrt[0].clone()
+        alphas_cumprod_sqrt_T = alphas_cumprod_sqrt[-1].clone()
+        alphas_cumprod_sqrt -= alphas_cumprod_sqrt_T
+        alphas_cumprod_sqrt *= alphas_cumprod_sqrt_0 / (alphas_cumprod_sqrt_0 - alphas_cumprod_sqrt_T)
+
+        if self.post_shift:
+            alphas_cumprod_sqrt = (
+                alphas_cumprod_sqrt**2 / (self.shift_scale + (1 - self.shift_scale) * alphas_cumprod_sqrt**2)
+            ) ** 0.5
+
+        sigmas = torch.flip(alphas_cumprod_sqrt, (0,))
+        sigmas = torch.cat([sigmas, sigmas.new_zeros([1])]) if do_append_zero else sigmas
+        if return_idx:
+            return sigmas if not flip else torch.flip(sigmas, (0,)), timesteps
+        return sigmas if not flip else torch.flip(sigmas, (0,))
+
+
 def _schedule_latent_step(
     *,
     video_scheduler: FlowUniPCMultistepScheduler,
@@ -1463,13 +1529,19 @@ def _schedule_latent_step(
     is_a2v: bool,
     cfg_number: int,
     using_sde_flag: bool,
+    use_sr_model: bool = False,
 ):
-    if cfg_number == 1:
+    # Fast DDIM path for cfg_number==1, only used during the BR stage
+    if cfg_number == 1 and not use_sr_model:
         latent_video = video_scheduler.step_ddim(v_cfg_video, idx, latent_video)
         latent_audio = audio_scheduler.step_ddim(v_cfg_audio, idx, latent_audio)
         return latent_video, latent_audio
 
     if using_sde_flag:
+        if use_sr_model:
+            # SR stage with SDE: only update video, keep audio unchanged
+            latent_video = video_scheduler.step(v_cfg_video, t, latent_video, return_dict=False)[0]
+            return latent_video, latent_audio
         if idx < int(len(steps) * (3 / 4)):
             noise_theta = 1.0 if (idx + 1) % 2 == 0 else 0.0
         else:
@@ -1480,7 +1552,8 @@ def _schedule_latent_step(
         return latent_video, latent_audio
 
     latent_video = video_scheduler.step(v_cfg_video, t, latent_video, return_dict=False)[0]
-    if not is_a2v:
+    # Do not update audio latent during the SR stage
+    if not is_a2v and not use_sr_model:
         latent_audio = audio_scheduler.step(v_cfg_audio, t, latent_audio, return_dict=False)[0]
     return latent_video, latent_audio
 
@@ -1578,6 +1651,16 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             text_offset=dp_cfg.get("text_offset", 0),
             coords_style=dp_cfg.get("coords_style", "v2"),
         )
+        # SR DataProxy forces v1 coordinate style (consistent with the original)
+        self.sr_data_proxy = MagiDataProxy(
+            patch_size=dp_cfg.get("patch_size", 2),
+            t_patch_size=dp_cfg.get("t_patch_size", 1),
+            frame_receptive_field=dp_cfg.get("frame_receptive_field", 11),
+            spatial_rope_interpolation=dp_cfg.get("spatial_rope_interpolation", "extra"),
+            ref_audio_offset=dp_cfg.get("ref_audio_offset", 1000),
+            text_offset=dp_cfg.get("text_offset", 0),
+            coords_style="v1",
+        )
 
         self.fps = eval_cfg.get("fps", 25)
         self.num_inference_steps_default = eval_cfg.get("num_inference_steps", 32)
@@ -1593,6 +1676,14 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         self.vae_stride = eval_cfg.get("vae_stride", [4, 16, 16])
         self.z_dim = eval_cfg.get("z_dim", 48)
         self.patch_size = eval_cfg.get("patch_size", [1, 2, 2])
+        # SR-specific hyperparameters
+        self.sr_num_inference_steps_default = eval_cfg.get("sr_num_inference_steps", 5)
+        self.sr_cfg_number = eval_cfg.get("sr_cfg_number", 2)
+        self.sr_video_txt_guidance_scale = eval_cfg.get("sr_video_txt_guidance_scale", 3.5)
+        self.noise_value = eval_cfg.get("noise_value", 220)
+        self.sr_audio_noise_scale = eval_cfg.get("sr_audio_noise_scale", 0.7)
+        # ZeroSNR sigma schedule for SR noise injection (flip=True, high to low)
+        self.zerosnr_sigmas = ZeroSNRDDPMDiscretization()(1000, do_append_zero=False, flip=True)
 
         self.context_null, self.original_context_null_len = _get_padded_t5_gemma_embedding(
             _NEGATIVE_PROMPT,
@@ -1601,12 +1692,28 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         )
         self.video_processor = VideoProcessor(vae_scale_factor=16)
 
+        # SR DiT model (loaded from the 1080p_sr/ subdirectory)
+        sr_dit_subfolder = eval_cfg.get("sr_dit_subfolder", "1080p_sr")
+        sr_dit_config_path = os.path.join(model_path, sr_dit_subfolder, "config.json")
+        with open(sr_dit_config_path) as f:
+            sr_dit_json = json.load(f)
+        sr_dit_model_config = MagiHumanDiTConfig(**sr_dit_json)
+        self.sr_dit = DiTModel(sr_dit_model_config)
+        self.sr_dit.eval()
+
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=model_path,
                 subfolder=dit_subfolder,
                 revision=None,
                 prefix="dit.",
+                fall_back_to_pt=True,
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model_path,
+                subfolder=sr_dit_subfolder,
+                revision=None,
+                prefix="sr_dit.",
                 fall_back_to_pt=True,
             ),
         ]
@@ -1620,6 +1727,12 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         noise_pred = self.dit(*packed)
         return self.data_proxy.process_output(noise_pred)
 
+    def _sr_dit_forward(self, eval_input: EvalInput) -> tuple[torch.Tensor, torch.Tensor]:
+        """SR stage uses sr_data_proxy (coords_style=v1) and sr_dit model."""
+        packed = self.sr_data_proxy.process_input(eval_input)
+        noise_pred = self.sr_dit(*packed)
+        return self.sr_data_proxy.process_output(noise_pred)
+
     @torch.inference_mode()
     def _evaluate_with_latent(
         self,
@@ -1630,7 +1743,13 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         latent_audio: torch.Tensor,
         num_inference_steps: int,
         is_a2v: bool = False,
+        use_sr_model: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Select cfg_number and guidance_scale based on BR/SR stage
+        cfg_number = self.sr_cfg_number if use_sr_model else self.cfg_number
+        video_guidance = self.sr_video_txt_guidance_scale if use_sr_model else self.video_txt_guidance_scale
+        forward_fn = self._sr_dit_forward if use_sr_model else self._dit_forward
+
         video_scheduler = FlowUniPCMultistepScheduler()
         audio_scheduler = FlowUniPCMultistepScheduler()
         video_scheduler.set_timesteps(num_inference_steps, device=self.device_str, shift=self.shift)
@@ -1638,22 +1757,19 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         timesteps = video_scheduler.timesteps
 
         latent_length = latent_video.shape[2]
-        sr_video_txt_guidance_scale = (
-            torch.tensor(self.video_txt_guidance_scale, device=self.device_str)
-            .expand(1, 1, latent_length, 1, 1)
-            .clone()
+        cfg_trick_guidance = (
+            torch.tensor(video_guidance, device=self.device_str).expand(1, 1, latent_length, 1, 1).clone()
         )
         if self.use_cfg_trick:
-            sr_video_txt_guidance_scale[:, :, : self.cfg_trick_start_frame] = min(
-                self.cfg_trick_value, self.video_txt_guidance_scale
-            )
+            cfg_trick_guidance[:, :, : self.cfg_trick_start_frame] = min(self.cfg_trick_value, video_guidance)
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for idx, t in enumerate(timesteps):
                 if latent_image is not None:
                     latent_video[:, :, :1] = latent_image[:, :, :1]
 
-                video_txt_guidance_scale = self.video_txt_guidance_scale if t > 500 else 2.0
+                # Reduce guidance when t<=500 during BR stage (original behavior)
+                cur_video_guidance = video_guidance if (use_sr_model or t > 500) else 2.0
 
                 eval_input_cond = EvalInput(
                     x_t=latent_video,
@@ -1663,12 +1779,12 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                     txt_feat_len=[original_context_len],
                 )
 
-                v_cond_video, v_cond_audio = self._dit_forward(eval_input_cond)
+                v_cond_video, v_cond_audio = forward_fn(eval_input_cond)
 
-                if self.cfg_number == 1:
+                if cfg_number == 1:
                     v_cfg_video = v_cond_video
                     v_cfg_audio = v_cond_audio
-                elif self.cfg_number == 2:
+                elif cfg_number == 2:
                     eval_input_uncond = EvalInput(
                         x_t=latent_video,
                         audio_x_t=latent_audio,
@@ -1676,11 +1792,11 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                         txt_feat=self.context_null,
                         txt_feat_len=[self.original_context_null_len],
                     )
-                    v_uncond_video, v_uncond_audio = self._dit_forward(eval_input_uncond)
-                    v_cfg_video = v_uncond_video + video_txt_guidance_scale * (v_cond_video - v_uncond_video)
+                    v_uncond_video, v_uncond_audio = forward_fn(eval_input_uncond)
+                    v_cfg_video = v_uncond_video + cur_video_guidance * (v_cond_video - v_uncond_video)
                     v_cfg_audio = v_uncond_audio + self.audio_txt_guidance_scale * (v_cond_audio - v_uncond_audio)
                 else:
-                    raise ValueError(f"Invalid cfg_number: {self.cfg_number}")
+                    raise ValueError(f"Invalid cfg_number: {cfg_number}")
 
                 latent_video, latent_audio = _schedule_latent_step(
                     video_scheduler=video_scheduler,
@@ -1693,8 +1809,9 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                     v_cfg_video=v_cfg_video,
                     v_cfg_audio=v_cfg_audio,
                     is_a2v=is_a2v,
-                    cfg_number=self.cfg_number,
+                    cfg_number=cfg_number,
                     using_sde_flag=self.using_sde_flag,
+                    use_sr_model=use_sr_model,
                 )
 
                 pbar.update()
@@ -1761,10 +1878,16 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         width = req.sampling_params.width or width
         seed = req.sampling_params.seed if req.sampling_params.seed is not None else seed
         num_steps = req.sampling_params.num_inference_steps or num_inference_steps or self.num_inference_steps_default
+        sr_height: int | None = None
+        sr_width: int | None = None
+        sr_num_steps: int | None = None
         if hasattr(req.sampling_params, "extra_args") and req.sampling_params.extra_args:
             seconds = req.sampling_params.extra_args.get("seconds", seconds)
             audio_path = req.sampling_params.extra_args.get("audio_path", audio_path)
             image_path = req.sampling_params.extra_args.get("image_path", image_path)
+            sr_height = req.sampling_params.extra_args.get("sr_height", None)
+            sr_width = req.sampling_params.extra_args.get("sr_width", None)
+            sr_num_steps = req.sampling_params.extra_args.get("sr_num_inference_steps", None)
 
         device = self.device_str
 
@@ -1809,7 +1932,8 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         else:
             br_image = None
 
-        latent_video, latent_audio = self._evaluate_with_latent(
+        # ── BR stage ─────────────────────────────────────────────────────────
+        br_latent_video, br_latent_audio = self._evaluate_with_latent(
             context,
             original_context_len,
             br_image,
@@ -1817,12 +1941,64 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             latent_audio.clone(),
             num_steps,
             is_a2v,
+            use_sr_model=False,
         )
 
+        # ── SR stage (optional, triggered when sr_height/sr_width are provided) ──
+        if sr_height is not None and sr_width is not None:
+            sr_latent_height = sr_height // self.vae_stride[1] // self.patch_size[1] * self.patch_size[1]
+            sr_latent_width = sr_width // self.vae_stride[2] // self.patch_size[2] * self.patch_size[2]
+            sr_height = sr_latent_height * self.vae_stride[1]
+            sr_width = sr_latent_width * self.vae_stride[2]
+
+            # Image condition (at SR resolution)
+            if image_path is not None:
+                sr_image = self._encode_image(load_image(image_path), sr_height, sr_width)
+            else:
+                sr_image = None
+
+            # Trilinear interpolation of BR latent to SR resolution
+            sr_latent_video = torch.nn.functional.interpolate(
+                br_latent_video,
+                size=(latent_length, sr_latent_height, sr_latent_width),
+                mode="trilinear",
+                align_corners=True,
+            )
+
+            # Noise injection: sigma-weighted blend (noise_value indexes the ZeroSNR sigma schedule)
+            if self.noise_value != 0:
+                noise = torch.randn_like(sr_latent_video)
+                sigma = self.zerosnr_sigmas.to(sr_latent_video.device)[self.noise_value]
+                sr_latent_video = sr_latent_video * sigma + noise * (1 - sigma**2) ** 0.5
+
+            # Audio: blend with noise (noised version used during SR inference; final audio keeps BR result)
+            sr_latent_audio = torch.randn_like(br_latent_audio) * self.sr_audio_noise_scale + br_latent_audio * (
+                1 - self.sr_audio_noise_scale
+            )
+
+            torch.cuda.empty_cache()
+            sr_steps = sr_num_steps or self.sr_num_inference_steps_default
+            final_latent_video, _ = self._evaluate_with_latent(
+                context,
+                original_context_len,
+                sr_image,
+                sr_latent_video.clone(),
+                sr_latent_audio.clone(),
+                sr_steps,
+                is_a2v,
+                use_sr_model=True,
+            )
+            # SR stage does not update audio; keep the BR result
+            final_latent_video = final_latent_video
+            final_latent_audio = br_latent_audio
+        else:
+            final_latent_video = br_latent_video
+            final_latent_audio = br_latent_audio
+
         torch.cuda.empty_cache()
-        videos_np = self._decode_video(latent_video)
+        videos_np = self._decode_video(final_latent_video)
         torch.cuda.empty_cache()
-        audio_np = self._decode_audio(latent_audio)
+        audio_np = self._decode_audio(final_latent_audio)
 
         return DiffusionOutput(
             output=[],
