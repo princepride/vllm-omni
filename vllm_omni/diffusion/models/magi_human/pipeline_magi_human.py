@@ -1608,13 +1608,13 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         self.device_str = device
         self.dtype = od_config.dtype or torch.bfloat16
 
-        pipeline_config_path = os.path.join(model_path, "pipeline_config.json")
-        with open(pipeline_config_path) as f:
-            pipeline_config = json.load(f)
-        eval_cfg = pipeline_config["evaluation"]
-        dp_cfg = pipeline_config["data_proxy"]
+        model_index_path = os.path.join(model_path, "model_index.json")
+        with open(model_index_path) as f:
+            model_index = json.load(f)
+        eval_cfg = model_index
+        dp_cfg = model_index.get("data_proxy", {})
 
-        dit_subfolder = eval_cfg.get("dit_subfolder", "dit")
+        dit_subfolder = "transformer"
 
         dit_config_path = os.path.join(model_path, dit_subfolder, "config.json")
         with open(dit_config_path) as f:
@@ -1693,7 +1693,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         self.video_processor = VideoProcessor(vae_scale_factor=16)
 
         # SR DiT model (loaded from the sr/ subdirectory)
-        sr_dit_subfolder = eval_cfg.get("sr_dit_subfolder", "sr")
+        sr_dit_subfolder = "sr"
         sr_dit_config_path = os.path.join(model_path, sr_dit_subfolder, "config.json")
         with open(sr_dit_config_path) as f:
             sr_dit_json = json.load(f)
