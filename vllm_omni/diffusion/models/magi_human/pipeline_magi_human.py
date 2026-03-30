@@ -1397,12 +1397,15 @@ class EvalInput:
 
 
 class _T5GemmaEncoder:
-    def __init__(self, model_path: str, device: str, weight_dtype: torch.dtype):
+    def __init__(self, model_path: str, device: str, weight_dtype: torch.dtype, subfolder: str | None = None):
         self.device = device
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = T5GemmaEncoderModel.from_pretrained(model_path, is_encoder_decoder=False, dtype=weight_dtype).to(
-            device
-        )
+        hf_kwargs: dict[str, Any] = {}
+        if subfolder is not None:
+            hf_kwargs["subfolder"] = subfolder
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, **hf_kwargs)
+        self.model = T5GemmaEncoderModel.from_pretrained(
+            model_path, is_encoder_decoder=False, dtype=weight_dtype, **hf_kwargs
+        ).to(device)
 
     @torch.inference_mode()
     def encode(self, prompt: str) -> torch.Tensor:
@@ -1598,27 +1601,65 @@ def get_magi_human_post_process_func(*args, **kwargs):
 
 
 # ===========================================================================
+# HF Hub / local path helpers
+# ===========================================================================
+
+
+def _load_json(model_path: str, filename: str, local_files_only: bool = True) -> dict:
+    """Load a JSON config file from a local path or HuggingFace Hub repo."""
+    if local_files_only:
+        path = os.path.join(model_path, *filename.split("/"))
+        with open(path) as f:
+            return json.load(f)
+    else:
+        from huggingface_hub import hf_hub_download
+
+        cached = hf_hub_download(repo_id=model_path, filename=filename)
+        with open(cached) as f:
+            return json.load(f)
+
+
+def _resolve_subdir(
+    model_path: str,
+    subfolder: str,
+    local_files_only: bool = True,
+    required_files: list[str] | None = None,
+) -> str:
+    """Resolve a model subfolder to a local directory path.
+
+    For HF Hub repos, downloads all ``required_files`` (default: ``["config.json"]``)
+    into the HF cache and returns the parent directory.
+    """
+    if local_files_only:
+        return os.path.join(model_path, subfolder)
+    from huggingface_hub import hf_hub_download
+
+    files = required_files or ["config.json"]
+    last_cached: str | None = None
+    for fname in files:
+        last_cached = hf_hub_download(repo_id=model_path, filename=f"{subfolder}/{fname}")
+    return os.path.dirname(last_cached)
+
+
+# ===========================================================================
 # Main Pipeline
 # ===========================================================================
 class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMixin):
     def __init__(self, od_config: OmniDiffusionConfig, **kwargs):
         super().__init__()
         model_path = od_config.model
+        local_files_only = os.path.exists(model_path)
         device = f"cuda:{torch.cuda.current_device()}"
         self.device_str = device
         self.dtype = od_config.dtype or torch.bfloat16
 
-        model_index_path = os.path.join(model_path, "model_index.json")
-        with open(model_index_path) as f:
-            model_index = json.load(f)
+        model_index = _load_json(model_path, "model_index.json", local_files_only)
         eval_cfg = model_index
         dp_cfg = model_index.get("data_proxy", {})
 
         dit_subfolder = "transformer"
 
-        dit_config_path = os.path.join(model_path, dit_subfolder, "config.json")
-        with open(dit_config_path) as f:
-            dit_json = json.load(f)
+        dit_json = _load_json(model_path, f"{dit_subfolder}/config.json", local_files_only)
         dit_model_config = MagiHumanDiTConfig(**dit_json)
 
         self.dit = DiTModel(dit_model_config)
@@ -1627,19 +1668,32 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         self.vae = DistributedAutoencoderKLWan.from_pretrained(model_path, subfolder="vae")
         self.vae.to(device)
         self.vae.eval()
-        vae_config_path = os.path.join(model_path, "vae", "config.json")
-        with open(vae_config_path) as f:
-            vae_cfg = json.load(f)
+        vae_cfg = _load_json(model_path, "vae/config.json", local_files_only)
         self.vae_latent_mean = torch.tensor(vae_cfg["latents_mean"], dtype=torch.float32)
         self.vae_latent_std = torch.tensor(vae_cfg["latents_std"], dtype=torch.float32)
 
-        self.audio_vae = SAAudioFeatureExtractor(device=device, model_path=os.path.join(model_path, "audio_vae"))
+        self.audio_vae = SAAudioFeatureExtractor(
+            device=device,
+            model_path=_resolve_subdir(
+                model_path,
+                "audio_vae",
+                local_files_only,
+                required_files=["config.json", "model_config.json", "model.safetensors"],
+            ),
+        )
 
-        logger.info("Loading T5Gemma text encoder from %s", os.path.join(model_path, "text_encoder"))
+        logger.info("Loading T5Gemma text encoder from %s (subfolder=text_encoder)", model_path)
+        if local_files_only:
+            txt_enc_path = os.path.join(model_path, "text_encoder")
+            txt_enc_subfolder = None
+        else:
+            txt_enc_path = model_path
+            txt_enc_subfolder = "text_encoder"
         self.txt_encoder = _T5GemmaEncoder(
-            model_path=os.path.join(model_path, "text_encoder"),
+            model_path=txt_enc_path,
             device=device,
             weight_dtype=self.dtype,
+            subfolder=txt_enc_subfolder,
         )
 
         self.data_proxy = MagiDataProxy(
@@ -1694,9 +1748,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
 
         # SR DiT model (loaded from the sr/ subdirectory)
         sr_dit_subfolder = "sr"
-        sr_dit_config_path = os.path.join(model_path, sr_dit_subfolder, "config.json")
-        with open(sr_dit_config_path) as f:
-            sr_dit_json = json.load(f)
+        sr_dit_json = _load_json(model_path, f"{sr_dit_subfolder}/config.json", local_files_only)
         sr_dit_model_config = MagiHumanDiTConfig(**sr_dit_json)
         self.sr_dit = DiTModel(sr_dit_model_config)
         self.sr_dit.eval()
