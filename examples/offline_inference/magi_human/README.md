@@ -6,6 +6,28 @@ Because MagiHuman is a very large model featuring a powerful DiT MoE backbone an
 
 ## Setup
 
+### Install MagiCompiler (recommended)
+
+MagiHuman relies on [MagiCompiler](https://github.com/SandAI-org/MagiCompiler) for custom-op registration used by the DiT attention kernels. While the pipeline can fall back to stub implementations, installing MagiCompiler is **strongly recommended** for correct behaviour.
+
+```bash
+# Clone the repo
+git clone https://github.com/SandAI-org/MagiCompiler.git
+cd MagiCompiler
+
+# System dependencies (optional, for FX graph visualization; Debian/Ubuntu)
+sudo apt update && sudo apt install -y graphviz
+
+# Python dependencies
+pip install -r requirements.txt
+
+# Install MagiCompiler
+pip install .          # end users (recommended)
+# pip install -e .     # developers (editable install)
+```
+
+### Hardware requirements
+
 Ensure your hardware has enough VRAM. For a standard node with 80GB GPUs, running with `--tensor-parallel-size 4` is recommended to shard both the MoE weights and the T5Gemma text encoder across 4 GPUs, reducing the per-GPU peak VRAM overhead significantly (by roughly ~13.5GB per GPU compared to single-device inference).
 
 Please refer to the [stage configuration documentation](../../../../configuration/stage_configs/) for further details on allocating memory.
