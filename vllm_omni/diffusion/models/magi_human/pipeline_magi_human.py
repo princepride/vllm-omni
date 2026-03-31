@@ -47,6 +47,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import (
     DiffusersPipelineLoader,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.t5_encoder.t5_gemma_encoder import T5GemmaEncoderModelTP
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -1401,20 +1402,43 @@ class EvalInput:
 
 class _T5GemmaEncoder:
     def __init__(self, model_path: str, device: str, weight_dtype: torch.dtype, subfolder: str | None = None):
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
         self.device = device
         hf_kwargs: dict[str, Any] = {}
         if subfolder is not None:
             hf_kwargs["subfolder"] = subfolder
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, **hf_kwargs)
-        self.model = T5GemmaEncoderModel.from_pretrained(
-            model_path, is_encoder_decoder=False, dtype=weight_dtype, **hf_kwargs
-        ).to(device)
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size > 1:
+            from transformers.models.t5gemma.configuration_t5gemma import T5GemmaConfig
+
+            config = T5GemmaConfig.from_pretrained(model_path, **hf_kwargs)
+            # The config we need is the encoder config
+            config_encoder = config.encoder
+            # Propagate some outer config values
+            config_encoder.vocab_size = config.vocab_size
+            config_encoder.rms_norm_eps = getattr(config, "rms_norm_eps", config_encoder.rms_norm_eps)
+            self.model = T5GemmaEncoderModelTP(config_encoder).to(device).to(weight_dtype)
+            self.is_tp = True
+        else:
+            self.model = T5GemmaEncoderModel.from_pretrained(
+                model_path, is_encoder_decoder=False, dtype=weight_dtype, **hf_kwargs
+            ).to(device)
+            self.is_tp = False
 
     @torch.inference_mode()
     def encode(self, prompt: str) -> torch.Tensor:
         inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
         outputs = self.model(**inputs)
-        return outputs["last_hidden_state"].half()
+
+        if self.is_tp:
+            # T5GemmaEncoderModelTP just returns the hidden states tensor
+            return outputs.half()
+        else:
+            # HF model returns BaseModelOutput
+            return outputs["last_hidden_state"].half()
 
 
 def _pad_or_trim(tensor: torch.Tensor, target_size: int, dim: int, pad_value: float = 0.0) -> tuple[torch.Tensor, int]:
@@ -1795,6 +1819,19 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            # ── Text Encoder weights ──
+            if name.startswith("text_encoder."):
+                if getattr(self.txt_encoder, "is_tp", False):
+                    # Strip "text_encoder." prefix for the T5Gemma TP model
+                    # The T5GemmaEncoderModelTP load_weights handles the "encoder." prefix itself
+                    sub_name = name[len("text_encoder.") :]
+                    loaded_params.update(
+                        f"text_encoder.{k}" for k in self.txt_encoder.model.load_weights([(sub_name, loaded_weight)])
+                    )
+                else:
+                    loaded_params.add(name)
+                continue
+
             # ── Shared attention QKV + Gating split ──
             # Checkpoint: attention.linear_qkv.weight = [Q, K, V, G] fused.
             # Model: attention.linear_qkv.weight (QKVParallelLinear) + attention.linear_gating.weight.
