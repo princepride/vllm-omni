@@ -30,7 +30,7 @@ pip install .          # end users (recommended)
 
 Ensure your hardware has enough VRAM. For a standard node with 80GB GPUs, running with `--tensor-parallel-size 4` is recommended to shard both the MoE weights and the T5Gemma text encoder across 4 GPUs, reducing the per-GPU peak VRAM overhead significantly (by roughly ~13.5GB per GPU compared to single-device inference).
 
-Please refer to the [stage configuration documentation](../../../../configuration/stage_configs/) for further details on allocating memory.
+Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) for further details on allocating memory.
 
 ## Run Examples
 
