@@ -19,6 +19,14 @@ from magi_compiler.api import magi_register_custom_op
 from magi_compiler.config import CompileConfig
 from torch.nn import Parameter
 from torch.nn import functional as F
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+)
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.vllm_flash_attn import flash_attn_varlen_func as _vllm_fa_varlen
 
 
@@ -339,6 +347,182 @@ def create_linear(
 
 
 # ---------------------------------------------------------------------------
+# MoE TP parallel linear wrappers: per-expert vLLM parallel layers
+# ---------------------------------------------------------------------------
+class MoEQKVParallelLinear(nn.Module):
+    """Per-expert QKVParallelLinear with modality dispatch.
+
+    Wraps ``num_experts`` independent QKVParallelLinear instances.
+    Forward: dispatch tokens by modality → per-expert QKV matmul (TP-sharded)
+    → undispatch.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        num_experts: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList(
+            [
+                QKVParallelLinear(
+                    hidden_size=hidden_size,
+                    head_size=head_size,
+                    total_num_heads=total_num_heads,
+                    total_num_kv_heads=total_num_kv_heads,
+                    bias=bias,
+                    return_bias=False,
+                )
+                for _ in range(num_experts)
+            ]
+        )
+        # Expose per-rank head info from the first expert (all are identical).
+        self.num_heads = self.experts[0].num_heads
+        self.num_kv_heads = self.experts[0].num_kv_heads
+        self.head_size = head_size
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> torch.Tensor:
+        x_list = modality_dispatcher.dispatch(x)
+        out_list: list[torch.Tensor] = []
+        for i in range(self.num_experts):
+            out = self.experts[i](x_list[i])
+            out_list.append(out)
+        return modality_dispatcher.undispatch(*out_list)
+
+
+class MoEColumnParallelLinear(nn.Module):
+    """Per-expert ColumnParallelLinear with modality dispatch.
+
+    Forward: dispatch → per-expert column-parallel matmul → undispatch.
+    Output stays TP-local (no gather).
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        num_experts: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList(
+            [
+                ColumnParallelLinear(
+                    input_size=input_size,
+                    output_size=output_size,
+                    bias=bias,
+                    gather_output=False,
+                    return_bias=False,
+                )
+                for _ in range(num_experts)
+            ]
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> torch.Tensor:
+        x_list = modality_dispatcher.dispatch(x)
+        out_list: list[torch.Tensor] = []
+        for i in range(self.num_experts):
+            out = self.experts[i](x_list[i])
+            out_list.append(out)
+        return modality_dispatcher.undispatch(*out_list)
+
+
+class MoERowParallelLinear(nn.Module):
+    """Per-expert RowParallelLinear with modality dispatch.
+
+    Forward: dispatch → per-expert row-parallel matmul (includes all-reduce)
+    → undispatch.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        num_experts: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList(
+            [
+                RowParallelLinear(
+                    input_size=input_size,
+                    output_size=output_size,
+                    bias=bias,
+                    input_is_parallel=True,
+                    return_bias=False,
+                )
+                for _ in range(num_experts)
+            ]
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> torch.Tensor:
+        x_list = modality_dispatcher.dispatch(x)
+        out_list: list[torch.Tensor] = []
+        for i in range(self.num_experts):
+            out = self.experts[i](x_list[i])
+            out_list.append(out)
+        return modality_dispatcher.undispatch(*out_list)
+
+
+def validate_magi_human_tp_constraints(
+    *,
+    hidden_size: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    tensor_parallel_size: int,
+) -> None:
+    """Validate MagiHuman TP divisibility constraints.
+
+    Both shared layers (num_modality == 1) and MoE layers (num_modality == 3)
+    support TP via vLLM's parallel linear layers (QKVParallelLinear /
+    ColumnParallelLinear / RowParallelLinear).  MoE layers use per-expert
+    parallel layers with modality dispatch.
+
+    Supported tp_sizes given default config (hidden=5120, heads_q=40, kv=8): 1, 2, 4.
+    """
+    tp = tensor_parallel_size
+    if tp <= 1:
+        return
+    errors: list[str] = []
+    if num_heads_q % tp != 0:
+        errors.append(f"num_heads_q ({num_heads_q}) must be divisible by tensor_parallel_size ({tp})")
+    if num_heads_kv % tp != 0:
+        errors.append(f"num_heads_kv ({num_heads_kv}) must be divisible by tensor_parallel_size ({tp})")
+    # SWIGLU layers use intermediate = int(hidden * 8/3) // 4 * 4
+    intermediate_swiglu = int(hidden_size * 4 * 2 / 3) // 4 * 4
+    if intermediate_swiglu % tp != 0:
+        errors.append(
+            f"swiglu intermediate_size ({intermediate_swiglu}) must be divisible by "
+            f"tensor_parallel_size ({tp}). Supported tp values: 1, 2, 4"
+        )
+    # GELU7 MoE layers use intermediate = hidden * 4
+    intermediate_gelu = hidden_size * 4
+    if intermediate_gelu % tp != 0:
+        errors.append(f"gelu intermediate_size ({intermediate_gelu}) must be divisible by tensor_parallel_size ({tp})")
+    if errors:
+        raise ValueError("MagiHuman TP constraint violations:\n" + "\n".join(f"  - {e}" for e in errors))
+
+
+# ---------------------------------------------------------------------------
 # Flash attention (no context-parallelism) — uses vllm's flash attention
 # ---------------------------------------------------------------------------
 
@@ -504,27 +688,79 @@ class Attention(torch.nn.Module):
         self.pre_norm = MultiModalityRMSNorm(config.hidden_size, eps=1e-6, num_modality=config.num_modality)
         self.gating_size = config.num_heads_q if config.enable_attn_gating else 0
 
-        self.linear_qkv = create_linear(
-            config.hidden_size,
-            config.num_heads_q * config.head_dim + config.num_heads_kv * config.head_dim * 2 + self.gating_size,
-            num_experts=config.num_modality,
-            bias=False,
-            dtype=config.params_dtype,
-            num_layers=config.num_layers,
-        )
-        self.linear_proj = create_linear(
-            config.num_heads_q * config.head_dim,
-            config.hidden_size,
-            bias=False,
-            num_experts=config.num_modality,
-            dtype=config.params_dtype,
-            num_layers=config.num_layers,
-        )
+        # Both shared blocks (num_modality == 1) and MoE blocks (num_modality > 1)
+        # use vLLM's parallel linear layers for TP support.
+        # MoE blocks wrap per-expert parallel layers with modality dispatch.
+        if config.num_modality == 1:
+            # QKVParallelLinear handles GQA head-sharding for any tp_size.
+            # The combined checkpoint weight [Q, K, V, G] is split during
+            # load_weights: Q+K+V → linear_qkv, G → linear_gating.
+            self.linear_qkv = QKVParallelLinear(
+                hidden_size=config.hidden_size,
+                head_size=config.head_dim,
+                total_num_heads=config.num_heads_q,
+                total_num_kv_heads=config.num_heads_kv,
+                bias=False,
+                return_bias=False,
+            )
+            self.linear_proj = RowParallelLinear(
+                input_size=config.num_heads_q * config.head_dim,
+                output_size=config.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                return_bias=False,
+            )
+            if config.enable_attn_gating:
+                self.linear_gating = ColumnParallelLinear(
+                    input_size=config.hidden_size,
+                    output_size=config.num_heads_q,
+                    bias=False,
+                    gather_output=False,
+                    return_bias=False,
+                )
+            else:
+                self.linear_gating = None
+        else:
+            # MoE blocks: per-expert TP-sharded parallel layers.
+            self.linear_qkv = MoEQKVParallelLinear(
+                hidden_size=config.hidden_size,
+                head_size=config.head_dim,
+                total_num_heads=config.num_heads_q,
+                total_num_kv_heads=config.num_heads_kv,
+                num_experts=config.num_modality,
+                bias=False,
+            )
+            self.linear_proj = MoERowParallelLinear(
+                input_size=config.num_heads_q * config.head_dim,
+                output_size=config.hidden_size,
+                num_experts=config.num_modality,
+                bias=False,
+            )
+            if config.enable_attn_gating:
+                self.linear_gating = MoEColumnParallelLinear(
+                    input_size=config.hidden_size,
+                    output_size=config.num_heads_q,
+                    num_experts=config.num_modality,
+                    bias=False,
+                )
+            else:
+                self.linear_gating = None
+
         self.q_norm = MultiModalityRMSNorm(config.head_dim, num_modality=config.num_modality)
         self.k_norm = MultiModalityRMSNorm(config.head_dim, num_modality=config.num_modality)
 
-        self.q_size = config.num_heads_q * config.head_dim
-        self.kv_size = config.num_heads_kv * config.head_dim
+        # q_size / kv_size reflect the per-rank head count when tp > 1.
+        # Both shared and MoE QKV layers expose .num_heads / .num_kv_heads.
+        if config.num_modality == 1:
+            self.q_size = self.linear_qkv.num_heads * config.head_dim
+            self.kv_size = self.linear_qkv.num_kv_heads * config.head_dim
+            self._local_heads_q = self.linear_qkv.num_heads
+            self._local_heads_kv = self.linear_qkv.num_kv_heads
+        else:
+            self.q_size = self.linear_qkv.num_heads * config.head_dim
+            self.kv_size = self.linear_qkv.num_kv_heads * config.head_dim
+            self._local_heads_q = self.linear_qkv.num_heads
+            self._local_heads_kv = self.linear_qkv.num_kv_heads
 
     def forward(
         self,
@@ -537,13 +773,28 @@ class Attention(torch.nn.Module):
         modality_dispatcher: ModalityDispatcher,
     ) -> torch.Tensor:
         hidden_states = self.pre_norm(hidden_states, modality_dispatcher=modality_dispatcher).to(torch.bfloat16)
-        qkv: torch.Tensor = self.linear_qkv(hidden_states, modality_dispatcher=modality_dispatcher).to(torch.float32)
 
-        q, k, v, g = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size, self.gating_size], dim=1)
-        q = q.view(-1, self.config.num_heads_q, self.config.head_dim)
-        k = k.view(-1, self.config.num_heads_kv, self.config.head_dim)
-        v = v.view(-1, self.config.num_heads_kv, self.config.head_dim)
-        g = g.view(k.shape[0], self.config.num_heads_q, -1)
+        if self.config.num_modality == 1:
+            # vLLM parallel layers with return_bias=False return a single tensor.
+            qkv = self.linear_qkv(hidden_states).to(torch.float32)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.linear_gating is not None:
+                g = self.linear_gating(hidden_states).to(torch.float32)
+            else:
+                g = hidden_states.new_empty(hidden_states.shape[0], 0)
+        else:
+            # MoE TP path: per-expert QKV parallel layers.
+            qkv = self.linear_qkv(hidden_states, modality_dispatcher=modality_dispatcher).to(torch.float32)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.linear_gating is not None:
+                g = self.linear_gating(hidden_states, modality_dispatcher=modality_dispatcher).to(torch.float32)
+            else:
+                g = hidden_states.new_empty(hidden_states.shape[0], 0)
+
+        q = q.view(-1, self._local_heads_q, self.config.head_dim)
+        k = k.view(-1, self._local_heads_kv, self.config.head_dim)
+        v = v.view(-1, self._local_heads_kv, self.config.head_dim)
+        g = g.view(k.shape[0], self._local_heads_q, -1)
 
         q = self.q_norm(q, modality_dispatcher=modality_dispatcher)
         k = self.k_norm(k, modality_dispatcher=modality_dispatcher)
@@ -565,7 +816,9 @@ class Attention(torch.nn.Module):
         if self.config.enable_attn_gating:
             self_attn_out = self_attn_out * torch.sigmoid(g)
 
-        self_attn_out = self_attn_out.view(-1, self.config.num_heads_q * self.config.head_dim).to(torch.bfloat16)
+        self_attn_out = self_attn_out.view(-1, self._local_heads_q * self.config.head_dim).to(torch.bfloat16)
+        if self.config.num_modality == 1:
+            return self.linear_proj(self_attn_out)
         return self.linear_proj(self_attn_out, modality_dispatcher=modality_dispatcher)
 
 
@@ -591,26 +844,51 @@ class MLP(torch.nn.Module):
         num_experts = config.num_modality
         self.pre_norm = MultiModalityRMSNorm(config.hidden_size, num_modality=config.num_modality)
         intermediate_size_up = config.intermediate_size * 2 if config.gated_act else config.intermediate_size
-        self.up_gate_proj = create_linear(
-            config.hidden_size,
-            intermediate_size_up,
-            bias=False,
-            dtype=config.params_dtype,
-            num_layers=config.num_layers,
-            num_experts=num_experts,
-        )
-        self.down_proj = create_linear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-            dtype=config.params_dtype,
-            num_layers=config.num_layers,
-            num_experts=num_experts,
-        )
+
+        # Both shared blocks (num_experts == 1) and MoE blocks (num_experts > 1)
+        # use vLLM's parallel linear layers for TP support.
+        if num_experts == 1:
+            # ColumnParallelLinear shards the output dim uniformly.  For
+            # SWIGLU7 the interleaved [up0, gate0, up1, gate1, ...] format
+            # is preserved within each rank's contiguous slice, so swiglu7
+            # (which uses x[..., ::2] / x[..., 1::2]) still works correctly.
+            self.up_gate_proj = ColumnParallelLinear(
+                input_size=config.hidden_size,
+                output_size=intermediate_size_up,
+                bias=False,
+                gather_output=False,
+                return_bias=False,
+            )
+            self.down_proj = RowParallelLinear(
+                input_size=config.intermediate_size,
+                output_size=config.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                return_bias=False,
+            )
+        else:
+            # MoE blocks: per-expert TP-sharded parallel layers.
+            self.up_gate_proj = MoEColumnParallelLinear(
+                input_size=config.hidden_size,
+                output_size=intermediate_size_up,
+                num_experts=num_experts,
+                bias=False,
+            )
+            self.down_proj = MoERowParallelLinear(
+                input_size=config.intermediate_size,
+                output_size=config.hidden_size,
+                num_experts=num_experts,
+                bias=False,
+            )
         self.activation_func = create_activation_func(config.activation_type)
 
     def forward(self, x: torch.Tensor, modality_dispatcher: ModalityDispatcher) -> torch.Tensor:
         x = self.pre_norm(x, modality_dispatcher=modality_dispatcher).to(torch.bfloat16)
+        if isinstance(self.up_gate_proj, ColumnParallelLinear):
+            x = self.up_gate_proj(x).to(torch.float32)
+            x = self.activation_func(x).to(torch.bfloat16)
+            return self.down_proj(x).to(torch.float32)
+        # MoE TP path: per-expert column/row parallel layers.
         x = self.up_gate_proj(x, modality_dispatcher=modality_dispatcher).to(torch.float32)
         x = self.activation_func(x).to(torch.bfloat16)
         x = self.down_proj(x, modality_dispatcher=modality_dispatcher).to(torch.float32)
@@ -798,6 +1076,12 @@ class DiTModel(torch.nn.Module):
 
     def __init__(self, model_config: Any):
         super().__init__()
+        validate_magi_human_tp_constraints(
+            hidden_size=model_config.hidden_size,
+            num_heads_q=model_config.hidden_size // model_config.head_dim,
+            num_heads_kv=model_config.num_query_groups,
+            tensor_parallel_size=get_tensor_model_parallel_world_size(),
+        )
         self.config = TransformerConfig(
             hidden_size=model_config.hidden_size,
             video_in_channels=model_config.video_in_channels,

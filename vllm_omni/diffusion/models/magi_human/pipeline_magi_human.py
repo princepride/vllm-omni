@@ -34,7 +34,10 @@ from torch.nn import functional as F
 from torch.nn.utils import weight_norm
 from transformers import AutoTokenizer
 from transformers.models.t5gemma import T5GemmaEncoderModel
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
@@ -1771,8 +1774,170 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        # Weight loading for MagiHuman DiT with TP support.
+        #
+        # The checkpoint stores weights with these naming patterns:
+        #   - attention.linear_qkv.weight: fused [Q, K, V, G] for shared layers,
+        #     or stacked per-expert [expert0_Q|K|V|G, expert1_..., expert2_...] for MoE.
+        #   - attention.linear_proj.weight: single for shared, stacked per-expert for MoE.
+        #   - mlp.up_gate_proj.weight / mlp.down_proj.weight: similarly stacked for MoE.
+        #
+        # The model now uses per-expert vLLM parallel layers for MoE blocks:
+        #   attention.linear_qkv.experts.{i}.weight  (QKVParallelLinear per expert)
+        #   attention.linear_gating.experts.{i}.weight  (ColumnParallelLinear per expert)
+        #   attention.linear_proj.experts.{i}.weight  (RowParallelLinear per expert)
+        #   mlp.up_gate_proj.experts.{i}.weight  (ColumnParallelLinear per expert)
+        #   mlp.down_proj.experts.{i}.weight  (RowParallelLinear per expert)
+        #
+        # Shared layers keep the same naming (no .experts.).
+        params_dict = dict(self.named_parameters())
+        modules_dict = dict(self.named_modules())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            # ── Shared attention QKV + Gating split ──
+            # Checkpoint: attention.linear_qkv.weight = [Q, K, V, G] fused.
+            # Model: attention.linear_qkv.weight (QKVParallelLinear) + attention.linear_gating.weight.
+            if "attention.linear_qkv.weight" in name:
+                gating_name = name.replace("attention.linear_qkv.weight", "attention.linear_gating.weight")
+                # Check if this is a shared layer (direct param exists, no .experts.)
+                if name in params_dict and gating_name in params_dict:
+                    qkv_param = params_dict[name]
+                    gating_param = params_dict[gating_name]
+
+                    mod_path = name[: -len(".weight")]
+                    qkv_mod = modules_dict.get(mod_path)
+                    if qkv_mod is not None and hasattr(qkv_mod, "total_num_heads"):
+                        total_heads_q = qkv_mod.total_num_heads
+                        total_heads_kv = qkv_mod.total_num_kv_heads
+                        head_dim = qkv_mod.head_size
+                    else:
+                        head_dim = 128
+                        tp_size = get_tensor_model_parallel_world_size()
+                        total_heads_q = gating_param.data.shape[0] * tp_size
+                        total_heads_kv = (loaded_weight.shape[0] - total_heads_q * head_dim - total_heads_q) // (
+                            2 * head_dim
+                        )
+
+                    q_size = total_heads_q * head_dim
+                    kv_size = total_heads_kv * head_dim
+
+                    q_w = loaded_weight[:q_size]
+                    k_w = loaded_weight[q_size : q_size + kv_size]
+                    v_w = loaded_weight[q_size + kv_size : q_size + 2 * kv_size]
+                    g_w = loaded_weight[q_size + 2 * kv_size :]
+
+                    qkv_loader = getattr(qkv_param, "weight_loader", default_weight_loader)
+                    qkv_loader(qkv_param, q_w, "q")
+                    qkv_loader(qkv_param, k_w, "k")
+                    qkv_loader(qkv_param, v_w, "v")
+
+                    gating_loader = getattr(gating_param, "weight_loader", default_weight_loader)
+                    gating_loader(gating_param, g_w)
+
+                    loaded_params.add(name)
+                    loaded_params.add(gating_name)
+                    continue
+
+                # ── MoE attention QKV + Gating split ──
+                # Checkpoint: attention.linear_qkv.weight = stacked [expert0_QKVG, expert1_QKVG, ...].
+                # Model: attention.linear_qkv.experts.{i}.weight (QKVParallelLinear per expert)
+                #       + attention.linear_gating.experts.{i}.weight (ColumnParallelLinear per expert).
+                expert0_name = name.replace("attention.linear_qkv.weight", "attention.linear_qkv.experts.0.weight")
+                if expert0_name in params_dict:
+                    # Determine num_experts by checking which expert indices exist.
+                    moe_qkv_mod_path = name[: -len(".weight")]
+                    moe_qkv_mod = modules_dict.get(moe_qkv_mod_path)
+                    num_experts = moe_qkv_mod.num_experts if moe_qkv_mod is not None else 3
+
+                    # Get head info from the first expert's QKVParallelLinear.
+                    expert0_mod_path = name.replace("attention.linear_qkv.weight", "attention.linear_qkv.experts.0")
+                    expert0_mod = modules_dict.get(expert0_mod_path)
+                    if expert0_mod is not None and hasattr(expert0_mod, "total_num_heads"):
+                        total_heads_q = expert0_mod.total_num_heads
+                        total_heads_kv = expert0_mod.total_num_kv_heads
+                        head_dim = expert0_mod.head_size
+                    else:
+                        head_dim = 128
+                        # Infer from checkpoint weight shape.
+                        # We'll get exact sizes from model config below.
+                        total_heads_q = 40  # fallback for default config
+                        total_heads_kv = 8
+
+                    q_size = total_heads_q * head_dim
+                    kv_size = total_heads_kv * head_dim
+                    # Check if gating is present.
+                    gating_expert0_name = name.replace(
+                        "attention.linear_qkv.weight", "attention.linear_gating.experts.0.weight"
+                    )
+                    has_gating = gating_expert0_name in params_dict
+
+                    # Split stacked checkpoint weight into per-expert chunks.
+                    expert_weights = loaded_weight.chunk(num_experts, dim=0)
+
+                    for i in range(num_experts):
+                        expert_w = expert_weights[i]
+                        # Each expert chunk: [Q, K, V, G (optional)].
+                        q_w = expert_w[:q_size]
+                        k_w = expert_w[q_size : q_size + kv_size]
+                        v_w = expert_w[q_size + kv_size : q_size + 2 * kv_size]
+
+                        expert_param_name = name.replace(
+                            "attention.linear_qkv.weight",
+                            f"attention.linear_qkv.experts.{i}.weight",
+                        )
+                        expert_param = params_dict[expert_param_name]
+                        expert_loader = getattr(expert_param, "weight_loader", default_weight_loader)
+                        expert_loader(expert_param, q_w, "q")
+                        expert_loader(expert_param, k_w, "k")
+                        expert_loader(expert_param, v_w, "v")
+                        loaded_params.add(expert_param_name)
+
+                        if has_gating:
+                            g_w = expert_w[q_size + 2 * kv_size :]
+                            gating_param_name = name.replace(
+                                "attention.linear_qkv.weight",
+                                f"attention.linear_gating.experts.{i}.weight",
+                            )
+                            gating_param = params_dict[gating_param_name]
+                            gating_loader = getattr(gating_param, "weight_loader", default_weight_loader)
+                            gating_loader(gating_param, g_w)
+                            loaded_params.add(gating_param_name)
+                    continue
+
+            # ── MoE stacked weight splitting for proj / MLP layers ──
+            # Checkpoint: x.y.weight (stacked [expert0, expert1, ...]).
+            # Model: x.y.experts.{i}.weight.
+            if name not in params_dict:
+                # Check if this is a stacked MoE weight by looking for .experts.0.
+                base, _, suffix = name.rpartition(".")
+                expert0_name = f"{base}.experts.0.{suffix}" if base else None
+                if expert0_name and expert0_name in params_dict:
+                    # Determine num_experts.
+                    moe_mod = modules_dict.get(base)
+                    num_experts = getattr(moe_mod, "num_experts", 3) if moe_mod is not None else 3
+
+                    # Split stacked weight into per-expert chunks.
+                    expert_weights = loaded_weight.chunk(num_experts, dim=0)
+                    for i in range(num_experts):
+                        expert_param_name = f"{base}.experts.{i}.{suffix}"
+                        if expert_param_name not in params_dict:
+                            continue
+                        expert_param = params_dict[expert_param_name]
+                        expert_loader = getattr(expert_param, "weight_loader", default_weight_loader)
+                        expert_loader(expert_param, expert_weights[i])
+                        loaded_params.add(expert_param_name)
+                    continue
+                # Truly unknown weight — skip.
+                continue
+
+            # ── Standard weight loading (shared layers + non-MoE params) ──
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
+        return loaded_params
 
     def _dit_forward(self, eval_input: EvalInput) -> tuple[torch.Tensor, torch.Tensor]:
         packed = self.data_proxy.process_input(eval_input)
