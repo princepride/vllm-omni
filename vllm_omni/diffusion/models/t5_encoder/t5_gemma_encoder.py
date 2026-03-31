@@ -270,6 +270,12 @@ class T5GemmaEncoderModelTP(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            # HF checkpoint keys may carry a "model." prefix (e.g.
+            # "model.encoder.layers.0...").  Strip it so the rest of the
+            # logic only needs to handle the "encoder.*" namespace.
+            if name.startswith("model."):
+                name = name[len("model.") :]
+
             if not name.startswith("encoder."):
                 continue
 

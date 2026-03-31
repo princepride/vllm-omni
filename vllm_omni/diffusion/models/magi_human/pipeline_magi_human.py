@@ -1796,6 +1796,16 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                 fall_back_to_pt=True,
             ),
         ]
+        if getattr(self.txt_encoder, "is_tp", False):
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=model_path,
+                    subfolder="text_encoder",
+                    revision=None,
+                    prefix="text_encoder.",
+                    fall_back_to_pt=True,
+                ),
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Weight loading for MagiHuman DiT with TP support.
@@ -1973,6 +1983,13 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        if getattr(self.txt_encoder, "is_tp", False):
+            self.context_null, self.original_context_null_len = _get_padded_t5_gemma_embedding(
+                _NEGATIVE_PROMPT,
+                self.txt_encoder,
+                self.t5_gemma_target_length,
+            )
 
         return loaded_params
 
