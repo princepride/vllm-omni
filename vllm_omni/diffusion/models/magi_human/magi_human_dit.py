@@ -14,9 +14,6 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
-from magi_compiler import magi_compile
-from magi_compiler.api import magi_register_custom_op
-from magi_compiler.config import CompileConfig
 from torch.nn import Parameter
 from torch.nn import functional as F
 from vllm.distributed import (
@@ -28,6 +25,29 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.vllm_flash_attn import flash_attn_varlen_func as _vllm_fa_varlen
+
+try:
+    from magi_compiler.api import magi_register_custom_op
+    from magi_compiler.config import CompileConfig
+except Exception:
+
+    class CompileConfig:  # type: ignore[no-redef]
+        pass
+
+    def magi_register_custom_op(*args, **kwargs):  # type: ignore[no-redef]
+        def decorator(func):
+            return func
+
+        return decorator
+
+
+def magi_compile(*args, **kwargs):
+    """No-op stub — vllm-omni handles execution; magi compilation is skipped."""
+
+    def decorator(cls_or_fn):
+        return cls_or_fn
+
+    return decorator
 
 
 # ---------------------------------------------------------------------------
