@@ -2,50 +2,35 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """End-to-end tests for MagiHuman pipeline via vLLM-Omni."""
 
+import numpy as np
 import pytest
 
 from tests.utils import hardware_test
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.platforms import current_omni_platform
-
-# Reference pixel data extracted from the first frame of the known-good output video
-# Generated with seed=52, num_inference_steps=8, etc.
-REFERENCE_PIXELS = [
-    {"position": (100, 100), "rgb": (0, 0, 0)},
-    {"position": (400, 50), "rgb": (0, 0, 0)},
-    {"position": (700, 100), "rgb": (0, 0, 0)},
-    {"position": (150, 400), "rgb": (0, 0, 0)},
-    {"position": (512, 512), "rgb": (0, 0, 0)},
-    {"position": (256, 256), "rgb": (0, 0, 0)},
-]
-
-if current_omni_platform.is_rocm():
-    REFERENCE_PIXELS = [
-        {"position": (100, 100), "rgb": (0, 0, 0)},
-        {"position": (400, 50), "rgb": (0, 0, 0)},
-        {"position": (700, 100), "rgb": (0, 0, 0)},
-        {"position": (150, 400), "rgb": (0, 0, 0)},
-        {"position": (512, 512), "rgb": (0, 0, 0)},
-        {"position": (256, 256), "rgb": (0, 0, 0)},
-    ]
-
-PIXEL_TOLERANCE = 5
 
 
-def _validate_video_pixels(
-    video_np,
-    reference_pixels: list = REFERENCE_PIXELS,
-    tolerance: int = PIXEL_TOLERANCE,
-) -> None:
-    first_frame = video_np[0]
-    for ref in reference_pixels:
-        x, y = ref["position"]
-        expected = ref["rgb"]
-        actual = first_frame[y, x][:3]
-        assert all(abs(int(a) - int(e)) <= tolerance for a, e in zip(actual, expected)), (
-            f"Pixel mismatch at ({x}, {y}): expected {expected}, got {tuple(actual)}"
-        )
+def _validate_video_quality(video_np: np.ndarray) -> None:
+    """Validate that the video contains meaningful content (not black/corrupt).
+
+    Diffusion outputs vary across TP sizes and hardware, so we check
+    statistical properties rather than exact pixel values.
+    """
+    assert video_np.dtype == np.uint8, f"Expected uint8, got {video_np.dtype}"
+
+    first_frame = video_np[0].astype(np.float32)
+
+    mean_val = first_frame.mean()
+    assert mean_val > 30, f"Video appears mostly black: mean pixel value {mean_val:.1f} (expected > 30)"
+    assert mean_val < 240, f"Video appears mostly white: mean pixel value {mean_val:.1f} (expected < 240)"
+
+    std_val = first_frame.std()
+    assert std_val > 10, f"Video has near-zero variance (solid color): std {std_val:.1f} (expected > 10)"
+
+    non_zero_ratio = np.count_nonzero(first_frame) / first_frame.size
+    assert non_zero_ratio > 0.5, f"Too many zero pixels: {non_zero_ratio:.2%} non-zero (expected > 50%)"
+
+    assert not np.any(np.isnan(first_frame)), "Video contains NaN values"
 
 
 @pytest.mark.core_model
@@ -126,6 +111,6 @@ def test_magi_human_e2e(run_level):
             f"Unexpected video shape: {video_np.shape}"
         )
 
-        _validate_video_pixels(video_np)
+        _validate_video_quality(video_np)
     finally:
         omni.close()
