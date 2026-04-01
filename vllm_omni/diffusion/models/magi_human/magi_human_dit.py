@@ -1093,6 +1093,11 @@ class TransformerConfig:
 # ---------------------------------------------------------------------------
 class DiTModel(torch.nn.Module):
     config: TransformerConfig
+    _layerwise_offload_blocks_attr = "blocks"
+
+    @property
+    def blocks(self) -> nn.ModuleList:
+        return self.block.layers
 
     def __init__(self, model_config: Any):
         super().__init__()

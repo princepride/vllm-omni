@@ -1716,7 +1716,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         else:
             txt_enc_path = model_path
             txt_enc_subfolder = "text_encoder"
-        self.txt_encoder = _T5GemmaEncoder(
+        self.text_encoder = _T5GemmaEncoder(
             model_path=txt_enc_path,
             device=device,
             weight_dtype=self.dtype,
@@ -1768,7 +1768,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
 
         self.context_null, self.original_context_null_len = _get_padded_t5_gemma_embedding(
             _NEGATIVE_PROMPT,
-            self.txt_encoder,
+            self.text_encoder,
             self.t5_gemma_target_length,
         )
         self.video_processor = VideoProcessor(vae_scale_factor=16)
@@ -1796,7 +1796,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
                 fall_back_to_pt=True,
             ),
         ]
-        if getattr(self.txt_encoder, "is_tp", False):
+        if getattr(self.text_encoder, "is_tp", False):
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=model_path,
@@ -1831,12 +1831,12 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         for name, loaded_weight in weights:
             # ── Text Encoder weights ──
             if name.startswith("text_encoder."):
-                if getattr(self.txt_encoder, "is_tp", False):
+                if getattr(self.text_encoder, "is_tp", False):
                     # Strip "text_encoder." prefix for the T5Gemma TP model
                     # The T5GemmaEncoderModelTP load_weights handles the "encoder." prefix itself
                     sub_name = name[len("text_encoder.") :]
                     loaded_params.update(
-                        f"text_encoder.{k}" for k in self.txt_encoder.model.load_weights([(sub_name, loaded_weight)])
+                        f"text_encoder.{k}" for k in self.text_encoder.model.load_weights([(sub_name, loaded_weight)])
                     )
                 else:
                     loaded_params.add(name)
@@ -1984,10 +1984,10 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        if getattr(self.txt_encoder, "is_tp", False):
+        if getattr(self.text_encoder, "is_tp", False):
             self.context_null, self.original_context_null_len = _get_padded_t5_gemma_embedding(
                 _NEGATIVE_PROMPT,
-                self.txt_encoder,
+                self.text_encoder,
                 self.t5_gemma_target_length,
             )
 
@@ -2194,7 +2194,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
 
         context, original_context_len = _get_padded_t5_gemma_embedding(
             prompt,
-            self.txt_encoder,
+            self.text_encoder,
             self.t5_gemma_target_length,
         )
 
