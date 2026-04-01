@@ -1,61 +1,7 @@
 import argparse
-import os
-import subprocess
-import tempfile
-
-import imageio
-import soundfile as sf
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-
-def merge_video_and_audio(video_path: str, audio_path: str, save_path: str):
-    cmd = [
-        "ffmpeg",
-        "-i",
-        video_path,
-        "-i",
-        audio_path,
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-shortest",
-        "-y",
-        save_path,
-        "-loglevel",
-        "error",
-    ]
-    subprocess.run(cmd, check=True)
-
-
-def save_output(custom: dict, save_path: str, fps: int = 25, sample_rate: int = 44100):
-    video_np = custom.get("video")
-    audio_np = custom.get("audio")
-
-    if video_np is None:
-        print("No video to save.")
-        return
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        video_tmp = os.path.join(tmpdir, "video.mp4")
-        imageio.mimwrite(video_tmp, video_np, fps=fps, quality=8, output_params=["-loglevel", "error"])
-
-        if audio_np is not None:
-            audio_tmp = os.path.join(tmpdir, "audio.wav")
-            sf.write(audio_tmp, audio_np, sample_rate)
-            merge_video_and_audio(video_tmp, audio_tmp, save_path)
-        else:
-            import shutil
-
-            shutil.copy2(video_tmp, save_path)
-
-    print(f"Saved to {save_path}")
 
 
 def parse_args():
@@ -77,8 +23,6 @@ def parse_args():
     parser.add_argument("--width", type=int, default=448, help="Video width.")
     parser.add_argument("--num-inference-steps", type=int, default=8, help="Number of denoising steps.")
     parser.add_argument("--seed", type=int, default=52, help="Random seed for generation.")
-    parser.add_argument("--fps", type=int, default=25, help="Video FPS.")
-    parser.add_argument("--audio-sample-rate", type=int, default=44100, help="Audio sample rate.")
     return parser.parse_args()
 
 
@@ -93,7 +37,6 @@ def main():
         devices=list(range(args.tensor_parallel_size)),
     )
 
-    # Use default highly-detailed prompt if none provided
     prompt = args.prompt
     if not prompt:
         prompt = (
@@ -144,10 +87,11 @@ def main():
     print(f"Generation complete. Output type: {type(outputs)}")
     if outputs:
         first = outputs[0]
-        req_out = first.request_output
-        if hasattr(req_out, "custom_output") and req_out.custom_output:
-            custom = req_out.custom_output
-            save_output(custom, args.output, fps=args.fps, sample_rate=args.audio_sample_rate)
+        if hasattr(first, "images") and first.images:
+            video_bytes = first.images[0]
+            with open(args.output, "wb") as f:
+                f.write(video_bytes)
+            print(f"Saved MP4 ({len(video_bytes)} bytes) to {args.output}")
         print("SUCCESS: MagiHuman pipeline generation completed.")
     else:
         print("WARNING: No outputs returned.")

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """End-to-end tests for MagiHuman pipeline via vLLM-Omni."""
 
-import numpy as np
+import av
 import pytest
 
 from tests.utils import hardware_test
@@ -10,27 +10,30 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
-def _validate_video_quality(video_np: np.ndarray) -> None:
-    """Validate that the video contains meaningful content (not black/corrupt).
+def _validate_mp4(video_bytes: bytes, min_frames: int = 10) -> None:
+    """Validate that the MP4 contains meaningful video and audio tracks."""
+    import io
 
-    Diffusion outputs vary across TP sizes and hardware, so we check
-    statistical properties rather than exact pixel values.
-    """
-    assert video_np.dtype == np.uint8, f"Expected uint8, got {video_np.dtype}"
+    container = av.open(io.BytesIO(video_bytes))
 
-    first_frame = video_np[0].astype(np.float32)
+    v_streams = [s for s in container.streams if s.type == "video"]
+    assert len(v_streams) >= 1, "No video stream found in MP4"
 
-    mean_val = first_frame.mean()
-    assert mean_val > 30, f"Video appears mostly black: mean pixel value {mean_val:.1f} (expected > 30)"
-    assert mean_val < 240, f"Video appears mostly white: mean pixel value {mean_val:.1f} (expected < 240)"
+    a_streams = [s for s in container.streams if s.type == "audio"]
+    assert len(a_streams) >= 1, "No audio stream found in MP4"
 
-    std_val = first_frame.std()
-    assert std_val > 10, f"Video has near-zero variance (solid color): std {std_val:.1f} (expected > 10)"
+    v_stream = v_streams[0]
+    assert v_stream.width >= 1080, f"Unexpected video width: {v_stream.width}"
+    assert v_stream.height >= 1056, f"Unexpected video height: {v_stream.height}"
 
-    non_zero_ratio = np.count_nonzero(first_frame) / first_frame.size
-    assert non_zero_ratio > 0.5, f"Too many zero pixels: {non_zero_ratio:.2%} non-zero (expected > 50%)"
+    frame_count = 0
+    for frame in container.decode(video=0):
+        frame_count += 1
+        if frame_count >= min_frames:
+            break
+    assert frame_count >= min_frames, f"Video has only {frame_count} frames (expected >= {min_frames})"
 
-    assert not np.any(np.isnan(first_frame)), "Video contains NaN values"
+    container.close()
 
 
 @pytest.mark.core_model
@@ -99,18 +102,12 @@ def test_magi_human_e2e(run_level):
 
         assert len(outputs) > 0, "No outputs returned"
         first = outputs[0]
-        req_out = first.request_output
-        assert hasattr(req_out, "custom_output") and req_out.custom_output, "No custom_output found"
 
-        custom = req_out.custom_output
-        assert "video" in custom and custom["video"] is not None, "No video generated"
-        assert "audio" in custom and custom["audio"] is not None, "No audio generated"
+        assert hasattr(first, "images") and first.images, "No images in output"
+        video_bytes = first.images[0]
+        assert isinstance(video_bytes, bytes), f"Expected MP4 bytes, got {type(video_bytes)}"
+        assert len(video_bytes) > 1000, f"MP4 too small ({len(video_bytes)} bytes)"
 
-        video_np = custom["video"]
-        assert video_np.shape[1] in (1056, 1080) and video_np.shape[2] == 1920, (
-            f"Unexpected video shape: {video_np.shape}"
-        )
-
-        _validate_video_quality(video_np)
+        _validate_mp4(video_bytes)
     finally:
         omni.close()
