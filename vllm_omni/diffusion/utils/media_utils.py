@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import io
+from fractions import Fraction
 
 import av
 import numpy as np
@@ -37,7 +38,7 @@ def mux_video_audio_bytes(
     buf = io.BytesIO()
     container = av.open(buf, mode="w", format="mp4")
 
-    v_stream = container.add_stream(video_codec, rate=fps)
+    v_stream = container.add_stream(video_codec, rate=Fraction(fps).limit_denominator(10000))
     v_stream.width = video_frames.shape[2]
     v_stream.height = video_frames.shape[1]
     v_stream.pix_fmt = "yuv420p"
