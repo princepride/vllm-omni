@@ -41,6 +41,8 @@ def expand_cfg_prompts(
     For text2img (modalities contains "image", no multi_modal_data with image):
       - One extra prompt for cfg_text (negative/empty prompt)
       - cfg_img reuses gen KV for text2img, so no extra prompt needed
+      - In think mode: cfg_img is also needed (gen decodes thinking tokens,
+        so cfg_img = gen's prefill-only KV without thinking)
 
     For text2text or img2text: returns empty list (no expansion needed).
 
@@ -60,13 +62,16 @@ def expand_cfg_prompts(
         return []
 
     neg_prompt = _get_negative_prompt(prompt, sampling_params)
+    think = prompt.get("think", False)
+    sys_prompt = prompt.get("think_system_prompt", "")
 
     if "image" in modalities:
+        cfg_text_prompt = f"{sys_prompt}{neg_prompt}" if think else neg_prompt
         neg_prompt_dict = {
-            "prompt": neg_prompt,
+            "prompt": cfg_text_prompt,
             "modalities": prompt.get("modalities", []),
         }
-        return [
+        expansions = [
             ExpandedPrompt(
                 prompt=neg_prompt_dict,
                 role="cfg_text",
@@ -74,11 +79,31 @@ def expand_cfg_prompts(
             ),
         ]
 
+        if think:
+            # In think mode the gen request decodes thinking tokens, making
+            # its KV cache differ from a prefill-only snapshot.  cfg_img
+            # uses the same prompt as gen so its prefill-only KV represents
+            # the context *without* thinking — matching the reference impl.
+            cfg_img_dict: dict[str, Any] = {
+                "prompt": prompt.get("prompt", ""),
+                "modalities": prompt.get("modalities", []),
+            }
+            expansions.append(
+                ExpandedPrompt(
+                    prompt=cfg_img_dict,
+                    role="cfg_img",
+                    request_id_suffix=CFG_IMG_SUFFIX,
+                ),
+            )
+
+        return expansions
+
     if "img2img" in modalities:
         IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
 
+        cfg_text_prefix = f"{sys_prompt}{IMG2IMG_PLACEHOLDER}" if think else IMG2IMG_PLACEHOLDER
         cfg_text_dict: dict[str, Any] = {
-            "prompt": f"{IMG2IMG_PLACEHOLDER}{neg_prompt}",
+            "prompt": f"{cfg_text_prefix}{neg_prompt}",
             "modalities": ["img2img"],
         }
         mm_data = prompt.get("multi_modal_data")

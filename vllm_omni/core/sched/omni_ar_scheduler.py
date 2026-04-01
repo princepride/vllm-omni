@@ -75,12 +75,33 @@ class OmniARScheduler(VLLMScheduler):
             return None
 
         omni_kv_config = getattr(self.vllm_config.model_config, "omni_kv_config", None)
-        if omni_kv_config:
-            if isinstance(omni_kv_config, dict):
-                return omni_kv_config.get("kv_transfer_criteria", None)
-            else:
-                return getattr(omni_kv_config, "kv_transfer_criteria", None)
-        return None
+        if not omni_kv_config:
+            return None
+
+        if isinstance(omni_kv_config, dict):
+            criteria = omni_kv_config.get("kv_transfer_criteria", None)
+        else:
+            criteria = getattr(omni_kv_config, "kv_transfer_criteria", None)
+
+        if criteria and criteria.get("type") == "think_model" and "token_id" not in criteria:
+            # Auto-resolve: use the model's EOS token so the gen branch
+            # triggers KV transfer via special_token when it finishes.
+            try:
+                hf_config = self.vllm_config.model_config.hf_config
+                eos = getattr(hf_config, "eos_token_id", None)
+                if isinstance(eos, list):
+                    eos = eos[0]
+                if eos is not None:
+                    criteria = dict(criteria)
+                    criteria["token_id"] = eos
+                    logger.info(
+                        "[Omni] think_model: auto-resolved token_id=%d from eos_token_id",
+                        eos,
+                    )
+            except Exception:
+                logger.warning("[Omni] think_model: failed to auto-resolve token_id from eos_token_id")
+
+        return criteria
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -144,6 +165,45 @@ class OmniARScheduler(VLLMScheduler):
 
                 # Do NOT stop request
                 return False
+
+        elif criteria_type == "think_model":
+            # Think-model mode: CFG companions transfer KV after prefill;
+            # the primary (gen) request decodes thinking text and transfers
+            # KV via special_token when its end token is generated.
+            cfg_suffixes = self.kv_transfer_criteria.get("cfg_suffixes", [])
+            is_cfg = any(request.request_id.endswith(suffix) for suffix in cfg_suffixes)
+
+            if is_cfg:
+                # CFG branches: prefill_finished behaviour
+                if request.num_computed_tokens >= request.num_prompt_tokens:
+                    logger.debug(
+                        "[Omni] CFG request %s triggered prefill_finished transfer (think_model)",
+                        request.request_id,
+                    )
+                    self.transfer_triggered_requests.add(request.request_id)
+                    self._mark_request_for_kv_transfer(request.request_id, request.num_computed_tokens)
+                    return False
+            else:
+                # Gen (primary) branch: special_token behaviour
+                target_token_id = self.kv_transfer_criteria.get("token_id")
+                if target_token_id is not None and target_token_id in new_token_ids:
+                    logger.debug(
+                        "[Omni] Gen request %s triggered special_token transfer (think_model)",
+                        request.request_id,
+                    )
+                    self.transfer_triggered_requests.add(request.request_id)
+
+                    try:
+                        idx = new_token_ids.index(target_token_id)
+                        tokens_to_exclude = len(new_token_ids) - (idx + 1)
+                        snapshot_len = request.num_computed_tokens - tokens_to_exclude
+                    except ValueError:
+                        snapshot_len = request.num_computed_tokens
+
+                    self._mark_request_for_kv_transfer(request.request_id, snapshot_len)
+                    return False
+
+            return False
 
         return False
 
@@ -298,11 +358,14 @@ class OmniARScheduler(VLLMScheduler):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
-            # If criteria returns True, it means we must STOP the request.
-            # If criteria returns False, it might have triggered a background
-            # transfer (e.g. prefill finished / special token) but continues decoding.
-            if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
-                stopped = True
+            # Check KV transfer criteria.  Must run even when the request
+            # is already stopped because for think_model the gen branch's
+            # trigger token (e.g. <|im_end|>) coincides with the normal
+            # stop token — the special_token KV snapshot must still be
+            # recorded before _free_request runs.
+            kv_trigger_stopped = self._process_kv_transfer_trigger(request, new_token_ids)
+            if not stopped:
+                stopped = kv_trigger_stopped
 
             if stopped:
                 routed_experts = self._get_routed_experts(request)

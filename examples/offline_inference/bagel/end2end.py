@@ -76,6 +76,17 @@ def parse_args():
         default=None,
         help="Quantization method (e.g. 'fp8').",
     )
+    parser.add_argument(
+        "--think",
+        action="store_true",
+        help="Enable thinking mode: the AR stage generates a planning/reasoning chain before producing the image.",
+    )
+    parser.add_argument(
+        "--max-think-tokens",
+        type=int,
+        default=4096,
+        help="Max tokens the thinker may generate in think mode.",
+    )
 
     args = parser.parse_args()
     return args
@@ -110,8 +121,21 @@ def main():
     from vllm_omni.entrypoints.omni import Omni
 
     omni_kwargs = {}
-    if args.stage_configs_path:
-        omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    stage_configs_path = args.stage_configs_path
+    if stage_configs_path is None and args.think:
+        stage_configs_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "vllm_omni",
+            "model_executor",
+            "stage_configs",
+            "bagel_think.yaml",
+        )
+        print(f"[Info] Think mode enabled, using stage config: {stage_configs_path}")
+    if stage_configs_path:
+        omni_kwargs["stage_configs_path"] = stage_configs_path
 
     omni_kwargs.update(
         {
@@ -130,13 +154,27 @@ def main():
 
     omni = Omni(model=model_name, **omni_kwargs)
 
+    GEN_THINK_SYSTEM_PROMPT = (
+        "You should first think about the planning process in the mind "
+        "and then generate the image. The planning process is enclosed "
+        "within <think> </think> tags, i.e. <think> planning process "
+        "here </think> image here"
+    )
+    VLM_THINK_SYSTEM_PROMPT = (
+        "You should first think about the reasoning process in the mind "
+        "and then provide the user with the answer. The reasoning process "
+        "is enclosed within <think> </think> tags, i.e. <think> reasoning "
+        "process here </think> answer here"
+    )
+
     formatted_prompts = []
     for p in prompts:
         if args.modality == "img2img":
             if not args.image_path or not os.path.exists(args.image_path):
                 raise ValueError(f"img2img requires --image-path pointing to an existing file, got: {args.image_path}")
             loaded_image = Image.open(args.image_path).convert("RGB")
-            final_prompt_text = f"<|fim_middle|><|im_start|>{p}<|im_end|>"
+            sys_prefix = GEN_THINK_SYSTEM_PROMPT if args.think else ""
+            final_prompt_text = f"{sys_prefix}<|fim_middle|><|im_start|>{p}<|im_end|>"
             prompt_dict = {
                 "prompt": final_prompt_text,
                 "multi_modal_data": {"img2img": loaded_image},
@@ -144,11 +182,20 @@ def main():
             }
             if args.negative_prompt is not None:
                 prompt_dict["negative_prompt"] = args.negative_prompt
+            if args.think:
+                prompt_dict["think"] = True
+                prompt_dict["think_system_prompt"] = GEN_THINK_SYSTEM_PROMPT
             formatted_prompts.append(prompt_dict)
         elif args.modality == "img2text":
             if args.image_path:
                 loaded_image = Image.open(args.image_path).convert("RGB")
-                final_prompt_text = f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                if args.think:
+                    final_prompt_text = (
+                        f"{VLM_THINK_SYSTEM_PROMPT}"
+                        f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                    )
+                else:
+                    final_prompt_text = f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
                 prompt_dict = {
                     "prompt": final_prompt_text,
                     "multi_modal_data": {"image": loaded_image},
@@ -156,17 +203,26 @@ def main():
                 }
                 formatted_prompts.append(prompt_dict)
         elif args.modality == "text2text":
-            final_prompt_text = f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
+            if args.think:
+                final_prompt_text = f"{VLM_THINK_SYSTEM_PROMPT}<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
+            else:
+                final_prompt_text = f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
             prompt_dict = {"prompt": final_prompt_text, "modalities": ["text"]}
             formatted_prompts.append(prompt_dict)
         else:
-            final_prompt_text = f"<|im_start|>{p}<|im_end|>"
+            sys_prefix = GEN_THINK_SYSTEM_PROMPT if args.think else ""
+            final_prompt_text = f"{sys_prefix}<|im_start|>{p}<|im_end|>"
             prompt_dict = {"prompt": final_prompt_text, "modalities": ["image"]}
             if args.negative_prompt is not None:
                 prompt_dict["negative_prompt"] = args.negative_prompt
+            if args.think:
+                prompt_dict["think"] = True
+                prompt_dict["think_system_prompt"] = GEN_THINK_SYSTEM_PROMPT
             formatted_prompts.append(prompt_dict)
 
     params_list = omni.default_sampling_params_list
+    if args.think and len(params_list) > 0:
+        params_list[0].max_tokens = args.max_think_tokens  # type: ignore
     if args.modality in ("text2img", "img2img"):
         if len(params_list) > 1:
             diffusion_params = params_list[1]
@@ -186,6 +242,12 @@ def main():
 
     img_idx = 0
     for req_output in omni_outputs:
+        text_output = getattr(req_output, "text", None)
+        if text_output and args.think:
+            print(f"[Think] Request {img_idx} thinking output:")
+            print(text_output)
+            print("-" * 60)
+
         images = getattr(req_output, "images", None)
 
         if not images:
