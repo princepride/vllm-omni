@@ -52,7 +52,6 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 
 from .magi_human_dit import (
     DiTModel,
@@ -1623,6 +1622,9 @@ def get_magi_human_pre_process_func(*args, **kwargs):
 
 def get_magi_human_post_process_func(*args, **kwargs):
     def post_process(output):
+        if isinstance(output, tuple) and len(output) == 2:
+            video, audio = output
+            return {"video": video, "audio": audio}
         return output
 
     return post_process
@@ -2272,10 +2274,4 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         torch.cuda.empty_cache()
         audio_np = self._decode_audio(final_latent_audio)
 
-        video_bytes = mux_video_audio_bytes(
-            videos_np[0],
-            audio_np,
-            fps=self.fps,
-            audio_sample_rate=self.audio_vae.sample_rate,
-        )
-        return DiffusionOutput(output=video_bytes)
+        return DiffusionOutput(output=(videos_np, audio_np))

@@ -2,18 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """End-to-end tests for MagiHuman pipeline via vLLM-Omni."""
 
+import io
+
 import av
+import numpy as np
 import pytest
 
 from tests.utils import hardware_test
+from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
 def _validate_mp4(video_bytes: bytes, min_frames: int = 10) -> None:
     """Validate that the MP4 contains meaningful video and audio tracks."""
-    import io
-
     container = av.open(io.BytesIO(video_bytes))
 
     v_streams = [s for s in container.streams if s.type == "video"]
@@ -103,8 +105,22 @@ def test_magi_human_e2e(run_level):
         assert len(outputs) > 0, "No outputs returned"
         first = outputs[0]
 
-        assert hasattr(first, "images") and first.images, "No images in output"
-        video_bytes = first.images[0]
+        assert hasattr(first, "images") and first.images, "No video frames in output"
+        video_frames = first.images[0]
+        assert isinstance(video_frames, np.ndarray), f"Expected numpy array, got {type(video_frames)}"
+        assert video_frames.ndim == 4, f"Expected 4D array (T,H,W,3), got shape {video_frames.shape}"
+
+        audio_waveform = None
+        if hasattr(first, "multimodal_output") and first.multimodal_output:
+            audio_waveform = first.multimodal_output.get("audio")
+        assert audio_waveform is not None, "No audio waveform in multimodal_output"
+
+        video_bytes = mux_video_audio_bytes(
+            video_frames,
+            audio_waveform,
+            fps=25.0,
+            audio_sample_rate=44100,
+        )
         assert isinstance(video_bytes, bytes), f"Expected MP4 bytes, got {type(video_bytes)}"
         assert len(video_bytes) > 1000, f"MP4 too small ({len(video_bytes)} bytes)"
 

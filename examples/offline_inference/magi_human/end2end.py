@@ -1,5 +1,6 @@
 import argparse
 
+from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -87,8 +88,23 @@ def main():
     print(f"Generation complete. Output type: {type(outputs)}")
     if outputs:
         first = outputs[0]
+
         if hasattr(first, "images") and first.images:
-            video_bytes = first.images[0]
+            video_frames = first.images[0]
+            print(f"Video frames: shape={video_frames.shape}, dtype={video_frames.dtype}")
+
+            audio_waveform = None
+            if hasattr(first, "multimodal_output") and first.multimodal_output:
+                audio_waveform = first.multimodal_output.get("audio")
+                if audio_waveform is not None:
+                    print(f"Audio waveform: shape={audio_waveform.shape}, dtype={audio_waveform.dtype}")
+
+            video_bytes = mux_video_audio_bytes(
+                video_frames,
+                audio_waveform,
+                fps=25.0,
+                audio_sample_rate=44100,
+            )
             with open(args.output, "wb") as f:
                 f.write(video_bytes)
             print(f"Saved MP4 ({len(video_bytes)} bytes) to {args.output}")
