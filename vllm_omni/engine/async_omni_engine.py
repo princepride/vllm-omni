@@ -722,14 +722,13 @@ class AsyncOmniEngine:
             cid = f"{parent_id}{ep.request_id_suffix}"
             companion_prompt = ep.prompt
 
-            # Apply companion-specific sampling params override if provided
-            companion_params = stage0_params
-            if ep.sampling_params_override:
-                companion_params = stage0_params.clone()
-                for k, v in ep.sampling_params_override.items():
-                    setattr(companion_params, k, v)
+            # Build companion-specific params and sampling_params_list.
+            # When the expansion declares overrides (e.g. max_tokens=1 for
+            # think-mode companions), clone and patch; otherwise reuse as-is.
+            companion_params, companion_spl = self._build_companion_params(
+                stage0_params, sampling_params_list, ep.sampling_params_override
+            )
 
-            # Run through same input processing as the main prompt
             if isinstance(companion_prompt, dict):
                 _inject_global_id(companion_prompt, cid)
 
@@ -750,12 +749,6 @@ class AsyncOmniEngine:
                 queue=None,
             )
 
-            companion_spl = sampling_params_list
-            if ep.sampling_params_override:
-                companion_spl = list(sampling_params_list)
-                if companion_spl:
-                    companion_spl[0] = companion_params
-
             self.request_queue.sync_q.put_nowait(
                 {
                     "type": "add_companion_request",
@@ -772,6 +765,23 @@ class AsyncOmniEngine:
             parent_id,
             len(expanded),
         )
+
+    @staticmethod
+    def _build_companion_params(
+        base_params: Any,
+        base_spl: list[Any],
+        overrides: dict[str, Any] | None,
+    ) -> tuple[Any, list[Any]]:
+        """Return (params, sampling_params_list) for a companion request."""
+        if not overrides:
+            return base_params, base_spl
+        patched = base_params.clone()
+        for k, v in overrides.items():
+            setattr(patched, k, v)
+        spl = list(base_spl)
+        if spl:
+            spl[0] = patched
+        return patched, spl
 
     @staticmethod
     def _get_default_cache_config(cache_backend: str | None) -> dict[str, Any] | None:

@@ -533,6 +533,62 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
     def get_kv_transfer_metadata(self, req_id: str) -> dict[str, Any] | None:
         return self._ropes_metadata.pop(req_id, None)
 
+    def finalize_kv_metadata(
+        self,
+        req_id: str,
+        metadata: dict[str, Any],
+        num_computed_tokens: int,
+    ) -> dict[str, Any]:
+        """Correct rope value at KV-transfer time.
+
+        During think-mode img2img, the prefill rope doesn't account for
+        decoded thinking tokens.  The corrected value is
+        ``num_computed_tokens + offset`` where *offset* was stored during
+        the position-rewriting prefill.
+        """
+        offset = self._decode_position_offsets.pop(req_id, 0)
+        if offset != 0 and "ropes" in metadata:
+            metadata["ropes"] = [num_computed_tokens + offset]
+        return metadata
+
+    def prepare_runner_inputs(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        req_ids: list[str],
+        num_computed_tokens: list[int],
+        num_scheduled_tokens: list[int],
+        input_ids_buffer: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Model-runner hook: adjust inputs before ``forward()``.
+
+        Returns ``(input_ids, positions)`` — possibly modified.
+
+        Two adjustments for BAGEL img2img:
+
+        1. **Restore input_ids** when ``inputs_embeds`` is present so that
+           ``_adjust_positions_for_img2img`` can locate the
+           ``<|fim_middle|>`` placeholder.
+        2. **Decode position offset**: prefill rewrites positions to a
+           compact scheme (rope ≪ prefill_len).  The runner assigns decode
+           positions from ``num_computed_tokens``, which is far too large;
+           apply the stored per-request offset.
+        """
+        if inputs_embeds is not None and input_ids is None and input_ids_buffer is not None:
+            input_ids = input_ids_buffer
+
+        if self._decode_position_offsets and positions is not None:
+            token_start = 0
+            for i, rid in enumerate(req_ids):
+                sched = num_scheduled_tokens[i]
+                offset = self._decode_position_offsets.get(rid, 0)
+                if offset != 0 and num_computed_tokens[i] > 0:
+                    positions[token_start : token_start + sched] += offset
+                token_start += sched
+
+        return input_ids, positions
+
     def flush_pending_metadata(self, req_ids: list[str]) -> None:
         """Map pending metadata (batch order) to req_ids after forward()."""
         pending = self._ropes_pending
