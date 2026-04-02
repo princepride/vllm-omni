@@ -196,6 +196,8 @@ def expand_cfg_prompts_think(
             "prompt": cfg_img_text,
             "modalities": ["img2img"],
         }
+        if mm_data:
+            cfg_img_dict["multi_modal_data"] = mm_data
 
         return [
             ExpandedPrompt(

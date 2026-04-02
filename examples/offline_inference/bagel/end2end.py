@@ -2,6 +2,7 @@ import argparse
 import os
 
 from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.model_executor.stage_input_processors.bagel import GEN_THINK_SYSTEM_PROMPT
 
 
 def parse_args():
@@ -151,20 +152,13 @@ def main():
 
     omni = Omni(model=model_name, **omni_kwargs)
 
-    think_system_prompt = (
-        "You should first think about the planning process in the mind "
-        "and then generate the image. \n"
-        "The planning process is enclosed within <think> </think> tags, "
-        "i.e. <think> planning process here </think> image here"
-    )
-
     formatted_prompts = []
     for p in prompts:
         if args.modality == "img2img":
             if not args.image_path or not os.path.exists(args.image_path):
                 raise ValueError(f"img2img requires --image-path pointing to an existing file, got: {args.image_path}")
             loaded_image = Image.open(args.image_path).convert("RGB")
-            think_prefix = f"<|im_start|>{think_system_prompt}<|im_end|>" if args.think else ""
+            think_prefix = f"<|im_start|>{GEN_THINK_SYSTEM_PROMPT}<|im_end|>" if args.think else ""
             final_prompt_text = f"{think_prefix}<|fim_middle|><|im_start|>{p}<|im_end|>"
             prompt_dict = {
                 "prompt": final_prompt_text,
@@ -189,7 +183,7 @@ def main():
             prompt_dict = {"prompt": final_prompt_text, "modalities": ["text"]}
             formatted_prompts.append(prompt_dict)
         else:
-            think_prefix = f"<|im_start|>{think_system_prompt}<|im_end|>" if args.think else ""
+            think_prefix = f"<|im_start|>{GEN_THINK_SYSTEM_PROMPT}<|im_end|>" if args.think else ""
             final_prompt_text = f"{think_prefix}<|im_start|>{p}<|im_end|>"
             prompt_dict = {"prompt": final_prompt_text, "modalities": ["image"]}
             if args.negative_prompt is not None:

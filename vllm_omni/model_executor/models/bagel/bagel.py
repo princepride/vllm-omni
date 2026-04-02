@@ -712,10 +712,15 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             num_vit = vit_emb.shape[0] + 2
             info = (num_vae, num_vit, int(H), int(W))
             self._pending_img2img_info.append(info)
-            # Only set up the companion queue for the main request (when queue
-            # is empty). Companion requests also call _process_img2img_input
-            # but should NOT create their own companion queue entries.
-            if not self._cfg_companion_queue:
+            # Only the gen (main) request should add a companion queue entry.
+            # Companion requests (cfg_text, cfg_img) also call this method with
+            # the same image, so guard by checking whether this exact info
+            # tuple is already enqueued.  For batched img2img with multiple
+            # concurrent gen requests this correctly adds one entry per unique
+            # image; images with identical (num_vae, num_vit, H, W) that arrive
+            # in the same batch are indistinguishable here and will share one
+            # entry, but that is an uncommon edge case.
+            if not any(entry[0] == info for entry in self._cfg_companion_queue):
                 self._cfg_companion_queue.append((info, 2))  # cfg_text + cfg_img
 
         return tuple(results)
@@ -832,29 +837,29 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
                     img_start = start + pre_text_len
                     post_text_start = img_start + num_img2img
-                    # M = pre_text_len: position base for image tokens
-                    M = pre_text_len
+                    # pre_text_pos: position base for image tokens
+                    pre_text_pos = pre_text_len
 
-                    # Pre-image text: sequential positions 0..M-1
+                    # Pre-image text: sequential positions 0..pre_text_pos-1
                     if pre_text_len > 0:
                         new_positions[start:img_start] = torch.arange(
-                            0, M, device=positions.device, dtype=positions.dtype
+                            0, pre_text_pos, device=positions.device, dtype=positions.dtype
                         )
 
-                    # VAE tokens: all share position M
-                    new_positions[img_start : img_start + num_vae] = M
-                    # Separator: position M
-                    new_positions[img_start + num_vae] = M
-                    # ViT tokens: all share position M+1
+                    # VAE tokens: all share position pre_text_pos
+                    new_positions[img_start : img_start + num_vae] = pre_text_pos
+                    # Separator: position pre_text_pos
+                    new_positions[img_start + num_vae] = pre_text_pos
+                    # ViT tokens: all share position pre_text_pos+1
                     vit_start = img_start + num_vae + 1
-                    new_positions[vit_start : vit_start + num_vit] = M + 1
+                    new_positions[vit_start : vit_start + num_vit] = pre_text_pos + 1
 
-                    # Post-image text: sequential positions M+2, M+3, ...
+                    # Post-image text: sequential positions pre_text_pos+2, pre_text_pos+3, ...
                     num_post_text = end - post_text_start
                     if num_post_text > 0:
                         new_positions[post_text_start:end] = torch.arange(
-                            M + 2,
-                            M + 2 + num_post_text,
+                            pre_text_pos + 2,
+                            pre_text_pos + 2 + num_post_text,
                             device=positions.device,
                             dtype=positions.dtype,
                         )
@@ -865,7 +870,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                     if vae_patches_end > vae_patches_start:
                         vae_mask[vae_patches_start:vae_patches_end] = True
 
-                    rope = M + 2 + num_post_text
+                    rope = pre_text_pos + 2 + num_post_text
                     self._ropes_pending.append(
                         {
                             "ropes": [rope],
