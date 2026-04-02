@@ -530,26 +530,22 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         self._decode_position_offsets.clear()
         self._vae_token_mask = None
 
-    def get_kv_transfer_metadata(self, req_id: str) -> dict[str, Any] | None:
-        return self._ropes_metadata.pop(req_id, None)
-
-    def finalize_kv_metadata(
+    def get_kv_transfer_metadata(
         self,
         req_id: str,
-        metadata: dict[str, Any],
-        num_computed_tokens: int,
-    ) -> dict[str, Any]:
-        """Correct rope value at KV-transfer time.
-
-        During think-mode img2img, the prefill rope doesn't account for
-        decoded thinking tokens.  The corrected value is
-        ``num_computed_tokens + offset`` where *offset* was stored during
-        the position-rewriting prefill.
-        """
+        *,
+        num_computed_tokens: int | None = None,
+    ) -> dict[str, Any] | None:
+        meta = self._ropes_metadata.pop(req_id, None)
+        if meta is None:
+            return None
+        # In think-mode img2img the prefill rope doesn't account for decoded
+        # thinking tokens; correct it to num_computed_tokens + offset.
+        # Skip correction when num_computed_tokens is unavailable (None).
         offset = self._decode_position_offsets.pop(req_id, 0)
-        if offset != 0 and "ropes" in metadata:
-            metadata["ropes"] = [num_computed_tokens + offset]
-        return metadata
+        if offset != 0 and "ropes" in meta and num_computed_tokens is not None:
+            meta["ropes"] = [num_computed_tokens + offset]
+        return meta
 
     def prepare_runner_inputs(
         self,

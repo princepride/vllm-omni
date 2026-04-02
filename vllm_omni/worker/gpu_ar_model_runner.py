@@ -106,17 +106,17 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
         finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
         if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
-            has_finalize = hasattr(self.model, "finalize_kv_metadata")
             for req_id, data in finished_reqs.items():
                 try:
-                    model_meta = self.model.get_kv_transfer_metadata(req_id)
+                    req_idx = self.input_batch.req_id_to_index.get(req_id)
+                    num_computed = (
+                        int(self.input_batch.num_computed_tokens_cpu[req_idx]) if req_idx is not None else None
+                    )
+                    model_meta = self.model.get_kv_transfer_metadata(
+                        req_id,
+                        num_computed_tokens=num_computed,
+                    )
                     if model_meta:
-                        if has_finalize:
-                            req_idx = self.input_batch.req_id_to_index.get(req_id)
-                            num_computed = (
-                                int(self.input_batch.num_computed_tokens_cpu[req_idx]) if req_idx is not None else 0
-                            )
-                            model_meta = self.model.finalize_kv_metadata(req_id, model_meta, num_computed)
                         existing = data.get("custom_metadata") or {}
                         existing.update(model_meta)
                         data["custom_metadata"] = existing
