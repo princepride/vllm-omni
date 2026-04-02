@@ -124,7 +124,7 @@ The following tables show which models support each feature:
 
 > Notes:
 > 1. Nextstep_1(T2I) does not support cache acceleration methods such as TeaCache or Cache-DiT.
-> 2. `Tongyi-MAI/Z-Image-Turbo` is a distilled model with minimal NFEs; CFG-Parallel is not necessary.
+> 2. `Tongyi-MAI/Z-Image-Turbo` and `princepride/daVinci-MagiHuman` are distilled models with minimal NFEs; CFG-Parallel is not necessary.
 
 ### VideoGen
 
