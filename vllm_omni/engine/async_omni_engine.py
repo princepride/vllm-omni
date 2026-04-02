@@ -722,12 +722,7 @@ class AsyncOmniEngine:
             cid = f"{parent_id}{ep.request_id_suffix}"
             companion_prompt = ep.prompt
 
-            # Build companion-specific params and sampling_params_list.
-            # When the expansion declares overrides (e.g. max_tokens=1 for
-            # think-mode companions), clone and patch; otherwise reuse as-is.
-            companion_params, companion_spl = self._build_companion_params(
-                stage0_params, sampling_params_list, ep.sampling_params_override
-            )
+            companion_params, companion_spl = ep.apply_overrides(stage0_params, sampling_params_list)
 
             if isinstance(companion_prompt, dict):
                 _inject_global_id(companion_prompt, cid)
@@ -765,23 +760,6 @@ class AsyncOmniEngine:
             parent_id,
             len(expanded),
         )
-
-    @staticmethod
-    def _build_companion_params(
-        base_params: Any,
-        base_spl: list[Any],
-        overrides: dict[str, Any] | None,
-    ) -> tuple[Any, list[Any]]:
-        """Return (params, sampling_params_list) for a companion request."""
-        if not overrides:
-            return base_params, base_spl
-        patched = base_params.clone()
-        for k, v in overrides.items():
-            setattr(patched, k, v)
-        spl = list(base_spl)
-        if spl:
-            spl[0] = patched
-        return patched, spl
 
     @staticmethod
     def _get_default_cache_config(cache_backend: str | None) -> dict[str, Any] | None:

@@ -32,6 +32,25 @@ class ExpandedPrompt:
     request_id_suffix: str
     sampling_params_override: dict[str, Any] | None = None
 
+    def apply_overrides(
+        self,
+        base_params: Any,
+        base_spl: list[Any],
+    ) -> tuple[Any, list[Any]]:
+        """Return ``(params, sampling_params_list)`` with overrides applied.
+
+        If this prompt has no overrides the originals are returned as-is.
+        """
+        if not self.sampling_params_override:
+            return base_params, base_spl
+        patched = base_params.clone()
+        for k, v in self.sampling_params_override.items():
+            setattr(patched, k, v)
+        spl = list(base_spl)
+        if spl:
+            spl[0] = patched
+        return patched, spl
+
 
 def expand_cfg_prompts(
     prompt: dict[str, Any] | str,
