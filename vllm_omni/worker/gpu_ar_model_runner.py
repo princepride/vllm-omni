@@ -106,10 +106,17 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
         finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
         if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
+            decode_offsets = getattr(self.model, "_decode_position_offsets", {})
             for req_id, data in finished_reqs.items():
                 try:
+                    offset = decode_offsets.pop(req_id, 0)
                     model_meta = self.model.get_kv_transfer_metadata(req_id)
                     if model_meta:
+                        if offset != 0 and "ropes" in model_meta:
+                            req_idx = self.input_batch.req_id_to_index.get(req_id)
+                            if req_idx is not None:
+                                num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                                model_meta["ropes"] = [num_computed + offset]
                         existing = data.get("custom_metadata") or {}
                         existing.update(model_meta)
                         data["custom_metadata"] = existing
@@ -265,6 +272,34 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 model_kwargs,
                 ec_connector_output,
             ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
+
+        # For BAGEL img2img, the model needs input_ids during prefill to
+        # detect where img2img tokens start (for correct position rewriting
+        # when a system prompt precedes the image). Restore from the
+        # persistent buffer since _preprocess nulls it for multimodal models.
+        if (
+            inputs_embeds is not None
+            and input_ids is None
+            and getattr(self.model, "_img2img_token_id", None) is not None
+        ):
+            input_ids = self.input_ids.gpu[:num_tokens_padded]
+
+        # Adjust decode positions for img2img requests whose prefill rewrote
+        # position IDs. The model runner assigns decode positions starting from
+        # num_computed_tokens, but the rewritten scheme expects them to
+        # continue from `rope` (which is much smaller than num_computed_tokens).
+        decode_offsets = getattr(self.model, "_decode_position_offsets", None)
+        if decode_offsets and positions is not None:
+            token_start = 0
+            for i in range(num_reqs):
+                rid = req_ids[i]
+                offset = decode_offsets.get(rid, 0)
+                if offset != 0:
+                    computed = int(self.input_batch.num_computed_tokens_cpu[i])
+                    if computed > 0:  # decode phase, not prefill
+                        sched = int(num_scheduled_tokens_np[i])
+                        positions[token_start : token_start + sched] += offset
+                token_start += int(num_scheduled_tokens_np[i])
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible

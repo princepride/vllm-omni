@@ -722,6 +722,13 @@ class AsyncOmniEngine:
             cid = f"{parent_id}{ep.request_id_suffix}"
             companion_prompt = ep.prompt
 
+            # Apply companion-specific sampling params override if provided
+            companion_params = stage0_params
+            if ep.sampling_params_override:
+                companion_params = stage0_params.clone()
+                for k, v in ep.sampling_params_override.items():
+                    setattr(companion_params, k, v)
+
             # Run through same input processing as the main prompt
             if isinstance(companion_prompt, dict):
                 _inject_global_id(companion_prompt, cid)
@@ -729,7 +736,7 @@ class AsyncOmniEngine:
             request = self.input_processor.process_inputs(
                 request_id=cid,
                 prompt=companion_prompt,
-                params=stage0_params,
+                params=companion_params,
                 supported_tasks=self.supported_tasks,
             )
             request = _upgrade_to_omni_request(request, companion_prompt)
@@ -743,6 +750,12 @@ class AsyncOmniEngine:
                 queue=None,
             )
 
+            companion_spl = sampling_params_list
+            if ep.sampling_params_override:
+                companion_spl = list(sampling_params_list)
+                if companion_spl:
+                    companion_spl[0] = companion_params
+
             self.request_queue.sync_q.put_nowait(
                 {
                     "type": "add_companion_request",
@@ -750,7 +763,7 @@ class AsyncOmniEngine:
                     "parent_id": parent_id,
                     "role": ep.role,
                     "prompt": request,
-                    "sampling_params_list": sampling_params_list,
+                    "sampling_params_list": companion_spl,
                 }
             )
 
