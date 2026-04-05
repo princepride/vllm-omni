@@ -64,6 +64,9 @@ class OmniARScheduler(VLLMScheduler):
 
         # Track requests that have already triggered prefill transfer to avoid duplicates
         self.transfer_triggered_requests: set[str] = set()
+
+        # Cache per-request flag to avoid repeated deserialization of additional_information
+        self._omits_kv_transfer_cache: dict[str, bool] = {}
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
@@ -83,12 +86,25 @@ class OmniARScheduler(VLLMScheduler):
         return None
 
     def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:
-        """True when orchestrator will not run stage 1+ for this request (e.g. text-only)."""
+        """True when orchestrator will not run stage 1+ for this request (e.g. text-only).
+
+        The result is cached per request to avoid repeated deserialization of
+        additional_information on every scheduler tick.
+        """
+        rid = request.request_id
+        cached = self._omits_kv_transfer_cache.get(rid)
+        if cached is not None:
+            return cached
+
         payload = getattr(request, "additional_information", None)
         if payload is None:
-            return False
-        info = deserialize_additional_information(payload)
-        return info.get("omni_final_stage_id") == 0
+            result = False
+        else:
+            info = deserialize_additional_information(payload)
+            result = info.get("omni_final_stage_id") == 0
+
+        self._omits_kv_transfer_cache[rid] = result
+        return result
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -523,6 +539,8 @@ class OmniARScheduler(VLLMScheduler):
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
+
+        self._omits_kv_transfer_cache.pop(request.request_id, None)
 
         # 1. Standard cleanup parts from base _free_request
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
