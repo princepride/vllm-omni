@@ -174,7 +174,10 @@ def main():
         elif args.modality == "img2text":
             if args.image_path:
                 loaded_image = Image.open(args.image_path).convert("RGB")
-                final_prompt_text = f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                think_prefix = f"<|im_start|>system\n{VLM_THINK_SYSTEM_PROMPT}<|im_end|>\n" if args.think else ""
+                final_prompt_text = (
+                    f"{think_prefix}<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                )
                 prompt_dict = {
                     "prompt": final_prompt_text,
                     "multi_modal_data": {"image": loaded_image},
