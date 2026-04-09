@@ -221,7 +221,7 @@ def _encode_video_bytes(video: Any, fps: int, audio: Any | None = None, audio_sa
         frames_u8,
         audio_np,
         fps=float(fps),
-        audio_sample_rate=audio_sample_rate or 44100,
+        audio_sample_rate=audio_sample_rate or 24000,
     )
 
 
