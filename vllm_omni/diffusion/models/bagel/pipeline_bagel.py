@@ -572,6 +572,110 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             cfg_img_context["kv_lens"] = cfg_img_newlens
             cfg_img_context["ropes"] = cfg_img_new_rope
 
+        # ---- Detect output modality and think mode ----
+        modalities = first_prompt.get("modalities", []) if isinstance(first_prompt, dict) else []
+        is_text_output = "text" in modalities
+        think_enabled = extra_args.get("think", False)
+        think_text = None
+
+        if think_enabled and injected_kv is None:
+            max_think_tokens = int(extra_args.get("max_think_tokens", 1000))
+            do_sample = bool(extra_args.get("do_sample", False))
+            text_temperature = float(extra_args.get("text_temperature", 0.3))
+
+            with torch.autocast(
+                device_type=self.device.type,
+                enabled=self.device.type != "cpu",
+                dtype=self.od_config.dtype,
+            ):
+                start_input = self.bagel.prepare_start_tokens(
+                    gen_context["kv_lens"], gen_context["ropes"], self.new_token_ids
+                )
+                for k, v in start_input.items():
+                    if torch.is_tensor(v):
+                        start_input[k] = v.to(self.device)
+
+                gen_ctx_copy = deepcopy(gen_context)
+                token_ids = self.bagel.generate_text(
+                    past_key_values=gen_ctx_copy["past_key_values"],
+                    max_length=max_think_tokens,
+                    do_sample=do_sample,
+                    temperature=text_temperature,
+                    end_token_id=self.new_token_ids["eos_token_id"],
+                    **start_input,
+                )
+                # token_ids shape: (seq_len, batch=1)
+                decoded = self.tokenizer.decode(token_ids[:, 0].tolist())
+                # Strip chat markers to get clean text
+                think_text = decoded.split("<|im_end|>")[0]
+                if "<|im_start|>" in think_text:
+                    think_text = think_text.split("<|im_start|>")[-1]
+                logger.info("Think mode generated %d tokens", token_ids.shape[0])
+
+            if not is_text_output:
+                # For image generation: feed thinking text back into gen_context
+                think_input, think_newlens, think_new_rope = self.bagel.prepare_prompts(
+                    curr_kvlens=gen_context["kv_lens"],
+                    curr_rope=gen_context["ropes"],
+                    prompts=[think_text],
+                    tokenizer=self.tokenizer,
+                    new_token_ids=self.new_token_ids,
+                )
+                for k, v in think_input.items():
+                    if torch.is_tensor(v):
+                        think_input[k] = v.to(self.device)
+                with torch.autocast(
+                    device_type=self.device.type,
+                    enabled=self.device.type != "cpu",
+                    dtype=self.od_config.dtype,
+                ):
+                    gen_context["past_key_values"] = self.bagel.forward_cache_update_text(
+                        gen_context["past_key_values"], **think_input
+                    )
+                gen_context["kv_lens"] = think_newlens
+                gen_context["ropes"] = think_new_rope
+
+        # ---- Text-only output (text2text / img2text) ----
+        if is_text_output and injected_kv is None:
+            if think_text is not None:
+                # Think mode already generated the text (including reasoning)
+                text_output = think_text
+            else:
+                max_text_tokens = int(extra_args.get("max_think_tokens", 500))
+                do_sample = bool(extra_args.get("do_sample", False))
+                text_temperature = float(extra_args.get("text_temperature", 0.3))
+
+                with torch.autocast(
+                    device_type=self.device.type,
+                    enabled=self.device.type != "cpu",
+                    dtype=self.od_config.dtype,
+                ):
+                    start_input = self.bagel.prepare_start_tokens(
+                        gen_context["kv_lens"], gen_context["ropes"], self.new_token_ids
+                    )
+                    for k, v in start_input.items():
+                        if torch.is_tensor(v):
+                            start_input[k] = v.to(self.device)
+                    token_ids = self.bagel.generate_text(
+                        past_key_values=gen_context["past_key_values"],
+                        max_length=max_text_tokens,
+                        do_sample=do_sample,
+                        temperature=text_temperature,
+                        end_token_id=self.new_token_ids["eos_token_id"],
+                        **start_input,
+                    )
+                    decoded = self.tokenizer.decode(token_ids[:, 0].tolist())
+                    text_output = decoded.split("<|im_end|>")[0]
+                    if "<|im_start|>" in text_output:
+                        text_output = text_output.split("<|im_start|>")[-1]
+
+            return DiffusionOutput(
+                output=text_output,
+                custom_output={"text_output": text_output},
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+
+        # ---- Image generation (text2img / img2img) ----
         if req.sampling_params.seed is not None:
             torch.manual_seed(req.sampling_params.seed)
             if self.device.type == "cuda":
@@ -676,12 +780,17 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         if trajectory_log_probs:
             trajectory_log_probs_stacked = torch.stack(trajectory_log_probs)
 
+        custom = {}
+        if think_text is not None:
+            custom["think_text"] = think_text
+
         return DiffusionOutput(
             output=img,
             trajectory_latents=trajectory_latents_stacked,
             trajectory_timesteps=trajectory_timesteps_stacked,
             trajectory_log_probs=trajectory_log_probs_stacked,
             trajectory_decoded=trajectory_decoded,
+            custom_output=custom,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
