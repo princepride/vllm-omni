@@ -620,27 +620,13 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 logger.info("Think mode generated %d tokens", token_ids.shape[0])
 
             if not is_text_output:
-                # For image generation: feed thinking text back into gen_context
-                think_input, think_newlens, think_new_rope = self.bagel.prepare_prompts(
-                    curr_kvlens=gen_context["kv_lens"],
-                    curr_rope=gen_context["ropes"],
-                    prompts=[think_text],
-                    tokenizer=self.tokenizer,
-                    new_token_ids=self.new_token_ids,
-                )
-                for k, v in think_input.items():
-                    if torch.is_tensor(v):
-                        think_input[k] = v.to(self.device)
-                with torch.autocast(
-                    device_type=self.device.type,
-                    enabled=self.device.type != "cpu",
-                    dtype=self.od_config.dtype,
-                ):
-                    gen_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                        gen_context["past_key_values"], **think_input
-                    )
-                gen_context["kv_lens"] = think_newlens
-                gen_context["ropes"] = think_new_rope
+                # Use the autoregressive KV cache from think generation
+                # directly, instead of decode→re-encode which adds extra
+                # bos/eos and may alter tokenization.
+                num_think_tokens = token_ids.shape[0]
+                gen_context["past_key_values"] = gen_ctx_copy["past_key_values"]
+                gen_context["kv_lens"] = [kl + num_think_tokens for kl in gen_context["kv_lens"]]
+                gen_context["ropes"] = [r + num_think_tokens for r in gen_context["ropes"]]
 
         # ---- Text-only output (text2text / img2text) ----
         if is_text_output and injected_kv is None:
