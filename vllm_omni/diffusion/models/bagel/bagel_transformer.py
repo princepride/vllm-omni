@@ -1626,8 +1626,10 @@ class Bagel(nn.Module):
         num_layers = len(caches[0].key_cache)
         merged = NaiveCache(num_layers)
         for layer_idx in range(num_layers):
-            merged.key_cache[layer_idx] = torch.cat([c.key_cache[layer_idx] for c in caches], dim=0)
-            merged.value_cache[layer_idx] = torch.cat([c.value_cache[layer_idx] for c in caches], dim=0)
+            key_parts = [c.key_cache[layer_idx] for c in caches if c.key_cache[layer_idx] is not None]
+            val_parts = [c.value_cache[layer_idx] for c in caches if c.value_cache[layer_idx] is not None]
+            merged.key_cache[layer_idx] = torch.cat(key_parts, dim=0) if key_parts else None
+            merged.value_cache[layer_idx] = torch.cat(val_parts, dim=0) if val_parts else None
         return merged
 
     def prepare_start_tokens(self, curr_kvlens, curr_rope, new_token_ids):

@@ -495,11 +495,15 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
                     cfg_text_context = deepcopy(gen_context)
 
+            # Strip <|im_start|>/<|im_end|> wrappers that end2end.py may have
+            # already added, so prepare_prompts doesn't double-add bos/eos.
+            clean_prompt = prompt.removeprefix("<|im_start|>").removesuffix("<|im_end|>")
+
             # Update gen_context with text prompt
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
-                prompts=[prompt],
+                prompts=[clean_prompt],
                 tokenizer=self.tokenizer,
                 new_token_ids=self.new_token_ids,
             )
@@ -527,34 +531,37 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             gen_context["kv_lens"] = newlens
             gen_context["ropes"] = new_rope
 
-            # cfg_text_context: update with negative prompt (no text condition)
+            # cfg_text_context: update with negative prompt (no text condition).
+            # When empty, keep cfg_text_context as-is (kv_lens=0) to match
+            # original BAGEL; _merge_naive_caches handles None KV entries.
             neg_prompt = extra_args.get("negative_prompt", "")
-            neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
-                curr_kvlens=cfg_text_context["kv_lens"],
-                curr_rope=cfg_text_context["ropes"],
-                prompts=[neg_prompt],
-                tokenizer=self.tokenizer,
-                new_token_ids=self.new_token_ids,
-            )
-            for k, v in neg_input.items():
-                if torch.is_tensor(v):
-                    neg_input[k] = v.to(self.device)
-            with torch.autocast(
-                device_type=self.device.type,
-                enabled=self.device.type != "cpu",
-                dtype=self.od_config.dtype,
-            ):
-                cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                    cfg_text_context["past_key_values"], **neg_input
+            if neg_prompt:
+                neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
+                    curr_kvlens=cfg_text_context["kv_lens"],
+                    curr_rope=cfg_text_context["ropes"],
+                    prompts=[neg_prompt],
+                    tokenizer=self.tokenizer,
+                    new_token_ids=self.new_token_ids,
                 )
-            cfg_text_context["kv_lens"] = neg_newlens
-            cfg_text_context["ropes"] = neg_rope
+                for k, v in neg_input.items():
+                    if torch.is_tensor(v):
+                        neg_input[k] = v.to(self.device)
+                with torch.autocast(
+                    device_type=self.device.type,
+                    enabled=self.device.type != "cpu",
+                    dtype=self.od_config.dtype,
+                ):
+                    cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
+                        cfg_text_context["past_key_values"], **neg_input
+                    )
+                cfg_text_context["kv_lens"] = neg_newlens
+                cfg_text_context["ropes"] = neg_rope
 
             # cfg_img_context: update with text prompt (no image condition)
             cfg_img_generation_input, cfg_img_newlens, cfg_img_new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=cfg_img_context["kv_lens"],
                 curr_rope=cfg_img_context["ropes"],
-                prompts=[prompt],
+                prompts=[clean_prompt],
                 tokenizer=self.tokenizer,
                 new_token_ids=self.new_token_ids,
             )
