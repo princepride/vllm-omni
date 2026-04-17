@@ -407,8 +407,7 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
             if cfg_img_kv is None:
                 cfg_img_kv = injected_kv
-
-            else
+            else:
                 cfg_img_seq_len = cfg_img_kv.key_cache[0].shape[0]
                 cfg_img_context["past_key_values"] = cfg_img_kv
                 cfg_img_context["kv_lens"] = [cfg_img_seq_len]
