@@ -291,9 +291,10 @@ def _get_negative_prompt(
 ) -> str:
     """Resolve the negative prompt for CFG from prompt or sampling params.
 
-    An empty string is treated the same as absent (falls through to
-    the Bagel default token pair), because an empty negative prompt is
-    not meaningful for CFG guidance.
+    Returns the negative prompt string when one is supplied, otherwise an
+    empty string. Callers decide how to treat the empty case: text2img
+    skips the cfg_text companion entirely, while img2img substitutes it
+    into the cfg_text prompt template.
     """
     neg = prompt.get("negative_prompt")
     if neg:

@@ -406,7 +406,16 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 pass
 
             if cfg_img_kv is None:
-                cfg_img_kv = injected_kv
+                # text2img multi-stage: cfg_img reuses gen KV (positive prompt,
+                # no image), mirroring forward_cache_update_text on cfg_img_context
+                # in the single-stage path.
+                cfg_img_seq_len = injected_kv.key_cache[0].shape[0]
+                cfg_img_context["past_key_values"] = injected_kv
+                cfg_img_context["kv_lens"] = [cfg_img_seq_len]
+                if req.sampling_params.kv_metadata and "ropes" in req.sampling_params.kv_metadata:
+                    cfg_img_context["ropes"] = req.sampling_params.kv_metadata["ropes"]
+                else:
+                    cfg_img_context["ropes"] = [cfg_img_seq_len]
             else:
                 cfg_img_seq_len = cfg_img_kv.key_cache[0].shape[0]
                 cfg_img_context["past_key_values"] = cfg_img_kv
