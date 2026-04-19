@@ -4,7 +4,7 @@
 """
 End-to-end tests for Bagel with shared memory connector: img2img and text2img.
 
-- img2img: validates output vs reference pixels within a ±10 tolerance.
+- img2img: validates output vs reference pixels within a ±15 tolerance.
 - text2img: validates output vs reference pixels within a ±5 tolerance
   (equivalent to `examples/offline_inference/bagel/end2end.py` with
   text2img modality and 15 steps).
@@ -91,8 +91,10 @@ if current_omni_platform.is_rocm():
         {"position": (256, 256), "rgb": (167, 156, 150)},
     ]
 
-PIXEL_TOLERANCE = 10
 TEXT2IMG_PIXEL_TOLERANCE = 5
+
+# Relax pixel tolerance to 15 to account for Triton kernel numerical drift
+PIXEL_TOLERANCE = 15
 
 DEFAULT_PROMPT = "<|fim_middle|><|im_start|>Change the grass color to red<|im_end|>"
 
