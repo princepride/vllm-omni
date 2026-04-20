@@ -17,7 +17,6 @@ async_chunk: false
 stages:
   - stage_id: 0
     max_num_seqs: 1
-    enforce_eager: true
     devices: "0"
     default_sampling_params:
       seed: 52

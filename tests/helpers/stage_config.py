@@ -427,6 +427,22 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
     },
+    "bagel_think": {
+        "base_config": "bagel_think.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 3,
+                "gpu_memory_utilization": 0.45,
+                "load_format": "dummy",
+            },
+            {
+                "stage_id": 1,
+                "max_num_seqs": 1,
+                "load_format": "dummy",
+            },
+        ],
+    },
     "bagel_single_stage": {
         "base_config": "bagel_single_stage.yaml",
         "stages": [
@@ -445,11 +461,13 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_num_seqs": 1,
                 "gpu_memory_utilization": 0.45,
                 "load_format": "dummy",
+                "output_connectors": {"to_stage_1": "mooncake_connector"},
             },
             {
                 "stage_id": 1,
                 "max_num_seqs": 1,
                 "load_format": "dummy",
+                "input_connectors": {"from_stage_0": "mooncake_connector"},
             },
         ],
         "connectors": {

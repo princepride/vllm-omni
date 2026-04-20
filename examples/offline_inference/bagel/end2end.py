@@ -147,6 +147,9 @@ def main():
 
     omni_kwargs = {}
     stage_configs_path = args.stage_configs_path
+    if args.think and stage_configs_path is None:
+        stage_configs_path = "vllm_omni/deploy/bagel_think.yaml"
+        print(f"[Info] Think mode enabled, using deploy config: {stage_configs_path}")
     if stage_configs_path:
         omni_kwargs["stage_configs_path"] = stage_configs_path
 
@@ -210,6 +213,9 @@ def main():
             formatted_prompts.append(prompt_dict)
 
     params_list = omni.default_sampling_params_list
+    # Bagel exposes 1 sampling param set for single-stage (DiT-only) and
+    # 2 for two-stage (Thinker + DiT).  This heuristic may need updating
+    # if future pipelines break that 1:1 mapping.
     is_single_stage = len(params_list) == 1
 
     diffusion_params_idx = 0 if is_single_stage else (1 if len(params_list) > 1 else 0)

@@ -187,16 +187,24 @@ See [`bagel_single_stage.yaml`](https://github.com/vllm-project/vllm-omni/tree/m
 
 ### Tensor Parallelism (TP)
 
-For larger models or multi-GPU environments:
+For larger models or multi-GPU environments, customize the deploy YAML (see [`bagel.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel.yaml)) and set per-stage `tensor_parallel_size` and `devices`:
+
+```yaml
+# Example: TP=2 on GPUs 0,1 for the Thinker stage
+stages:
+  - stage_id: 0
+    tensor_parallel_size: 2
+    devices: "0,1"
+```
+
+Then pass the custom deploy YAML:
 
 ```bash
 python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --modality text2img \
                   --prompts "A cute cat" \
-                  --tensor-parallel-size 2
+                  --stage-configs-path /path/to/custom_bagel.yaml
 ```
-
-Or customize the deploy YAML (see [`bagel.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel.yaml)) with per-stage `tensor_parallel_size`.
 
 ### FP8 Quantization
 

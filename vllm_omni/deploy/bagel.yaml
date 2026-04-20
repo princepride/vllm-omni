@@ -12,7 +12,6 @@ stages:
   - stage_id: 0
     max_num_seqs: 3
     gpu_memory_utilization: 0.45
-    enforce_eager: true
     devices: "0"
     default_sampling_params:
       temperature: 0.4
@@ -51,3 +50,8 @@ platforms:
     stages:
       - stage_id: 0
         gpu_memory_utilization: 0.9
+        max_num_batched_tokens: 16384
+        quantization: fp8
+      - stage_id: 1
+        gpu_memory_utilization: 0.9
+        devices: "1"
