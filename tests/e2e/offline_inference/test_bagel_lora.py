@@ -187,9 +187,9 @@ def test_bagel_lora_scale_and_deactivation(run_level, tmp_path):
             f"LoRA scale has no effect: diff_1x={diff_1x:.2f}, diff_2x={diff_2x:.2f}"
         )
 
-        # (c) Output is not corrupted
+        # (c) Output is not corrupted (scale=2.0 can produce ~2x the diff of scale=1.0)
         assert diff_1x < 80, f"LoRA output looks corrupted: diff_1x={diff_1x}"
-        assert diff_2x < 80, f"LoRA output looks corrupted: diff_2x={diff_2x}"
+        assert diff_2x < 160, f"LoRA output looks corrupted: diff_2x={diff_2x}"
 
         # (d) Deactivation fully restores base model
         assert diff_restored == 0.0, f"Base model not restored after LoRA deactivation: diff={diff_restored}"
