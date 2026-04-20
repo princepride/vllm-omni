@@ -20,7 +20,7 @@ MASTER_ADDRESS="${MASTER_ADDRESS:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-8092}"
 STAGE="all"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STAGE_CONFIGS_PATH="${STAGE_CONFIGS_PATH:-$SCRIPT_DIR/../../../vllm_omni/model_executor/stage_configs/bagel.yaml}"
+STAGE_CONFIGS_PATH="${STAGE_CONFIGS_PATH:-$SCRIPT_DIR/../../../vllm_omni/deploy/bagel.yaml}"
 EXTRA_ARGS=()
 
 usage() {

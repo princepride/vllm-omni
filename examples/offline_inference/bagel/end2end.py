@@ -147,13 +147,8 @@ def main():
 
     omni_kwargs = {}
     stage_configs_path = args.stage_configs_path
-    is_single_stage = stage_configs_path and "single_stage" in stage_configs_path
-    if args.think and stage_configs_path is None:
-        stage_configs_path = "vllm_omni/model_executor/stage_configs/bagel_think.yaml"
-        print(f"[Info] Think mode enabled, using stage config: {stage_configs_path}")
     if stage_configs_path:
         omni_kwargs["stage_configs_path"] = stage_configs_path
-        is_single_stage = "single_stage" in stage_configs_path
 
     omni_kwargs.update(
         {
@@ -215,9 +210,8 @@ def main():
             formatted_prompts.append(prompt_dict)
 
     params_list = omni.default_sampling_params_list
+    is_single_stage = len(params_list) == 1
 
-    # For single-stage DiT, think/text params go into the diffusion sampling params extra_args.
-    # For 2-stage, diffusion params are at index 1.
     diffusion_params_idx = 0 if is_single_stage else (1 if len(params_list) > 1 else 0)
     diffusion_params = params_list[diffusion_params_idx]
 
