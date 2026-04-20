@@ -6,6 +6,8 @@
 # Fields omitted from a stage fall back to StageDeployConfig dataclass
 # defaults (see vllm_omni/config/stage_config.py).
 
+async_chunk: false
+
 stages:
   - stage_id: 0
     max_num_seqs: 3
