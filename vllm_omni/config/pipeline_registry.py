@@ -54,6 +54,7 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "bagel_single_stage": (
         "vllm_omni.model_executor.models.bagel.pipeline",
         "BAGEL_SINGLE_STAGE_PIPELINE",
+    ),
     "voxcpm2": (
         "vllm_omni.model_executor.models.voxcpm2.pipeline",
         "VOXCPM2_PIPELINE",
