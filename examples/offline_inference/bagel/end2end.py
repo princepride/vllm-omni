@@ -53,7 +53,19 @@ def parse_args():
     parser.add_argument("--shm-threshold-bytes", type=int, default=65536)
     parser.add_argument("--worker-backend", type=str, default="process", choices=["process", "ray"])
     parser.add_argument("--ray-address", type=str, default=None)
-    parser.add_argument("--stage-configs-path", type=str, default=None)
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Path to deploy YAML (new format). If unset, auto-loads "
+        "vllm_omni/deploy/bagel.yaml based on the HF model_type.",
+    )
+    parser.add_argument(
+        "--stage-configs-path",
+        type=str,
+        default=None,
+        help="[Deprecated] Legacy path to stage_args YAML. Prefer --deploy-config for new-format YAMLs.",
+    )
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
 
     parser.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (default: 4.0)")
@@ -146,11 +158,16 @@ def main():
     from vllm_omni.entrypoints.omni import Omni
 
     omni_kwargs = {}
+    if args.deploy_config is not None and args.stage_configs_path is not None:
+        raise ValueError("--deploy-config and --stage-configs-path are mutually exclusive; prefer --deploy-config.")
+    deploy_config = args.deploy_config
     stage_configs_path = args.stage_configs_path
-    if args.think and stage_configs_path is None:
-        stage_configs_path = "vllm_omni/deploy/bagel_think.yaml"
-        print(f"[Info] Think mode enabled, using deploy config: {stage_configs_path}")
-    if stage_configs_path:
+    if args.think and deploy_config is None and stage_configs_path is None:
+        deploy_config = "vllm_omni/deploy/bagel_think.yaml"
+        print(f"[Info] Think mode enabled, using deploy config: {deploy_config}")
+    if deploy_config:
+        omni_kwargs["deploy_config"] = deploy_config
+    elif stage_configs_path:
         omni_kwargs["stage_configs_path"] = stage_configs_path
 
     omni_kwargs.update(
