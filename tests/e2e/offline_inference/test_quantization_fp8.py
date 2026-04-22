@@ -30,7 +30,6 @@ import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-from pathlib import Path
 from typing import Any
 
 import pytest
