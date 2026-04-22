@@ -185,7 +185,7 @@ def main():
     if args.quantization:
         omni_kwargs["quantization_config"] = args.quantization
 
-    omni = Omni(model=model_name, **omni_kwargs)
+    omni = Omni.from_cli_args(args, model=model_name, **omni_kwargs)
 
     formatted_prompts = []
     for p in prompts:
