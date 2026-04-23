@@ -29,7 +29,7 @@ python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
 python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --modality text2img \
                   --prompts "A cute cat" \
-                  --stage-configs-path vllm_omni/deploy/bagel_single_stage.yaml
+                  --deploy-config vllm_omni/deploy/bagel_single_stage.yaml
 ```
 
 > **Note**: These examples work with the default configuration on an **NVIDIA A100 (80GB)**. For dual-GPU setups, modify the deploy YAML to distribute stages across devices.
@@ -172,13 +172,13 @@ The pipeline is defined in [`bagel.yaml`](../../../vllm_omni/deploy/bagel.yaml).
 
 ### Single-Stage
 
-Pass the single-stage deploy config via `--stage-configs-path`:
+Pass the single-stage deploy config via `--deploy-config`:
 
 ```bash
 python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --modality text2img \
                   --prompts "A cute cat" \
-                  --stage-configs-path vllm_omni/deploy/bagel_single_stage.yaml
+                  --deploy-config vllm_omni/deploy/bagel_single_stage.yaml
 ```
 
 See [`bagel_single_stage.yaml`](../../../vllm_omni/deploy/bagel_single_stage.yaml) for configuration details. The `pipeline: bagel_single_stage` field selects the single-stage topology from the pipeline registry.
@@ -201,7 +201,7 @@ Then pass the custom deploy YAML:
 python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --modality text2img \
                   --prompts "A cute cat" \
-                  --stage-configs-path /path/to/custom_bagel.yaml
+                  --deploy-config /path/to/custom_bagel.yaml
 ```
 
 ### FP8 Quantization
@@ -253,7 +253,7 @@ python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
 
 | Argument | Type | Default | Description |
 | :------- | :--- | :------ | :---------- |
-| `--stage-configs-path` | string | `None` | Path to deploy YAML (auto-detected if omitted) |
+| `--deploy-config` | string | `None` | Path to deploy YAML (auto-detected if omitted) |
 | `--worker-backend` | choice | `process` | `process` or `ray` |
 | `--ray-address` | string | `None` | Ray cluster address |
 | `--quantization` | string | `None` | Quantization method (e.g. `fp8`) |

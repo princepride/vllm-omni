@@ -46,14 +46,3 @@ connectors:
       device_name: ""
       memory_pool_size: 4294967296
       memory_pool_device: "cpu"
-
-platforms:
-  xpu:
-    stages:
-      - stage_id: 0
-        gpu_memory_utilization: 0.9
-        max_num_batched_tokens: 16384
-        quantization: fp8
-      - stage_id: 1
-        gpu_memory_utilization: 0.9
-        devices: "1"

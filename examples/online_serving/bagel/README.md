@@ -34,7 +34,7 @@ cd examples/online_serving/bagel
 bash run_server.sh
 ```
 
-To use a custom deploy YAML (note: `--stage-configs-path` is deprecated in favor of `--deploy-config`):
+To use a custom deploy YAML, pass it via `--deploy-config`:
 
 ```bash
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
