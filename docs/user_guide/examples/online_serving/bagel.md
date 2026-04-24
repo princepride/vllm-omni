@@ -34,6 +34,10 @@ Or use the convenience script:
 ```bash
 cd examples/online_serving/bagel
 bash run_server.sh
+
+# Launch a single stage per terminal
+bash run_server_stage_cli.sh --stage 0
+bash run_server_stage_cli.sh --stage 1
 ```
 
 To use a custom deploy YAML (note: `--stage-configs-path` is deprecated in favor of `--deploy-config`):
@@ -73,11 +77,12 @@ Deploy each stage on a **separate node** for better resource utilization. Replac
 **1. Launch Stage 0 (Thinker / Orchestrator)** on the orchestrator node:
 
 ```bash
+# API server port for client requests: 8000
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
     --port 8000 \
     --stage-id 0 \
-    -oma <ORCHESTRATOR_IP> \
-    -omp 8091
+    --omni-master-address <ORCHESTRATOR_IP> \
+    --omni-master-port 8091
 ```
 
 **2. Launch Stage 1 (DiT)** on the remote node in headless mode:
@@ -86,8 +91,8 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
     --stage-id 1 \
     --headless \
-    -oma <ORCHESTRATOR_IP> \
-    -omp 8091
+    --omni-master-address <ORCHESTRATOR_IP> \
+    --omni-master-port 8091
 ```
 
 Or use the convenience script:
