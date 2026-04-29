@@ -1827,6 +1827,8 @@ class Bagel(nn.Module):
         # ── SP + CFG: sequential single-branch forwards ──
         use_sp = self._sp_size > 1
         if use_sp and use_cfg_text:
+            if return_trajectory_latents and len(timesteps) > 0:
+                trajectory_latents.append(x_t.clone())
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
                 in_cfg_window = t > cfg_interval[0] and t <= cfg_interval[1]
@@ -1890,13 +1892,15 @@ class Bagel(nn.Module):
                     x_t = x_t - v_t.to(x_t.device) * dts[i]
                 if return_trajectory_latents:
                     trajectory_latents.append(x_t.clone())
-                    trajectory_timesteps.append(timesteps[i] - dts[i])
+                    trajectory_timesteps.append(timesteps[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
             return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
         # ── SP without CFG: direct single-branch loop ──
         if use_sp:
+            if return_trajectory_latents and len(timesteps) > 0:
+                trajectory_latents.append(x_t.clone())
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
                 v_t = self.forward_single_branch(
@@ -1923,7 +1927,7 @@ class Bagel(nn.Module):
                     x_t = x_t - v_t.to(x_t.device) * dts[i]
                 if return_trajectory_latents:
                     trajectory_latents.append(x_t.clone())
-                    trajectory_timesteps.append(timesteps[i] - dts[i])
+                    trajectory_timesteps.append(timesteps[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
             return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
@@ -1984,6 +1988,9 @@ class Bagel(nn.Module):
                 "merged_cache": self._merge_naive_caches(branches_cache),
             }
 
+        if return_trajectory_latents and len(timesteps) > 0:
+            trajectory_latents.append(x_t.clone())
+
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if t > cfg_interval[0] and t <= cfg_interval[1]:
@@ -2021,7 +2028,7 @@ class Bagel(nn.Module):
                 x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
             if return_trajectory_latents:
                 trajectory_latents.append(x_t.clone())
-                trajectory_timesteps.append(timesteps[i] - dts[i])
+                trajectory_timesteps.append(timesteps[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
@@ -2122,6 +2129,9 @@ class Bagel(nn.Module):
         )
         _sched_kw = scheduler_kwargs or {}
 
+        if return_trajectory_latents and len(timesteps) > 0:
+            trajectory_latents.append(x_t.clone())
+
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
@@ -2179,7 +2189,7 @@ class Bagel(nn.Module):
                 x_t = x_t - v_t.to(x_t.device) * dts[i]
             if return_trajectory_latents:
                 trajectory_latents.append(x_t.clone())
-                trajectory_timesteps.append(timesteps[i] - dts[i])
+                trajectory_timesteps.append(timesteps[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
