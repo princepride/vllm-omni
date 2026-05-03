@@ -1,314 +1,182 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """
-Side-by-side comparison test for SenseNova-U1 T2I generation.
+End-to-end test for SenseNova-U1 text2img generation.
 
-Runs the **original** (HuggingFace / sensenova_u1 package) implementation and
-the **vLLM-Omni ported** implementation with identical parameters, then saves
-both images and prints pixel-level statistics.
+This test validates that the SenseNova-U1 model generates images that match
+expected reference pixel values within a ±10 tolerance.
 
-Usage (single-GPU, no TP):
-    python tests/e2e/offline_inference/test_sensenova_u1_t2i.py
-
-The script saves:
-    outputs/sensenova_u1_ref.png   – reference from original package
-    outputs/sensenova_u1_omni.png  – output from vllm-omni port
-    outputs/sensenova_u1_diff.png  – amplified difference map
+Equivalent to running:
+    python SenseNova-U1/examples/t2i/inference.py \
+        --model_path SenseNova/SenseNova-U1-8B-MoT \
+        --prompt "Close portrait of an elderly woman ..." \
+        --width 1536 --height 2720 \
+        --cfg_scale 4.0 --cfg_norm none --timestep_shift 3.0 \
+        --num_steps 50 --seed 42 --think
 """
 
-from __future__ import annotations
-
-import argparse
 import os
-import time
+from typing import Any
 
-import numpy as np
-import torch
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+import pytest
 from PIL import Image
 
-# ---------------------------------------------------------------------------
-# Shared test config
-# ---------------------------------------------------------------------------
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.entrypoints.omni import Omni
 
-PROMPT = (
+SENSENOVA_U1_CI_DEPLOY = get_deploy_config_path("ci/sensenova_u1.yaml")
+
+# Reference pixel data extracted from the known-good output image
+# Each entry contains (x, y) position and expected (R, G, B) values
+# Generated with seed=42, num_inference_steps=50, think=True,
+# prompt="Close portrait of an elderly woman by a farmhouse window, ..."
+REFERENCE_PIXELS = [
+    {"position": (100, 100), "rgb": (247, 249, 250)},
+    {"position": (768, 200), "rgb": (176, 135, 97)},
+    {"position": (400, 600), "rgb": (200, 190, 180)},
+    {"position": (1200, 2000), "rgb": (92, 77, 65)},
+    {"position": (750, 500), "rgb": (186, 135, 88)},
+    {"position": (300, 1360), "rgb": (198, 159, 114)},
+    {"position": (1000, 1800), "rgb": (57, 29, 13)},
+    {"position": (500, 2400), "rgb": (97, 83, 74)},
+    {"position": (768, 1360), "rgb": (84, 42, 22)},
+    {"position": (200, 900), "rgb": (195, 190, 182)},
+]
+
+PIXEL_TOLERANCE = 10
+
+DEFAULT_PROMPT = (
     "Close portrait of an elderly woman by a farmhouse window, textured skin, "
     "gentle smile, warm natural light, emotional documentary look. The portrait "
     "should feel polished and natural, with sharp eyes, realistic skin texture, "
     "accurate facial anatomy, and premium lighting that keeps the face as the "
     "main focus."
 )
-WIDTH = 1536
-HEIGHT = 2720
-CFG_SCALE = 4.0
-CFG_NORM = "none"
-TIMESTEP_SHIFT = 3.0
-NUM_STEPS = 50
-SEED = 42
-THINK_MODE = False
-MODEL_ID = "SenseNova/SenseNova-U1-8B-MoT"
-DTYPE = torch.bfloat16
-DEVICE = "cuda"
+
+EXPECTED_OUTPUT_SIZE = (1536, 2720)
 
 
-# ---------------------------------------------------------------------------
-# 1. Reference: original sensenova_u1 package
-# ---------------------------------------------------------------------------
-
-
-def run_reference(model_path: str) -> Image.Image:
-    """Generate an image using the original HuggingFace implementation."""
-    print("=" * 60)
-    print("[REF] Loading original SenseNova-U1 model …")
-    print("=" * 60)
-
-    import sensenova_u1  # noqa: F401 – registers AutoConfig/AutoModel
-    from transformers import AutoConfig, AutoModel, AutoTokenizer
-
-    config = AutoConfig.from_pretrained(model_path)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModel.from_pretrained(model_path, config=config, torch_dtype=DTYPE).to(DEVICE).eval()
-
-    print(f"[REF] Generating {WIDTH}x{HEIGHT}, steps={NUM_STEPS}, seed={SEED} …")
-    t0 = time.perf_counter()
-    with torch.inference_mode():
-        out = model.t2i_generate(
-            tokenizer,
-            PROMPT,
-            image_size=(WIDTH, HEIGHT),
-            cfg_scale=CFG_SCALE,
-            cfg_norm=CFG_NORM,
-            timestep_shift=TIMESTEP_SHIFT,
-            cfg_interval=(0.0, 1.0),
-            num_steps=NUM_STEPS,
-            batch_size=1,
-            seed=SEED,
-            think_mode=THINK_MODE,
-        )
-    dt = time.perf_counter() - t0
-    print(f"[REF] Done in {dt:.1f}s")
-
-    tensor = out[0] if THINK_MODE else out  # (B, 3, H, W) normalised
-    mean = torch.tensor((0.5, 0.5, 0.5), device=tensor.device, dtype=tensor.dtype).view(1, 3, 1, 1)
-    std = mean.clone()
-    arr = ((tensor * std + mean).clamp(0, 1).float().permute(0, 2, 3, 1).cpu().numpy() * 255).round().astype(np.uint8)
-    img = Image.fromarray(arr[0])
-
-    # Free GPU memory
-    del model, tokenizer, config
-    torch.cuda.empty_cache()
-    return img
-
-
-# ---------------------------------------------------------------------------
-# 2. vLLM-Omni ported version
-# ---------------------------------------------------------------------------
-
-_vllm_config_ctx = None
-
-
-def _init_distributed():
-    """Initialize vLLM distributed state for single-GPU standalone usage."""
-    import torch.distributed as dist
-    from vllm.config.vllm import VllmConfig, set_current_vllm_config
-    from vllm.distributed.parallel_state import (
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
-
-    # Set up a minimal VllmConfig so that parallel layers can be constructed.
-    global _vllm_config_ctx
-    if _vllm_config_ctx is None:
-        vllm_cfg = VllmConfig()
-        _vllm_config_ctx = set_current_vllm_config(vllm_cfg)
-        _vllm_config_ctx.__enter__()
-
-    if not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29500")
-        os.environ.setdefault("RANK", "0")
-        os.environ.setdefault("WORLD_SIZE", "1")
-        os.environ.setdefault("LOCAL_RANK", "0")
-        init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-        initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
-
-
-def run_omni(model_path: str) -> Image.Image:
-    """Generate an image using the vLLM-Omni ported pipeline."""
-    print("=" * 60)
-    print("[OMNI] Loading vLLM-Omni SenseNova-U1 pipeline …")
-    print("=" * 60)
-
-    _init_distributed()
-
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
-        SenseNovaU1Pipeline,
-    )
-
-    # Build a minimal OmniDiffusionConfig
-    od_config = OmniDiffusionConfig()
-    od_config.model = model_path
-    od_config.dtype = DTYPE
-    od_config.revision = None
-
-    pipeline = SenseNovaU1Pipeline(od_config=od_config)
-
-    # Load weights
-    print("[OMNI] Loading weights …")
-    import glob
-    from pathlib import Path
-
-    from safetensors import safe_open
-
-    model_dir = Path(pipeline.local_model_path)
-
-    safetensor_files = sorted(glob.glob(str(model_dir / "*.safetensors")))
-    if not safetensor_files:
-        safetensor_files = sorted(glob.glob(str(model_dir / "**/*.safetensors"), recursive=True))
-
-    def _iter_weights():
-        for sf_path in safetensor_files:
-            with safe_open(sf_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    yield key, f.get_tensor(key)
-
-    loaded = pipeline.load_weights(_iter_weights())
-    print(f"[OMNI] Loaded {len(loaded)} parameter tensors")
-
-    pipeline = pipeline.to(device=DEVICE, dtype=DTYPE)
-    pipeline.eval()
-
-    # Build a minimal request-like object
-    class _FakeSamplingParams:
-        height = HEIGHT
-        width = WIDTH
-        num_inference_steps = NUM_STEPS
-        seed = SEED
-        extra_args = {
-            "cfg_scale": CFG_SCALE,
-            "cfg_norm": CFG_NORM,
-            "timestep_shift": TIMESTEP_SHIFT,
+def _configure_sampling_params(omni: Omni) -> list:
+    """Configure sampling parameters for SenseNova-U1 text2img generation."""
+    params_list = omni.default_sampling_params_list
+    if len(params_list) > 0:
+        params_list[0].num_inference_steps = 50  # type: ignore
+        params_list[0].height = EXPECTED_OUTPUT_SIZE[1]  # type: ignore
+        params_list[0].width = EXPECTED_OUTPUT_SIZE[0]  # type: ignore
+        params_list[0].extra_args = {  # type: ignore
+            "cfg_scale": 4.0,
+            "cfg_norm": "none",
+            "timestep_shift": 3.0,
             "cfg_interval": (0.0, 1.0),
             "batch_size": 1,
-            "think": THINK_MODE,
+            "think": True,
             "t_eps": 0.02,
         }
-
-    class _FakeRequest:
-        prompts = [PROMPT]
-        sampling_params = _FakeSamplingParams()
-
-    print(f"[OMNI] Generating {WIDTH}x{HEIGHT}, steps={NUM_STEPS}, seed={SEED} …")
-    t0 = time.perf_counter()
-    result = pipeline.forward(_FakeRequest())
-    dt = time.perf_counter() - t0
-    print(f"[OMNI] Done in {dt:.1f}s")
-
-    img = result.output
-    del pipeline
-    torch.cuda.empty_cache()
-    return img
+    return params_list
 
 
-# ---------------------------------------------------------------------------
-# 3. Comparison
-# ---------------------------------------------------------------------------
+def _extract_generated_image(omni_outputs: list) -> Image.Image | None:
+    """Extract the generated image from Omni outputs."""
+    for req_output in omni_outputs:
+        if images := getattr(req_output, "images", None):
+            return images[0]
+        if hasattr(req_output, "request_output") and req_output.request_output:
+            stage_out = req_output.request_output
+            if hasattr(stage_out, "images") and stage_out.images:
+                return stage_out.images[0]
+    return None
 
 
-def compare_images(ref: Image.Image, omni: Image.Image, out_dir: str):
-    """Pixel-level comparison and diff visualisation."""
-    ref_np = np.array(ref).astype(np.float32)
-    omni_np = np.array(omni).astype(np.float32)
+def _validate_pixels(
+    image: Image.Image,
+    reference_pixels: list[dict[str, Any]] = REFERENCE_PIXELS,
+    tolerance: int = PIXEL_TOLERANCE,
+) -> None:
+    """Validate that image pixels match expected reference values.
 
-    if ref_np.shape != omni_np.shape:
-        print(f"[WARN] Shape mismatch: ref={ref_np.shape} vs omni={omni_np.shape}")
-        return
+    Args:
+        image: The PIL Image to validate.
+        reference_pixels: List of dicts with 'position' (x, y) and 'rgb' (R, G, B).
+        tolerance: Maximum allowed difference per color channel.
 
-    diff = np.abs(ref_np - omni_np)
-    mae = diff.mean()
-    max_diff = diff.max()
-    psnr = 20 * np.log10(255.0 / (np.sqrt(np.mean((ref_np - omni_np) ** 2)) + 1e-8))
-
-    print("\n" + "=" * 60)
-    print("COMPARISON RESULTS")
-    print("=" * 60)
-    print(f"  Image size     : {ref_np.shape[1]}x{ref_np.shape[0]}")
-    print(f"  MAE (0-255)    : {mae:.2f}")
-    print(f"  Max diff       : {max_diff:.0f}")
-    print(f"  PSNR           : {psnr:.1f} dB")
-    print(f"  Exact match    : {np.array_equal(ref_np.astype(np.uint8), omni_np.astype(np.uint8))}")
-
-    # Sample pixel comparisons at specific positions
-    positions = [(100, 100), (768, 1360), (400, 600), (1200, 2000), (750, 500)]
-    print("\n  Pixel samples (x, y) -> ref_rgb vs omni_rgb:")
-    for x, y in positions:
-        if y < ref_np.shape[0] and x < ref_np.shape[1]:
-            r = tuple(ref_np[y, x].astype(int))
-            o = tuple(omni_np[y, x].astype(int))
-            d = tuple(diff[y, x].astype(int))
-            print(f"    ({x:4d}, {y:4d}): ref={r} omni={o} diff={d}")
-
-    # Diff visualisation (amplified by 5x for visibility)
-    diff_vis = np.clip(diff * 5, 0, 255).astype(np.uint8)
-    Image.fromarray(diff_vis).save(os.path.join(out_dir, "sensenova_u1_diff.png"))
-    print(f"\n  Diff map saved to {out_dir}/sensenova_u1_diff.png")
-
-    if mae < 1.0:
-        print("\n  VERDICT: PASS (MAE < 1.0 — images are essentially identical)")
-    elif mae < 10.0:
-        print(f"\n  VERDICT: CLOSE (MAE = {mae:.1f} — minor numerical differences)")
-    else:
-        print(f"\n  VERDICT: DIVERGED (MAE = {mae:.1f} — significant differences, investigate)")
+    Raises:
+        AssertionError: If any pixel differs beyond tolerance.
+    """
+    for ref in reference_pixels:
+        x, y = ref["position"]
+        expected = ref["rgb"]
+        actual = image.getpixel((x, y))[:3]
+        assert all(abs(a - e) <= tolerance for a, e in zip(actual, expected)), (
+            f"Pixel mismatch at ({x}, {y}): expected {expected}, got {actual}"
+        )
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _generate_sensenova_u1_image(
+    omni: Omni,
+    prompt: str = DEFAULT_PROMPT,
+) -> Image.Image:
+    """Generate an image using SenseNova-U1 model with configured parameters.
 
+    Args:
+        omni: The Omni instance to use for generation.
+        prompt: The text prompt for image generation.
 
-def parse_args():
-    p = argparse.ArgumentParser(description="SenseNova-U1 vLLM-Omni comparison test")
-    p.add_argument("--model_path", default=MODEL_ID, help="HF model id or local path")
-    p.add_argument("--output_dir", default="outputs", help="Where to save images")
-    p.add_argument(
-        "--mode",
-        choices=["both", "ref", "omni"],
-        default="both",
-        help="'both'=run both and compare, 'ref'=only reference, 'omni'=only vllm-omni",
+    Returns:
+        The generated PIL Image.
+
+    Raises:
+        AssertionError: If no image is generated or size is incorrect.
+    """
+    params_list = _configure_sampling_params(omni)
+
+    omni_outputs = list(
+        omni.generate(
+            prompts=[{"prompt": prompt, "modalities": ["image"]}],
+            sampling_params_list=params_list,
+        )
     )
-    return p.parse_args()
+
+    generated_image = _extract_generated_image(omni_outputs)
+    assert generated_image is not None, "No images generated"
+    assert generated_image.size == EXPECTED_OUTPUT_SIZE, f"Expected {EXPECTED_OUTPUT_SIZE}, got {generated_image.size}"
+
+    return generated_image
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+def _resolve_deploy_config(config_path: str, run_level: str) -> str:
+    """Resolve deploy config based on run level.
 
-    ref_path = os.path.join(args.output_dir, "sensenova_u1_ref.png")
-    omni_path = os.path.join(args.output_dir, "sensenova_u1_omni.png")
-
-    ref_img = None
-    omni_img = None
-
-    if args.mode in ("both", "ref"):
-        ref_img = run_reference(args.model_path)
-        ref_img.save(ref_path)
-        print(f"[REF] Saved to {ref_path}")
-
-    if args.mode in ("both", "omni"):
-        omni_img = run_omni(args.model_path)
-        omni_img.save(omni_path)
-        print(f"[OMNI] Saved to {omni_path}")
-
-    if args.mode == "both" and ref_img is not None and omni_img is not None:
-        compare_images(ref_img, omni_img, args.output_dir)
-    elif args.mode == "omni" and os.path.exists(ref_path):
-        print(f"\n[INFO] Found existing reference at {ref_path}, comparing …")
-        ref_img = Image.open(ref_path)
-        compare_images(ref_img, omni_img, args.output_dir)
-
-    print("\nDone.")
+    For advanced_model (real weights), strip load_format: dummy so the model
+    falls back to loading real weights from HuggingFace.
+    """
+    if run_level == "advanced_model":
+        return modify_stage_config(
+            config_path,
+            deletes={
+                "stages": {
+                    0: ["load_format"],
+                }
+            },
+        )
+    return config_path
 
 
-if __name__ == "__main__":
-    main()
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100"})
+def test_sensenova_u1_text2img(run_level):
+    """Test SenseNova-U1 text2img with shared memory connector."""
+    config_path = _resolve_deploy_config(SENSENOVA_U1_CI_DEPLOY, run_level)
+    with OmniRunner(
+        "SenseNova/SenseNova-U1-8B-MoT",
+        stage_configs_path=config_path,
+    ) as runner:
+        generated_image = _generate_sensenova_u1_image(runner.omni)
+        if run_level == "advanced_model":
+            _validate_pixels(generated_image)

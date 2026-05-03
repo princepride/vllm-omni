@@ -453,6 +453,16 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
     },
+    "sensenova_u1": {
+        "base_config": "sensenova_u1.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 1,
+                "load_format": "dummy",
+            },
+        ],
+    },
     "bagel_mooncake": {
         "base_config": "bagel.yaml",
         "stages": [

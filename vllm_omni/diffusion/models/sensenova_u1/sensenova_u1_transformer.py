@@ -738,7 +738,7 @@ class SenseNovaU1ForCausalLM(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
-        logits = self.lm_head(outputs.last_hidden_state)
+        logits = torch.nn.functional.linear(outputs.last_hidden_state, self.lm_head.weight)
         return type(
             "Output",
             (),
