@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as VLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler as SyncScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
@@ -80,6 +81,47 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
 
+    def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
+        """Return the number of tokens confirmed computed (excluding async placeholders).
+
+        In async scheduling mode, num_computed_tokens is optimistically advanced
+        to include scheduled-but-not-yet-executed tokens. The confirmed count
+        (actual KV data on GPU) is obtained by subtracting the outstanding
+        output placeholders.
+        """
+        return request.num_computed_tokens - request.num_output_placeholders
+
+    def _update_request_with_output(self, request: Request, new_token_ids: list[int]) -> tuple[list[int], bool]:
+        """Handle output tokens with proper async scheduling protocol.
+
+        Uses the sync Scheduler's token-appending logic (no cache_blocks call),
+        then manages num_output_placeholders ourselves. This avoids the
+        AsyncScheduler's eager cache_blocks call which can interfere with KV
+        transfer block management in omni pipelines.
+        """
+        if request.discard_latest_async_tokens:
+            request.discard_latest_async_tokens = False
+            return [], False
+
+        status_before_update = request.status
+
+        # Use the base sync Scheduler logic: append tokens, check stop.
+        new_token_ids, stopped = SyncScheduler._update_request_with_output(self, request, new_token_ids)
+
+        # Maintain the async placeholder bookkeeping.
+        request.num_output_placeholders -= len(new_token_ids)
+        assert request.num_output_placeholders >= 0
+
+        # Cache blocks up to the confirmed computed tokens. We do this
+        # explicitly (same as AsyncScheduler) so prefix caching still works
+        # when enabled, but using the confirmed count to avoid caching blocks
+        # whose KV has not yet been computed on GPU.
+        if status_before_update == RequestStatus.RUNNING:
+            confirmed = self._get_confirmed_num_computed_tokens(request)
+            self.kv_cache_manager.cache_blocks(request, confirmed)
+
+        return new_token_ids, stopped
+
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
         if not hasattr(self, "vllm_config"):
@@ -146,10 +188,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 return True
             return False
 
+        # Use confirmed computed tokens (excludes async placeholders) to get
+        # the actual seq_len of KV data present on GPU.
+        confirmed_computed = self._get_confirmed_num_computed_tokens(request)
+
         if criteria_type == "prefill_finished":
-            if request.num_computed_tokens >= request.num_prompt_tokens:
+            if confirmed_computed >= request.num_prompt_tokens:
                 self.transfer_triggered_requests.add(request.request_id)
-                self._mark_request_for_kv_transfer(request.request_id, request.num_computed_tokens)
+                self._mark_request_for_kv_transfer(request.request_id, confirmed_computed)
                 actually_queued = request.request_id in self.requests_needing_kv_transfer
 
                 if stop_decode_on_trigger and actually_queued:
@@ -169,9 +215,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 try:
                     idx = new_token_ids.index(target_token_id)
                     tokens_to_exclude = len(new_token_ids) - (idx + 1)
-                    snapshot_len = request.num_computed_tokens - tokens_to_exclude
+                    snapshot_len = confirmed_computed - tokens_to_exclude
                 except ValueError:
-                    snapshot_len = request.num_computed_tokens
+                    snapshot_len = confirmed_computed
 
                 self._mark_request_for_kv_transfer(request.request_id, snapshot_len)
                 actually_queued = request.request_id in self.requests_needing_kv_transfer
@@ -622,7 +668,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     )
             else:
                 self.waiting_for_transfer_free.add(request_id)
-                self._mark_request_for_kv_transfer(request_id, request.num_computed_tokens)
+                confirmed_computed = self._get_confirmed_num_computed_tokens(request)
+                self._mark_request_for_kv_transfer(request_id, confirmed_computed)
                 # Return KV transfer metadata so it propagates to RequestOutput
                 if request_id in self.requests_needing_kv_transfer:
                     transfer_data = self.requests_needing_kv_transfer[request_id]
