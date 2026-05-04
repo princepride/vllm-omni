@@ -1,0 +1,105 @@
+# SenseNova-U1 for text-to-image generation
+
+## Summary
+
+- Vendor: SenseNova
+- Model: `SenseNova/SenseNova-U1-8B-MoT`
+- Task: Text-to-image generation (with optional think-mode reasoning)
+- Mode: Offline inference
+- Maintainer: Community
+
+## When to use this recipe
+
+Use this recipe to run SenseNova-U1-8B-MoT text-to-image generation via
+vLLM-Omni. SenseNova-U1 is a unified Qwen3-based LLM with
+Mixture-of-Tokenizers (MoT) attention that handles text encoding, optional
+chain-of-thought reasoning, and flow-matching image denoising in a single
+pipeline — no separate text encoder or VAE needed.
+
+## References
+
+- Example script:
+  [`examples/offline_inference/sensenova_u1/end2end.py`](../../examples/offline_inference/sensenova_u1/end2end.py)
+- Example README:
+  [`examples/offline_inference/sensenova_u1/README.md`](../../examples/offline_inference/sensenova_u1/README.md)
+- E2E test:
+  [`tests/e2e/offline_inference/test_sensenova_u1_t2i.py`](../../tests/e2e/offline_inference/test_sensenova_u1_t2i.py)
+- HuggingFace model page:
+  [SenseNova/SenseNova-U1-8B-MoT](https://huggingface.co/SenseNova/SenseNova-U1-8B-MoT)
+
+## Hardware Support
+
+## GPU
+
+### 1x H200 (144GB)
+
+#### Environment
+
+- OS: Linux
+- Python: 3.12
+- Driver / runtime: NVIDIA 590.48.01, CUDA 13.1
+- vLLM-Omni version: 0.18.1.dev
+
+#### Command
+
+```bash
+python examples/offline_inference/sensenova_u1/end2end.py \
+    --prompt "Close portrait of an elderly woman by a farmhouse window, textured skin, gentle smile, warm natural light, emotional documentary look. The portrait should feel polished and natural, with sharp eyes, realistic skin texture, accurate facial anatomy, and premium lighting that keeps the face as the main focus." \
+    --width 1536 --height 2720 \
+    --seed 42 --num-steps 50 \
+    --cfg-scale 4.0 --timestep-shift 3.0 --cfg-norm none \
+    --think --print-think \
+    --output outputs
+```
+
+#### Verification
+
+```bash
+pytest -s -v tests/e2e/offline_inference/test_sensenova_u1_t2i.py \
+    -m "advanced_model" --run-level "advanced_model"
+```
+
+#### Notes
+
+- E2E latency: **32.1s** (1536×2720, 50 steps, think mode, CFG scale 4.0)
+- Peak VRAM: **35.9 GB** reserved, 35.1 GB allocated
+- Model loading: 32.8 GiB, 8.7s
+- No deploy YAML needed — the engine auto-generates a single-stage diffusion config.
+- Think mode (`--think`) is recommended for higher image quality.
+
+### 2x H200 (144GB) — TP=2
+
+#### Environment
+
+- OS: Linux
+- Python: 3.12
+- Driver / runtime: NVIDIA 590.48.01, CUDA 13.1
+- vLLM-Omni version: 0.18.1.dev
+
+#### Command
+
+```bash
+python examples/offline_inference/sensenova_u1/end2end.py \
+    --prompt "Close portrait of an elderly woman by a farmhouse window, textured skin, gentle smile, warm natural light, emotional documentary look. The portrait should feel polished and natural, with sharp eyes, realistic skin texture, accurate facial anatomy, and premium lighting that keeps the face as the main focus." \
+    --width 1536 --height 2720 \
+    --seed 42 --num-steps 50 \
+    --cfg-scale 4.0 --timestep-shift 3.0 --cfg-norm none \
+    --think --print-think \
+    --tensor-parallel-size 2 \
+    --output outputs
+```
+
+#### Verification
+
+Verify the output image is generated at `outputs/sensenova_u1_output_0.png`
+with the expected 1536×2720 resolution.
+
+#### Notes
+
+- E2E latency: **28.3s** (1536×2720, 50 steps, think mode, CFG scale 4.0)
+- Peak VRAM (per GPU): **18.2 GB** reserved, 17.9 GB allocated
+- Model loading: 16.5 GiB per GPU, 7.0s
+- TP=2 provides ~12% speedup over TP=1; limited by serial CFG dual-forward
+  and communication overhead.
+- The LLM transformer uses `QKVParallelLinear` and `MergedColumnParallelLinear`
+  for fused QKV and gate/up projections with TP support.
