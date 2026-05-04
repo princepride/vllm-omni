@@ -66,7 +66,6 @@ Use `--print-think` to display the generated reasoning text.
 | Parameter | Default | Description |
 | :-------- | :------ | :---------- |
 | `--model` | `SenseNova/SenseNova-U1-8B-MoT` | HuggingFace model ID or local path |
-| `--deploy-config` | `vllm_omni/deploy/sensenova_u1.yaml` | Deploy YAML configuration |
 | `--output` | `.` | Output directory for saved images |
 | `--tensor-parallel-size` | 1 | Number of GPUs for tensor parallelism |
 | `--enforce-eager` | False | Disable torch.compile |

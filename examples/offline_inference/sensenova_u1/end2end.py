@@ -42,13 +42,6 @@ def parse_args():
         default=".",
         help="Output directory to save generated images.",
     )
-    parser.add_argument(
-        "--deploy-config",
-        type=str,
-        default="vllm_omni/deploy/sensenova_u1.yaml",
-        help="Path to deploy YAML configuration.",
-    )
-
     # Image dimensions
     parser.add_argument("--height", type=int, default=2048, help="Height of generated image.")
     parser.add_argument("--width", type=int, default=2048, help="Width of generated image.")
@@ -113,7 +106,6 @@ def main():
 
     omni = Omni(
         model=args.model,
-        stage_configs_path=args.deploy_config,
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
     )
