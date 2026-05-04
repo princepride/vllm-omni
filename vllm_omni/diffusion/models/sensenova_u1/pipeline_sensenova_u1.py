@@ -27,6 +27,7 @@ from typing import ClassVar
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision.transforms as T
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
@@ -53,6 +54,13 @@ logger = init_logger(__name__)
 
 NORM_MEAN = (0.5, 0.5, 0.5)
 NORM_STD = (0.5, 0.5, 0.5)
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+IMG_START_TOKEN = "<img>"
+IMG_END_TOKEN = "</img>"
+IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
 
 SYSTEM_MESSAGE_FOR_GEN = (
     "You are an image generation and editing assistant that accurately understands and executes "
@@ -87,6 +95,89 @@ def _resolve_model_path(model_path: str) -> str:
     from huggingface_hub import snapshot_download
 
     return snapshot_download(model_path)
+
+
+def _round_by_factor(number: float, factor: int) -> int:
+    return round(number / factor) * factor
+
+
+def _ceil_by_factor(number: float, factor: int) -> int:
+    return math.ceil(number / factor) * factor
+
+
+def _floor_by_factor(number: float, factor: int) -> int:
+    return math.floor(number / factor) * factor
+
+
+def _smart_resize(
+    height: int,
+    width: int,
+    factor: int = 32,
+    min_pixels: int = 65536,
+    max_pixels: int = 4194304,
+) -> tuple[int, int]:
+    """Rescale so that H/W are divisible by *factor* and total pixels in [min, max]."""
+    if max(height, width) / min(height, width) > 200:
+        raise ValueError(f"absolute aspect ratio must be < 200, got {max(height, width) / min(height, width)}")
+    h_bar = max(factor, _round_by_factor(height, factor))
+    w_bar = max(factor, _round_by_factor(width, factor))
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, _floor_by_factor(height / beta, factor))
+        w_bar = max(factor, _floor_by_factor(width / beta, factor))
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = _ceil_by_factor(height * beta, factor)
+        w_bar = _ceil_by_factor(width * beta, factor)
+    return h_bar, w_bar
+
+
+def _load_image_native(
+    image,
+    patch_size: int = 16,
+    downsample_ratio: float = 0.5,
+    min_pixels: int = 65536,
+    max_pixels: int = 4194304,
+):
+    """Load, smart-resize, ImageNet-normalize, and patchify an input image."""
+    if not isinstance(image, Image.Image):
+        image = Image.open(image)
+    if image.mode == "RGBA":
+        bg = Image.new("RGB", image.size, (255, 255, 255))
+        bg.paste(image, mask=image.split()[3])
+        image = bg.convert("RGB")
+    else:
+        image = image.convert("RGB")
+
+    transform = T.Compose(
+        [
+            T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+            T.ToTensor(),
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+
+    size_factor = int(patch_size // downsample_ratio)
+    resized_h, resized_w = _smart_resize(
+        image.height,
+        image.width,
+        factor=size_factor,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
+    image = image.resize((resized_w, resized_h))
+
+    pixel_values = transform(image).to(torch.float32)
+    c, h, w = pixel_values.shape
+    grid_h = h // patch_size
+    grid_w = w // patch_size
+    flatten_pv = (
+        pixel_values.view(c, grid_h, patch_size, grid_w, patch_size)
+        .permute(1, 3, 0, 2, 4)
+        .reshape(grid_h * grid_w, c * patch_size**2)
+    )
+    grid_hw = torch.tensor([[grid_h, grid_w]])
+    return flatten_pv, grid_hw
 
 
 def _load_sensenova_u1_config(model_path: str):
@@ -398,13 +489,20 @@ def _optimized_scale(positive_flat, negative_flat):
 
 
 class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelineProfilerMixin):
-    """SenseNova-U1 text-to-image pipeline for vllm-omni.
+    """SenseNova-U1 text-to-image and image-to-image pipeline for vllm-omni.
 
     Builds the full model graph internally:
     - language_model: SenseNovaU1ForCausalLM (TP-aware)
     - vision_model: NEOVisionModel (understanding branch)
     - fm_modules: ModuleDict with vision_model_mot_gen, timestep_embedder, fm_head, etc.
+
+    img2img (image editing) is triggered when `multi_modal_data["image"]` is
+    present in the prompt dict.  The pipeline then uses triple KV caches
+    (condition / img_condition / uncondition) with dual CFG
+    (``cfg_scale`` + ``img_cfg_scale``).
     """
+
+    support_image_input = True
 
     # CPU-offload protocol: language_model carries the denoising blocks; the
     # vision and FM modules are lightweight encoders pinned on GPU during the
@@ -424,6 +522,8 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
         self.top_cfg, self.llm_cfg, self.vis_cfg = _load_sensenova_u1_config(model_path)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.local_model_path)
+        self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        self.img_start_token_id = self.tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
 
         # Language model (TP-aware)
         self.language_model = SenseNovaU1ForCausalLM(
@@ -506,6 +606,62 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
         indexes = torch.stack([t_idx, h_idx, w_idx], dim=0)
         attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
         return input_ids, indexes, attention_mask
+
+    def _get_thw_indexes(self, input_ids, grid_hw=None):
+        """Build 3D RoPE indexes (t, h, w) from input_ids, assigning spatial
+        positions to ``<IMG_CONTEXT>`` tokens when *grid_hw* is provided."""
+        img_start_shift = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=input_ids.device),
+                (input_ids == self.img_start_token_id).long(),
+            ],
+            dim=0,
+        )[:-1]
+        not_img_token = (input_ids != self.img_context_token_id).long()
+        t_indexes = (img_start_shift + not_img_token).cumsum(0) - 1
+        h_indexes = torch.zeros_like(t_indexes)
+        w_indexes = torch.zeros_like(t_indexes)
+
+        if grid_hw is not None:
+            selected = input_ids == self.img_context_token_id
+            if selected.long().sum() > 0:
+                ds = int(1 / self.downsample_ratio)
+                abs_w, abs_h = _build_abs_positions_from_grid_hw(
+                    grid_hw // ds,
+                    device=t_indexes.device,
+                )
+                h_indexes[selected] = abs_h.to(t_indexes.device, t_indexes.dtype)
+                w_indexes[selected] = abs_w.to(t_indexes.device, t_indexes.dtype)
+        return torch.stack([t_indexes, h_indexes, w_indexes], dim=0)
+
+    def _build_it2i_inputs(self, query, pixel_values=None, grid_hw=None):
+        """Tokenize *query*, inject ViT features at ``<IMG_CONTEXT>`` positions,
+        and return ``(input_embeds, indexes, attention_mask)``."""
+        model_inputs = self.tokenizer(query, return_tensors="pt")
+        input_ids = model_inputs["input_ids"].to(self.device)
+        indexes = self._get_thw_indexes(input_ids[0], grid_hw)
+        attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
+        input_embeds = self.language_model.get_input_embeddings()(input_ids)
+        B, N, C = input_embeds.shape
+        if pixel_values is not None:
+            vit_embeds = self._extract_feature(pixel_values, grid_hw=grid_hw)
+            input_embeds = input_embeds.reshape(B * N, C)
+            flat_ids = input_ids.reshape(B * N)
+            selected = flat_ids == self.img_context_token_id
+            assert selected.sum() != 0, "No <IMG_CONTEXT> tokens found in query"
+            input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
+            input_embeds = input_embeds.reshape(B, N, C)
+        return input_embeds, indexes, attention_mask
+
+    def _it2i_prefix_forward(self, input_embeds, indexes, attention_mask):
+        """Run the prefix (text + vision embeddings) through the LM to get KV cache."""
+        out = self.language_model.model(
+            inputs_embeds=input_embeds,
+            indexes=indexes,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+        return out.past_key_values, out.last_hidden_state
 
     def _build_t2i_image_indexes(self, token_h, token_w, text_len, device):
         t_image = torch.full((token_h * token_w,), text_len, dtype=torch.long, device=device)
@@ -639,108 +795,115 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
         return t_idx + seq_len
 
     # -----------------------------------------------------------------------
-    # Main forward (T2I generation)
+    # Main forward (T2I / IT2I generation)
     # -----------------------------------------------------------------------
 
-    @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def _parse_request(self, req: OmniDiffusionRequest):
+        """Extract common parameters from the request."""
         first_prompt = req.prompts[0]
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-
         extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
         height = int(req.sampling_params.height) if req.sampling_params.height else 2048
         width = int(req.sampling_params.width) if req.sampling_params.width else 2048
-        image_size = (width, height)
+        grid_factor = self.patch_size * self.merge_size
+        if height % grid_factor or width % grid_factor:
+            old_h, old_w = height, width
+            height = _round_by_factor(height, grid_factor)
+            width = _round_by_factor(width, grid_factor)
+            logger.warning(
+                "Output size %dx%d not divisible by %d, rounded to %dx%d",
+                old_w,
+                old_h,
+                grid_factor,
+                width,
+                height,
+            )
+        return SimpleNamespace(
+            first_prompt=first_prompt,
+            prompt=prompt,
+            extra_args=extra_args,
+            image_size=(width, height),
+            num_steps=int(req.sampling_params.num_inference_steps or 50),
+            cfg_scale=float(extra_args.get("cfg_scale", 4.0)),
+            img_cfg_scale=float(extra_args.get("img_cfg_scale", 1.0)),
+            cfg_norm=str(extra_args.get("cfg_norm", "none")),
+            timestep_shift=float(extra_args.get("timestep_shift", 3.0)),
+            cfg_interval=tuple(extra_args.get("cfg_interval", (0.0, 1.0))),
+            batch_size=int(extra_args.get("batch_size", 1)),
+            seed=int(req.sampling_params.seed) if req.sampling_params.seed is not None else 42,
+            think_mode=bool(extra_args.get("think", False)),
+            t_eps=float(extra_args.get("t_eps", 0.02)),
+        )
 
-        num_steps = int(req.sampling_params.num_inference_steps or 50)
-        cfg_scale = float(extra_args.get("cfg_scale", 4.0))
-        cfg_norm = str(extra_args.get("cfg_norm", "none"))
-        timestep_shift = float(extra_args.get("timestep_shift", 3.0))
-        cfg_interval = tuple(extra_args.get("cfg_interval", (0.0, 1.0)))
-        batch_size = int(extra_args.get("batch_size", 1))
-        seed = int(req.sampling_params.seed) if req.sampling_params.seed is not None else 42
-        think_mode = bool(extra_args.get("think", False))
-        t_eps = float(extra_args.get("t_eps", 0.02))
-        self.top_cfg.t_eps = t_eps
+    def _extract_input_images(self, first_prompt):
+        """Return a list of PIL images from ``multi_modal_data``, or *None*."""
+        if isinstance(first_prompt, str):
+            return None
+        mm_data = first_prompt.get("multi_modal_data") or {}
+        raw = mm_data.get("image") or mm_data.get("img2img")
+        if raw is None:
+            return None
+        if not isinstance(raw, list):
+            raw = [raw]
+        images = []
+        for item in raw:
+            if isinstance(item, str):
+                images.append(Image.open(item).convert("RGB"))
+            elif isinstance(item, Image.Image):
+                images.append(item.convert("RGB"))
+            else:
+                raise TypeError(f"Unsupported image type: {type(item)}")
+        return images if images else None
 
-        merge_size = self.merge_size
-        IMG_START_TOKEN = "<img>"
+    def _prepare_input_images(self, images: list[Image.Image]):
+        """Encode input images: load, smart-resize, patchify → (pixel_values, grid_hw)."""
+        pixel_values_list = []
+        grid_hw_list = []
+        num_images = len(images)
+        max_pixels_per_image = min(2048 * 2048, (4096 * 4096) // num_images)
+        for img in images:
+            pv, ghw = _load_image_native(
+                img,
+                patch_size=self.vis_cfg.patch_size,
+                downsample_ratio=self.downsample_ratio,
+                min_pixels=512 * 512,
+                max_pixels=max_pixels_per_image,
+            )
+            pixel_values_list.append(pv.to(self.device, dtype=torch.bfloat16))
+            grid_hw_list.append(ghw.to(self.device))
+        return torch.cat(pixel_values_list), torch.cat(grid_hw_list)
+
+    def _build_it2i_query(self, prompt, images, think_mode):
+        """Build the tokenizer query string for img2img, expanding ``<image>``
+        placeholders into ``<img><IMG_CONTEXT>...<IMG_CONTEXT></img>`` with the
+        correct number of patches per image."""
+        image_count = prompt.count("<image>")
+        n_images = len(images["grid_hw"])
+        if n_images > image_count:
+            if image_count == 0 and n_images > 1:
+                prefix = "".join(f"Image-{i + 1}:<image>\n" for i in range(n_images))
+            else:
+                prefix = "<image>\n" * (n_images - image_count)
+            prompt = prefix + prompt
 
         think_content = "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
-        query_condition = _build_t2i_query(prompt, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
-        query_uncondition = _build_t2i_query("", append_text=IMG_START_TOKEN)
+        query = _build_t2i_query(prompt, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
 
-        input_ids_cond, indexes_cond, mask_cond = self._build_t2i_text_inputs(query_condition)
-        input_ids_uncond, indexes_uncond, mask_uncond = self._build_t2i_text_inputs(query_uncondition)
+        for i in range(images["grid_hw"].shape[0]):
+            h, w = images["grid_hw"][i]
+            num_patch_token = int(h * w * self.downsample_ratio**2)
+            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_patch_token + IMG_END_TOKEN
+            query = query.replace("<image>", image_tokens, 1)
+        return query
 
-        token_h = image_size[1] // (self.patch_size * merge_size)
-        token_w = image_size[0] // (self.patch_size * merge_size)
-
-        indexes_image_cond = self._build_t2i_image_indexes(
-            token_h,
-            token_w,
-            indexes_cond.shape[1],
-            device=self.device,
-        )
-        indexes_image_uncond = self._build_t2i_image_indexes(
-            token_h,
-            token_w,
-            indexes_uncond.shape[1],
-            device=self.device,
-        )
-
-        think_text = ""
-        if think_mode:
-            outputs_cond = self.language_model(
-                input_ids=input_ids_cond,
-                indexes=indexes_cond,
-                attention_mask=mask_cond,
-                use_cache=True,
-            )
-            past_kv_cond = outputs_cond.past_key_values
-            t_index_cond = indexes_cond[0].max().item()
-            past_kv_cond, t_index_cond, think_text = self._generate_think(
-                outputs_cond,
-                past_kv_cond,
-                t_index_cond,
-            )
-            indexes_image_cond = self._build_t2i_image_indexes(
-                token_h,
-                token_w,
-                t_index_cond + 1,
-                device=self.device,
-            )
-            hidden_cond = None
-        else:
-            past_kv_cond, hidden_cond = self._t2i_prefix_forward(input_ids_cond, indexes_cond, mask_cond)
-
-        past_kv_uncond, hidden_uncond = self._t2i_prefix_forward(input_ids_uncond, indexes_uncond, mask_uncond)
-
-        device = self.device
-        dtype = self.od_config.dtype
-
-        # Expand cache for batch
-        for layer_idx in range(len(past_kv_cond.layers)):
-            past_kv_cond.layers[layer_idx].keys = past_kv_cond.layers[layer_idx].keys.expand(
-                batch_size, *past_kv_cond.layers[layer_idx].keys.shape[1:]
-            )
-            past_kv_cond.layers[layer_idx].values = past_kv_cond.layers[layer_idx].values.expand(
-                batch_size, *past_kv_cond.layers[layer_idx].values.shape[1:]
-            )
-            past_kv_uncond.layers[layer_idx].keys = past_kv_uncond.layers[layer_idx].keys.expand(
-                batch_size, *past_kv_uncond.layers[layer_idx].keys.shape[1:]
-            )
-            past_kv_uncond.layers[layer_idx].values = past_kv_uncond.layers[layer_idx].values.expand(
-                batch_size, *past_kv_uncond.layers[layer_idx].values.shape[1:]
-            )
-
-        prepare_flash_kv_cache(past_kv_cond, current_len=token_h * token_w, batch_size=batch_size)
-        prepare_flash_kv_cache(past_kv_uncond, current_len=token_h * token_w, batch_size=batch_size)
-
-        # Init noise
-        grid_h = image_size[1] // self.patch_size
-        grid_w = image_size[0] // self.patch_size
-        grid_hw = torch.tensor([[grid_h, grid_w]] * batch_size, device=device)
+    def _init_noise_and_schedule(self, p):
+        """Init Gaussian noise and compute the flow-matching timestep schedule."""
+        merge_size = self.merge_size
+        grid_h = p.image_size[1] // self.patch_size
+        grid_w = p.image_size[0] // self.patch_size
+        token_h = p.image_size[1] // (self.patch_size * merge_size)
+        token_w = p.image_size[0] // (self.patch_size * merge_size)
+        grid_hw = torch.tensor([[grid_h, grid_w]] * p.batch_size, device=self.device)
 
         noise_scale = self.top_cfg.noise_scale
         if self.top_cfg.noise_scale_mode in ("resolution", "dynamic", "dynamic_sqrt"):
@@ -750,99 +913,381 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
             if self.top_cfg.noise_scale_mode == "dynamic_sqrt":
                 noise_scale = math.sqrt(noise_scale)
         noise_scale = min(noise_scale, self.top_cfg.noise_scale_max_value)
-        generator = torch.Generator(device).manual_seed(seed)
+
+        generator = torch.Generator(self.device).manual_seed(p.seed)
         image_prediction = noise_scale * torch.randn(
-            (batch_size, 3, image_size[1], image_size[0]),
-            device=device,
-            dtype=dtype,
+            (p.batch_size, 3, p.image_size[1], p.image_size[0]),
+            device=self.device,
+            dtype=self.od_config.dtype,
             generator=generator,
         )
 
-        attn_mask_cond = {"full_attention": None}
-        attn_mask_uncond = {"full_attention": None}
+        timesteps = torch.linspace(0.0, 1.0, p.num_steps + 1, device=self.device)
+        timesteps = self._apply_time_schedule(timesteps, token_h * token_w, p.timestep_shift)
 
-        timesteps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
-        timesteps = self._apply_time_schedule(timesteps, token_h * token_w, timestep_shift)
+        return SimpleNamespace(
+            merge_size=merge_size,
+            grid_h=grid_h,
+            grid_w=grid_w,
+            token_h=token_h,
+            token_w=token_w,
+            grid_hw=grid_hw,
+            noise_scale=noise_scale,
+            image_prediction=image_prediction,
+            timesteps=timesteps,
+        )
 
-        for step_i in range(num_steps):
-            t = timesteps[step_i]
-            t_next = timesteps[step_i + 1]
+    def _denoise_step(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i):
+        """Execute one denoising step with the appropriate CFG strategy."""
+        kv_cond = caches["cond"]
+        idx_cond = caches["idx_cond"]
+        mask_cond = caches["mask_cond"]
+
+        out_cond = self._t2i_predict_v(
+            image_embeds,
+            idx_cond,
+            mask_cond,
+            kv_cond,
+            t,
+            z,
+            image_token_num=ns.token_h * ns.token_w,
+            image_size=p.image_size,
+        )
+
+        is_it2i = "img_cond" in caches
+        if is_it2i:
+            return self._denoise_step_it2i(out_cond, image_embeds, ns, t, z, caches, p, step_i)
+        return self._denoise_step_t2i(out_cond, image_embeds, ns, t, z, caches, p, step_i)
+
+    def _denoise_step_t2i(self, out_cond, image_embeds, ns, t, z, caches, p, step_i):
+        """T2I: two-way CFG (condition vs uncondition), supports cfg_zero_star."""
+        if t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1:
+            out_uncond = self._t2i_predict_v(
+                image_embeds,
+                caches["idx_uncond"],
+                caches["mask_uncond"],
+                caches["uncond"],
+                t,
+                z,
+                image_token_num=ns.token_h * ns.token_w,
+                image_size=p.image_size,
+            )
+            if p.cfg_norm == "cfg_zero_star":
+                pos_flat = out_cond.view(p.batch_size, -1)
+                neg_flat = out_uncond.view(p.batch_size, -1)
+                alpha = _optimized_scale(pos_flat, neg_flat)
+                alpha = alpha.view(p.batch_size, *([1] * (len(out_cond.shape) - 1))).to(pos_flat.dtype)
+                v_pred = (
+                    out_cond * 0.0
+                    if step_i <= 0
+                    else (out_uncond * alpha + p.cfg_scale * (out_cond - out_uncond * alpha))
+                )
+            else:
+                v_pred = out_uncond + p.cfg_scale * (out_cond - out_uncond)
+                v_pred = self._apply_cfg_norm(v_pred, out_cond, p.cfg_norm)
+        else:
+            v_pred = out_cond
+        return v_pred
+
+    def _denoise_step_it2i(self, out_cond, image_embeds, ns, t, z, caches, p, step_i):
+        """IT2I: dual CFG with ``cfg_scale`` (text) and ``img_cfg_scale`` (image)."""
+        use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
+        needs_cfg = not (p.cfg_scale == 1 and p.img_cfg_scale == 1)
+
+        if not use_cfg or not needs_cfg:
+            return out_cond
+
+        predict_kw = dict(image_token_num=ns.token_h * ns.token_w, image_size=p.image_size)
+
+        if p.img_cfg_scale == 1:
+            out_img_cond = self._t2i_predict_v(
+                image_embeds,
+                caches["idx_img_cond"],
+                caches["mask_img_cond"],
+                caches["img_cond"],
+                t,
+                z,
+                **predict_kw,
+            )
+            v_pred = out_img_cond + p.cfg_scale * (out_cond - out_img_cond)
+        elif p.cfg_scale == p.img_cfg_scale:
+            out_uncond = self._t2i_predict_v(
+                image_embeds,
+                caches["idx_uncond"],
+                caches["mask_uncond"],
+                caches["uncond"],
+                t,
+                z,
+                **predict_kw,
+            )
+            v_pred = out_uncond + p.cfg_scale * (out_cond - out_uncond)
+        else:
+            out_img_cond = self._t2i_predict_v(
+                image_embeds,
+                caches["idx_img_cond"],
+                caches["mask_img_cond"],
+                caches["img_cond"],
+                t,
+                z,
+                **predict_kw,
+            )
+            out_uncond = self._t2i_predict_v(
+                image_embeds,
+                caches["idx_uncond"],
+                caches["mask_uncond"],
+                caches["uncond"],
+                t,
+                z,
+                **predict_kw,
+            )
+            v_pred = (
+                out_uncond + p.cfg_scale * (out_cond - out_img_cond) + p.img_cfg_scale * (out_img_cond - out_uncond)
+            )
+
+        if p.cfg_scale > 1 or p.img_cfg_scale > 1:
+            v_pred = self._apply_cfg_norm(v_pred, out_cond, p.cfg_norm)
+        return v_pred
+
+    @staticmethod
+    def _apply_cfg_norm(v_pred, out_cond, cfg_norm):
+        if cfg_norm == "global":
+            norm_c = torch.norm(out_cond, dim=(1, 2), keepdim=True)
+            norm_v = torch.norm(v_pred, dim=(1, 2), keepdim=True)
+            v_pred = v_pred * (norm_c / (norm_v + 1e-8)).clamp(0, 1.0)
+        elif cfg_norm == "channel":
+            norm_c = torch.norm(out_cond, dim=-1, keepdim=True)
+            norm_v = torch.norm(v_pred, dim=-1, keepdim=True)
+            v_pred = v_pred * (norm_c / (norm_v + 1e-8)).clamp(0, 1.0)
+        return v_pred
+
+    def _expand_and_prepare_kv(self, kv, token_hw, batch_size):
+        """Expand KV cache for batch and prepare flash attention buffers."""
+        for layer in kv.layers:
+            layer.keys = layer.keys.expand(batch_size, *layer.keys.shape[1:])
+            layer.values = layer.values.expand(batch_size, *layer.values.shape[1:])
+        prepare_flash_kv_cache(kv, current_len=token_hw, batch_size=batch_size)
+
+    @torch.inference_mode()
+    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        p = self._parse_request(req)
+        self.top_cfg.t_eps = p.t_eps
+
+        input_images = self._extract_input_images(p.first_prompt)
+        is_it2i = input_images is not None
+
+        if is_it2i:
+            return self._forward_it2i(p, input_images)
+        return self._forward_t2i(p)
+
+    def _forward_t2i(self, p) -> DiffusionOutput:
+        """Text-to-image generation path."""
+        ns = self._init_noise_and_schedule(p)
+
+        think_content = "<think>\n" if p.think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
+        query_cond = _build_t2i_query(p.prompt, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
+        query_uncond = _build_t2i_query("", append_text=IMG_START_TOKEN)
+
+        input_ids_cond, indexes_cond, mask_cond = self._build_t2i_text_inputs(query_cond)
+        input_ids_uncond, indexes_uncond, mask_uncond = self._build_t2i_text_inputs(query_uncond)
+
+        indexes_image_cond = self._build_t2i_image_indexes(ns.token_h, ns.token_w, indexes_cond.shape[1], self.device)
+        indexes_image_uncond = self._build_t2i_image_indexes(
+            ns.token_h, ns.token_w, indexes_uncond.shape[1], self.device
+        )
+
+        think_text = ""
+        if p.think_mode:
+            outputs_cond = self.language_model(
+                input_ids=input_ids_cond,
+                indexes=indexes_cond,
+                attention_mask=mask_cond,
+                use_cache=True,
+            )
+            past_kv_cond = outputs_cond.past_key_values
+            t_index_cond = indexes_cond[0].max().item()
+            past_kv_cond, t_index_cond, think_text = self._generate_think(outputs_cond, past_kv_cond, t_index_cond)
+            indexes_image_cond = self._build_t2i_image_indexes(ns.token_h, ns.token_w, t_index_cond + 1, self.device)
+        else:
+            past_kv_cond, _ = self._t2i_prefix_forward(input_ids_cond, indexes_cond, mask_cond)
+
+        past_kv_uncond, _ = self._t2i_prefix_forward(input_ids_uncond, indexes_uncond, mask_uncond)
+
+        self._expand_and_prepare_kv(past_kv_cond, ns.token_h * ns.token_w, p.batch_size)
+        self._expand_and_prepare_kv(past_kv_uncond, ns.token_h * ns.token_w, p.batch_size)
+
+        caches = {
+            "cond": past_kv_cond,
+            "idx_cond": indexes_image_cond,
+            "mask_cond": {"full_attention": None},
+            "uncond": past_kv_uncond,
+            "idx_uncond": indexes_image_uncond,
+            "mask_uncond": {"full_attention": None},
+        }
+        return self._run_denoising_loop(ns, caches, p, think_text)
+
+    def _forward_it2i(self, p, input_images: list[Image.Image]) -> DiffusionOutput:
+        """Image-to-image (editing) generation path with dual CFG."""
+        ns = self._init_noise_and_schedule(p)
+
+        pixel_values, grid_hw = self._prepare_input_images(input_images)
+        images_info = {"grid_hw": grid_hw, "pixel_values": pixel_values}
+        logger.info("img2img: %d input image(s), grid_hw=%s", len(input_images), grid_hw.tolist())
+
+        needs_cfg = not (p.cfg_scale == 1 and p.img_cfg_scale == 1)
+        needs_img_cond = needs_cfg and (p.img_cfg_scale == 1 or p.cfg_scale != p.img_cfg_scale)
+        needs_uncond = needs_cfg and p.img_cfg_scale != 1
+
+        # --- Condition query: full prompt + images ---
+        query_cond = self._build_it2i_query(p.prompt, images_info, p.think_mode)
+        embeds_cond, idx_cond, mask_cond = self._build_it2i_inputs(query_cond, pixel_values, grid_hw)
+
+        # --- Image-only condition: just "<image>" placeholders + pixel values ---
+        if needs_img_cond:
+            img_only_prompt = "<image>" * grid_hw.shape[0]
+            think_off = "<think>\n\n</think>\n\n" + IMG_START_TOKEN
+            query_img_cond = _build_t2i_query(img_only_prompt, append_text=think_off)
+            for i in range(grid_hw.shape[0]):
+                h, w = grid_hw[i]
+                num_patch = int(h * w * self.downsample_ratio**2)
+                tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_patch + IMG_END_TOKEN
+                query_img_cond = query_img_cond.replace("<image>", tokens, 1)
+            embeds_img_cond, idx_img_cond, mask_img_cond = self._build_it2i_inputs(
+                query_img_cond,
+                pixel_values,
+                grid_hw,
+            )
+        else:
+            embeds_img_cond = idx_img_cond = mask_img_cond = None
+
+        # --- Uncondition: empty prompt, no images ---
+        if needs_uncond:
+            query_uncond = _build_t2i_query("", append_text=IMG_START_TOKEN)
+            embeds_uncond, idx_uncond, mask_uncond = self._build_it2i_inputs(query_uncond)
+        else:
+            embeds_uncond = idx_uncond = mask_uncond = None
+
+        # --- Prefix forwards to build KV caches ---
+        think_text = ""
+        if p.think_mode:
+            outputs_cond = self.language_model(
+                inputs_embeds=embeds_cond,
+                indexes=idx_cond,
+                attention_mask=mask_cond,
+                use_cache=True,
+            )
+            past_kv_cond = outputs_cond.past_key_values
+            t_index_cond = idx_cond[0].max().item()
+            past_kv_cond, t_index_cond, think_text = self._generate_think(
+                outputs_cond,
+                past_kv_cond,
+                t_index_cond,
+            )
+            idx_image_cond = self._build_t2i_image_indexes(
+                ns.token_h,
+                ns.token_w,
+                t_index_cond + 1,
+                self.device,
+            )
+        else:
+            past_kv_cond, _ = self._it2i_prefix_forward(embeds_cond, idx_cond, mask_cond)
+            idx_image_cond = self._build_t2i_image_indexes(
+                ns.token_h,
+                ns.token_w,
+                idx_cond[0].max().item() + 1,
+                self.device,
+            )
+
+        caches = {
+            "cond": past_kv_cond,
+            "idx_cond": idx_image_cond,
+            "mask_cond": {"full_attention": None},
+        }
+
+        if needs_img_cond:
+            past_kv_img_cond, _ = self._it2i_prefix_forward(embeds_img_cond, idx_img_cond, mask_img_cond)
+            idx_image_img_cond = self._build_t2i_image_indexes(
+                ns.token_h,
+                ns.token_w,
+                idx_img_cond[0].max().item() + 1,
+                self.device,
+            )
+            caches["img_cond"] = past_kv_img_cond
+            caches["idx_img_cond"] = idx_image_img_cond
+            caches["mask_img_cond"] = {"full_attention": None}
+
+        if needs_uncond:
+            past_kv_uncond, _ = self._it2i_prefix_forward(embeds_uncond, idx_uncond, mask_uncond)
+            idx_image_uncond = self._build_t2i_image_indexes(
+                ns.token_h,
+                ns.token_w,
+                idx_uncond[0].max().item() + 1,
+                self.device,
+            )
+            caches["uncond"] = past_kv_uncond
+            caches["idx_uncond"] = idx_image_uncond
+            caches["mask_uncond"] = {"full_attention": None}
+
+        # Free vision tensors
+        del pixel_values, grid_hw, embeds_cond, idx_cond, mask_cond
+        if embeds_img_cond is not None:
+            del embeds_img_cond, idx_img_cond, mask_img_cond
+        if embeds_uncond is not None:
+            del embeds_uncond, idx_uncond, mask_uncond
+
+        # Expand all KV caches for batch
+        for key in ("cond", "img_cond", "uncond"):
+            if key in caches and not isinstance(caches[key], dict):
+                self._expand_and_prepare_kv(caches[key], ns.token_h * ns.token_w, p.batch_size)
+
+        return self._run_denoising_loop(ns, caches, p, think_text)
+
+    def _run_denoising_loop(self, ns, caches, p, think_text="") -> DiffusionOutput:
+        """Shared denoising loop for both T2I and IT2I."""
+        merge_size = self.merge_size
+        image_prediction = ns.image_prediction
+
+        for step_i in range(p.num_steps):
+            t = ns.timesteps[step_i]
+            t_next = ns.timesteps[step_i + 1]
 
             z = _patchify(image_prediction, self.patch_size * merge_size)
             image_input = _patchify(image_prediction, self.patch_size, channel_first=True)
             image_embeds = self._extract_feature(
-                image_input.view(batch_size * grid_h * grid_w, -1),
+                image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
                 gen_model=True,
-                grid_hw=grid_hw,
-            ).view(batch_size, token_h * token_w, -1)
+                grid_hw=ns.grid_hw,
+            ).view(p.batch_size, ns.token_h * ns.token_w, -1)
 
-            t_expanded = t.expand(batch_size * token_h * token_w)
+            t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
             timestep_embeddings = self.fm_modules["timestep_embedder"](t_expanded).view(
-                batch_size, token_h * token_w, -1
+                p.batch_size,
+                ns.token_h * ns.token_w,
+                -1,
             )
             if self.top_cfg.add_noise_scale_embedding:
-                ns_tensor = torch.full_like(t_expanded, noise_scale / self.top_cfg.noise_scale_max_value)
-                ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(batch_size, token_h * token_w, -1)
+                ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.top_cfg.noise_scale_max_value)
+                ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
+                    p.batch_size,
+                    ns.token_h * ns.token_w,
+                    -1,
+                )
                 timestep_embeddings = timestep_embeddings + ns_emb
             image_embeds = image_embeds + timestep_embeddings
 
-            v_pred_cond = self._t2i_predict_v(
-                image_embeds,
-                indexes_image_cond,
-                attn_mask_cond,
-                past_kv_cond,
-                t,
-                z,
-                image_token_num=token_h * token_w,
-                image_size=image_size,
-            )
-
-            if t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1:
-                v_pred_uncond = self._t2i_predict_v(
-                    image_embeds,
-                    indexes_image_uncond,
-                    attn_mask_uncond,
-                    past_kv_uncond,
-                    t,
-                    z,
-                    image_token_num=token_h * token_w,
-                    image_size=image_size,
-                )
-                if cfg_norm == "cfg_zero_star":
-                    pos_flat = v_pred_cond.view(batch_size, -1)
-                    neg_flat = v_pred_uncond.view(batch_size, -1)
-                    alpha = _optimized_scale(pos_flat, neg_flat)
-                    alpha = alpha.view(batch_size, *([1] * (len(v_pred_cond.shape) - 1))).to(pos_flat.dtype)
-                    if step_i <= 0:
-                        v_pred = v_pred_cond * 0.0
-                    else:
-                        v_pred = v_pred_uncond * alpha + cfg_scale * (v_pred_cond - v_pred_uncond * alpha)
-                else:
-                    v_pred = v_pred_uncond + cfg_scale * (v_pred_cond - v_pred_uncond)
-                    if cfg_norm == "global":
-                        norm_c = torch.norm(v_pred_cond, dim=(1, 2), keepdim=True)
-                        norm_v = torch.norm(v_pred, dim=(1, 2), keepdim=True)
-                        v_pred = v_pred * (norm_c / (norm_v + 1e-8)).clamp(0, 1.0)
-                    elif cfg_norm == "channel":
-                        norm_c = torch.norm(v_pred_cond, dim=-1, keepdim=True)
-                        norm_v = torch.norm(v_pred, dim=-1, keepdim=True)
-                        v_pred = v_pred * (norm_c / (norm_v + 1e-8)).clamp(0, 1.0)
-            else:
-                v_pred = v_pred_cond
-
+            v_pred = self._denoise_step(image_prediction, ns, t, z, image_embeds, caches, p, step_i)
             z = z + (t_next - t) * v_pred
-            image_prediction = _unpatchify(z, self.patch_size * merge_size, image_size[1], image_size[0])
+            image_prediction = _unpatchify(z, self.patch_size * merge_size, p.image_size[1], p.image_size[0])
 
-        clear_flash_kv_cache(past_kv_cond)
-        clear_flash_kv_cache(past_kv_uncond)
+        # Cleanup KV caches
+        for key in ("cond", "uncond", "img_cond"):
+            if key in caches and not isinstance(caches[key], dict):
+                clear_flash_kv_cache(caches[key])
 
         images = _to_pil(image_prediction)
         img = images[0] if images else None
-
         custom = {}
         if think_text:
             custom["think_text"] = think_text
-
         return DiffusionOutput(output=img, custom_output=custom)
 
     # -----------------------------------------------------------------------

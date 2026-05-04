@@ -1,20 +1,21 @@
-# SenseNova-U1 for text-to-image generation
+# SenseNova-U1 for text-to-image and image-to-image generation
 
 ## Summary
 
 - Vendor: SenseNova
 - Model: `SenseNova/SenseNova-U1-8B-MoT`
-- Task: Text-to-image generation (with optional think-mode reasoning)
+- Task: Text-to-image generation and image-to-image editing (with optional think-mode reasoning)
 - Mode: Offline inference
 - Maintainer: Community
 
 ## When to use this recipe
 
-Use this recipe to run SenseNova-U1-8B-MoT text-to-image generation via
-vLLM-Omni. SenseNova-U1 is a unified Qwen3-based LLM with
-Mixture-of-Tokenizers (MoT) attention that handles text encoding, optional
+Use this recipe to run SenseNova-U1-8B-MoT text-to-image or image-to-image
+(editing) generation via vLLM-Omni. SenseNova-U1 is a unified Qwen3-based LLM
+with Mixture-of-Tokenizers (MoT) attention that handles text encoding, optional
 chain-of-thought reasoning, and flow-matching image denoising in a single
-pipeline — no separate text encoder or VAE needed.
+pipeline — no separate text encoder or VAE needed. Image editing uses the same
+LLM with dual CFG (text + image guidance).
 
 ## References
 
@@ -66,6 +67,23 @@ pytest -s -v tests/e2e/offline_inference/test_sensenova_u1_t2i.py \
 - Model loading: 32.8 GiB, 8.7s
 - No deploy YAML needed — the engine auto-generates a single-stage diffusion config.
 - Think mode (`--think`) is recommended for higher image quality.
+
+#### Image-to-Image Editing (img2img)
+
+```bash
+python examples/offline_inference/sensenova_u1/end2end.py \
+    --prompt "Turn this into an oil painting" \
+    --image input.png \
+    --width 2048 --height 2048 \
+    --seed 42 --num-steps 50 \
+    --cfg-scale 4.0 --img-cfg-scale 1.0 --cfg-norm none \
+    --think --print-think \
+    --output outputs
+```
+
+- img2img uses dual CFG: `--cfg-scale` controls text guidance, `--img-cfg-scale`
+  controls image guidance (1.0 = image CFG disabled).
+- Pass multiple `--image` paths for multi-reference editing.
 
 ### 2x H200 (144GB) — TP=2
 

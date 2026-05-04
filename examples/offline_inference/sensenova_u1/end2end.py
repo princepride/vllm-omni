@@ -2,21 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-End-to-end offline inference for SenseNova-U1-8B-MoT text-to-image generation.
+End-to-end offline inference for SenseNova-U1-8B-MoT.
 
-SenseNova-U1 is a unified Qwen3-based LLM with Mixture-of-Tokenizers (MoT)
-attention that handles text encoding, optional think-mode reasoning, and
-flow-matching-based image denoising in a single pipeline.
+Supports both text-to-image (t2i) and image-to-image (img2img / editing).
 
-Usage:
+Text-to-image:
     python end2end.py --prompt "A cute cat" --think
-    python end2end.py --prompt "A futuristic cityscape" --width 2048 --height 2048
+
+Image-to-image (editing):
+    python end2end.py --prompt "Turn this into an oil painting" \
+        --image input.png --think
 
 See README.md for more examples.
 """
 
 import argparse
 import os
+
+from PIL import Image
 
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
@@ -25,7 +28,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="SenseNova-U1 text-to-image generation via vLLM-Omni.",
+        description="SenseNova-U1 text-to-image / image-to-image via vLLM-Omni.",
     )
     parser.add_argument(
         "--model",
@@ -35,7 +38,14 @@ def parse_args():
     parser.add_argument(
         "--prompt",
         default="A cute cat sitting on a windowsill, soft natural light",
-        help="Text prompt for image generation.",
+        help="Text prompt for generation or editing instruction.",
+    )
+    parser.add_argument(
+        "--image",
+        nargs="+",
+        metavar="PATH",
+        default=None,
+        help="Input image path(s) for img2img / editing. When provided, the model runs in image-editing mode.",
     )
     parser.add_argument(
         "--output",
@@ -50,12 +60,20 @@ def parse_args():
     # Generation parameters
     parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic results.")
     parser.add_argument("--num-steps", type=int, default=50, help="Number of denoising steps.")
-    parser.add_argument("--cfg-scale", type=float, default=4.0, help="Classifier-free guidance scale.")
+    parser.add_argument("--cfg-scale", type=float, default=4.0, help="Text classifier-free guidance scale.")
+    parser.add_argument(
+        "--img-cfg-scale",
+        type=float,
+        default=1.0,
+        help="Image CFG scale for img2img (1.0 = disabled). "
+        "When both --cfg-scale and --img-cfg-scale differ, dual CFG is used.",
+    )
     parser.add_argument(
         "--cfg-norm",
         type=str,
         default="none",
-        help="CFG normalization mode.",
+        choices=["none", "global", "channel", "cfg_zero_star"],
+        help="CFG normalization mode. cfg_zero_star is only for t2i.",
     )
     parser.add_argument(
         "--timestep-shift",
@@ -103,48 +121,67 @@ def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
 
+    is_img2img = args.image is not None
+
     omni = Omni(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
     )
 
+    extra_args = {
+        "cfg_scale": args.cfg_scale,
+        "cfg_norm": args.cfg_norm,
+        "timestep_shift": args.timestep_shift,
+        "cfg_interval": (0.0, 1.0),
+        "batch_size": 1,
+        "think": args.think,
+        "t_eps": args.t_eps,
+    }
+    if is_img2img:
+        extra_args["img_cfg_scale"] = args.img_cfg_scale
+
     sampling_params = OmniDiffusionSamplingParams(
         height=args.height,
         width=args.width,
         seed=args.seed,
         num_inference_steps=args.num_steps,
-        extra_args={
-            "cfg_scale": args.cfg_scale,
-            "cfg_norm": args.cfg_norm,
-            "timestep_shift": args.timestep_shift,
-            "cfg_interval": (0.0, 1.0),
-            "batch_size": 1,
-            "think": args.think,
-            "t_eps": args.t_eps,
-        },
+        extra_args=extra_args,
     )
 
+    mode_str = "img2img" if is_img2img else "t2i"
     print(f"\n{'=' * 60}")
-    print("SenseNova-U1 Generation Configuration:")
-    print(f"  Model       : {args.model}")
-    print(f"  Image size  : {args.width}x{args.height}")
-    print(f"  Steps       : {args.num_steps}")
-    print(f"  CFG scale   : {args.cfg_scale}")
-    print(f"  Seed        : {args.seed}")
-    print(f"  Think mode  : {args.think}")
-    print(f"  TP size     : {args.tensor_parallel_size}")
+    print(f"SenseNova-U1 Generation Configuration ({mode_str}):")
+    print(f"  Model          : {args.model}")
+    print(f"  Image size     : {args.width}x{args.height}")
+    print(f"  Steps          : {args.num_steps}")
+    print(f"  CFG scale      : {args.cfg_scale}")
+    if is_img2img:
+        print(f"  Img CFG scale  : {args.img_cfg_scale}")
+        print(f"  Input images   : {args.image}")
+    print(f"  Seed           : {args.seed}")
+    print(f"  Think mode     : {args.think}")
+    print(f"  TP size        : {args.tensor_parallel_size}")
     print(f"{'=' * 60}\n")
+
+    if is_img2img:
+        input_images = [Image.open(p).convert("RGB") for p in args.image]
+        prompt_dict = {
+            "prompt": args.prompt,
+            "multi_modal_data": {"image": input_images},
+            "modalities": ["img2img"],
+        }
+    else:
+        prompt_dict = {"prompt": args.prompt, "modalities": ["image"]}
 
     outputs = list(
         omni.generate(
-            prompts={"prompt": args.prompt, "modalities": ["image"]},
+            prompts=prompt_dict,
             sampling_params_list=sampling_params,
         )
     )
 
     for req_output in outputs:
-        # Single-stage DiT: think text lives on `_custom_output`, images on the request output directly.
         custom = getattr(req_output, "_custom_output", {}) or {}
         if args.print_think and custom.get("think_text"):
             print(f"[Think]\n{custom['think_text']}\n")
