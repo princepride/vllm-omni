@@ -5,7 +5,7 @@
 - Vendor: SenseNova
 - Model: `SenseNova/SenseNova-U1-8B-MoT`
 - Task: text2img, img2img, img2text (visual understanding), text2text (chat)
-- Mode: Offline inference
+- Mode: Offline inference, Online serving (OpenAI-compatible API)
 - Maintainer: Community
 
 ## When to use this recipe
@@ -20,12 +20,13 @@ text-to-text chat.
 
 ## References
 
-- Example script:
+- Offline example:
   [`examples/offline_inference/sensenova_u1/end2end.py`](../../examples/offline_inference/sensenova_u1/end2end.py)
-- Example README:
-  [`examples/offline_inference/sensenova_u1/README.md`](../../examples/offline_inference/sensenova_u1/README.md)
-- E2E test:
-  [`tests/e2e/offline_inference/test_sensenova_u1_t2i.py`](../../tests/e2e/offline_inference/test_sensenova_u1_t2i.py)
+- Online serving:
+  [`examples/online_serving/sensenova_u1/`](../../examples/online_serving/sensenova_u1/)
+- E2E tests:
+  [`tests/e2e/offline_inference/test_sensenova_u1_t2i.py`](../../tests/e2e/offline_inference/test_sensenova_u1_t2i.py),
+  [`tests/e2e/offline_inference/test_sensenova_u1_img2img.py`](../../tests/e2e/offline_inference/test_sensenova_u1_img2img.py)
 - HuggingFace model page:
   [SenseNova/SenseNova-U1-8B-MoT](https://huggingface.co/SenseNova/SenseNova-U1-8B-MoT)
 
@@ -145,3 +146,42 @@ with the expected 1536×2720 resolution.
   and communication overhead.
 - The LLM transformer uses `QKVParallelLinear` and `MergedColumnParallelLinear`
   for fused QKV and gate/up projections with TP support.
+
+## Online Serving
+
+SenseNova-U1 supports all four modalities via the OpenAI-compatible
+`/v1/chat/completions` API.
+
+### Launch
+
+```bash
+vllm serve SenseNova/SenseNova-U1-8B-MoT --omni --port 8091
+```
+
+### Send Requests
+
+```bash
+cd examples/online_serving/sensenova_u1
+
+# Text-to-image
+python openai_chat_client.py \
+    --prompt "A beautiful sunset" --modality text2img
+
+# Image-to-image editing
+python openai_chat_client.py \
+    --prompt "Turn this into an oil painting" \
+    --modality img2img --image-url input.jpg
+
+# Image understanding
+python openai_chat_client.py \
+    --prompt "Describe this image" \
+    --modality img2text --image-url photo.jpg
+
+# Text chat
+python openai_chat_client.py \
+    --prompt "What is the capital of France?" \
+    --modality text2text
+```
+
+For full API documentation and curl examples, see
+[`examples/online_serving/sensenova_u1/README.md`](../../examples/online_serving/sensenova_u1/README.md).

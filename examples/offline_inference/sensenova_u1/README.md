@@ -155,3 +155,8 @@ The corresponding pytest:
 pytest -s -v tests/e2e/offline_inference/test_sensenova_u1_t2i.py \
     -m "advanced_model" --run-level "advanced_model"
 ```
+
+## Online Serving
+
+For OpenAI-compatible API serving, see
+[`examples/online_serving/sensenova_u1/`](../../examples/online_serving/sensenova_u1/).
