@@ -795,7 +795,103 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
         return t_idx + seq_len
 
     # -----------------------------------------------------------------------
-    # Main forward (T2I / IT2I generation)
+    # Text generation (T2T / I2T)
+    # -----------------------------------------------------------------------
+
+    def _generate_text(
+        self,
+        prefix_logits,
+        past_key_values,
+        t_idx,
+        max_tokens=512,
+        do_sample=False,
+        temperature=0.7,
+    ):
+        """Autoregressive text decoding seeded from prefix logits."""
+        eos_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        generated_ids: list[int] = []
+
+        logits = prefix_logits[:, -1, :]
+        for _ in range(max_tokens):
+            if do_sample and temperature > 0:
+                probs = torch.softmax(logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            else:
+                next_token = torch.argmax(logits, dim=-1)
+
+            token_id = next_token.item()
+            if token_id == eos_token_id:
+                break
+            generated_ids.append(token_id)
+            outputs = self._ar_step(next_token, t_idx, past_key_values)
+            past_key_values = outputs.past_key_values
+            logits = outputs.logits[:, -1, :]
+            t_idx += 1
+
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    def _build_chat_query(self, prompt, has_images=False):
+        """Build a chat-style query (understanding mode, no ``<img>`` appended)."""
+        sys_msg = ""
+        system_prompt = f"<|im_start|>system\n{sys_msg}<|im_end|>\n" if sys_msg else ""
+        if has_images and "<image>" not in prompt:
+            prompt = "<image>\n" + prompt
+        return system_prompt + f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+    @torch.inference_mode()
+    def _forward_text(self, p, input_images) -> DiffusionOutput:
+        """Text output path for text2text and img2text."""
+        extra_args = p.extra_args
+        max_tokens = int(extra_args.get("max_tokens", 512))
+        do_sample = bool(extra_args.get("do_sample", False))
+        temperature = float(extra_args.get("temperature", 0.7))
+
+        if input_images is not None:
+            pixel_values, grid_hw = self._prepare_input_images(input_images)
+            query = self._build_chat_query(p.prompt, has_images=True)
+            # Expand <image> placeholders
+            for i in range(grid_hw.shape[0]):
+                h, w = grid_hw[i]
+                num_patch = int(h * w * self.downsample_ratio**2)
+                tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * num_patch + IMG_END_TOKEN
+                query = query.replace("<image>", tokens, 1)
+            embeds, indexes, mask = self._build_it2i_inputs(query, pixel_values, grid_hw)
+            outputs = self.language_model(
+                inputs_embeds=embeds,
+                indexes=indexes,
+                attention_mask=mask,
+                use_cache=True,
+            )
+        else:
+            query = self._build_chat_query(p.prompt, has_images=False)
+            input_ids, indexes, mask = self._build_t2i_text_inputs(query)
+            outputs = self.language_model(
+                input_ids=input_ids,
+                indexes=indexes,
+                attention_mask=mask,
+                use_cache=True,
+            )
+
+        past_kv = outputs.past_key_values
+        prefix_logits = outputs.logits
+        t_idx = indexes[0].max().item()
+
+        text_output = self._generate_text(
+            prefix_logits,
+            past_kv,
+            t_idx,
+            max_tokens=max_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+        )
+        logger.info("Text generation: %d chars", len(text_output))
+        return DiffusionOutput(
+            output=text_output,
+            custom_output={"text_output": text_output},
+        )
+
+    # -----------------------------------------------------------------------
+    # Main forward (T2I / IT2I / T2T / I2T)
     # -----------------------------------------------------------------------
 
     def _parse_request(self, req: OmniDiffusionRequest):
@@ -1073,9 +1169,12 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
         self.top_cfg.t_eps = p.t_eps
 
         input_images = self._extract_input_images(p.first_prompt)
-        is_it2i = input_images is not None
+        modalities = p.first_prompt.get("modalities", []) if isinstance(p.first_prompt, dict) else []
+        is_text_output = "text" in modalities
 
-        if is_it2i:
+        if is_text_output:
+            return self._forward_text(p, input_images)
+        if input_images is not None:
             return self._forward_it2i(p, input_images)
         return self._forward_t2i(p)
 

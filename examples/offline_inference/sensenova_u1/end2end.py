@@ -4,7 +4,7 @@
 """
 End-to-end offline inference for SenseNova-U1-8B-MoT.
 
-Supports both text-to-image (t2i) and image-to-image (img2img / editing).
+Supports four modalities: text2img, img2img, img2text, text2text.
 
 Text-to-image:
     python end2end.py --prompt "A cute cat" --think
@@ -12,6 +12,14 @@ Text-to-image:
 Image-to-image (editing):
     python end2end.py --prompt "Turn this into an oil painting" \
         --image input.png --think
+
+Image understanding:
+    python end2end.py --modality img2text \
+        --prompt "Describe this image" --image photo.jpg
+
+Text chat:
+    python end2end.py --modality text2text \
+        --prompt "What is the capital of France?"
 
 See README.md for more examples.
 """
@@ -28,12 +36,18 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="SenseNova-U1 text-to-image / image-to-image via vLLM-Omni.",
+        description="SenseNova-U1 text-to-image / image-to-image / text / understanding via vLLM-Omni.",
     )
     parser.add_argument(
         "--model",
         default="SenseNova/SenseNova-U1-8B-MoT",
         help="HuggingFace model ID or local path.",
+    )
+    parser.add_argument(
+        "--modality",
+        default="auto",
+        choices=["auto", "text2img", "img2img", "img2text", "text2text"],
+        help="Task modality. 'auto' infers from --image (img2img/img2text if images, else t2i/t2t).",
     )
     parser.add_argument(
         "--prompt",
@@ -45,7 +59,7 @@ def parse_args():
         nargs="+",
         metavar="PATH",
         default=None,
-        help="Input image path(s) for img2img / editing. When provided, the model runs in image-editing mode.",
+        help="Input image path(s) for img2img or img2text.",
     )
     parser.add_argument(
         "--output",
@@ -88,6 +102,25 @@ def parse_args():
         help="Epsilon for flow-matching timestep schedule.",
     )
 
+    # Text generation parameters (for text2text / img2text)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=2048,
+        help="Max tokens for text generation (text2text / img2text).",
+    )
+    parser.add_argument(
+        "--do-sample",
+        action="store_true",
+        help="Use sampling instead of greedy decoding for text generation.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for text generation.",
+    )
+
     # Think mode
     parser.add_argument(
         "--think",
@@ -117,11 +150,22 @@ def parse_args():
     return parser.parse_args()
 
 
+def _resolve_modality(args):
+    """Determine the effective modality from CLI args."""
+    if args.modality != "auto":
+        return args.modality
+    has_images = args.image is not None
+    # Default: image-producing tasks for backward compatibility
+    return "img2img" if has_images else "text2img"
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
 
-    is_img2img = args.image is not None
+    modality = _resolve_modality(args)
+    is_text_output = modality in ("text2text", "img2text")
+    has_images = modality in ("img2img", "img2text")
 
     omni = Omni(
         model=args.model,
@@ -138,8 +182,12 @@ def main():
         "think": args.think,
         "t_eps": args.t_eps,
     }
-    if is_img2img:
+    if modality == "img2img":
         extra_args["img_cfg_scale"] = args.img_cfg_scale
+    if is_text_output:
+        extra_args["max_tokens"] = args.max_tokens
+        extra_args["do_sample"] = args.do_sample
+        extra_args["temperature"] = args.temperature
 
     sampling_params = OmniDiffusionSamplingParams(
         height=args.height,
@@ -149,28 +197,44 @@ def main():
         extra_args=extra_args,
     )
 
-    mode_str = "img2img" if is_img2img else "t2i"
     print(f"\n{'=' * 60}")
-    print(f"SenseNova-U1 Generation Configuration ({mode_str}):")
+    print(f"SenseNova-U1 Configuration ({modality}):")
     print(f"  Model          : {args.model}")
-    print(f"  Image size     : {args.width}x{args.height}")
-    print(f"  Steps          : {args.num_steps}")
-    print(f"  CFG scale      : {args.cfg_scale}")
-    if is_img2img:
+    if not is_text_output:
+        print(f"  Image size     : {args.width}x{args.height}")
+        print(f"  Steps          : {args.num_steps}")
+        print(f"  CFG scale      : {args.cfg_scale}")
+    if modality == "img2img":
         print(f"  Img CFG scale  : {args.img_cfg_scale}")
+    if has_images:
         print(f"  Input images   : {args.image}")
+    if is_text_output:
+        print(f"  Max tokens     : {args.max_tokens}")
+        print(f"  Temperature    : {args.temperature}")
     print(f"  Seed           : {args.seed}")
     print(f"  Think mode     : {args.think}")
     print(f"  TP size        : {args.tensor_parallel_size}")
     print(f"{'=' * 60}\n")
 
-    if is_img2img:
+    # Build prompt dict
+    if has_images:
+        if not args.image:
+            raise ValueError(f"{modality} requires --image.")
         input_images = [Image.open(p).convert("RGB") for p in args.image]
-        prompt_dict = {
-            "prompt": args.prompt,
-            "multi_modal_data": {"image": input_images},
-            "modalities": ["img2img"],
-        }
+        if is_text_output:
+            prompt_dict = {
+                "prompt": args.prompt,
+                "multi_modal_data": {"image": input_images},
+                "modalities": ["text"],
+            }
+        else:
+            prompt_dict = {
+                "prompt": args.prompt,
+                "multi_modal_data": {"image": input_images},
+                "modalities": ["img2img"],
+            }
+    elif is_text_output:
+        prompt_dict = {"prompt": args.prompt, "modalities": ["text"]}
     else:
         prompt_dict = {"prompt": args.prompt, "modalities": ["image"]}
 
@@ -186,15 +250,20 @@ def main():
         if args.print_think and custom.get("think_text"):
             print(f"[Think]\n{custom['think_text']}\n")
 
-        images = getattr(req_output, "images", None) or []
-        if not images:
-            print("[Warning] No images generated.")
-            continue
-
-        for j, img in enumerate(images):
-            save_path = os.path.join(args.output, f"sensenova_u1_output_{j}.png")
-            img.save(save_path)
-            print(f"[Output] Saved {img.size[0]}x{img.size[1]} image to {save_path}")
+        if is_text_output:
+            text = custom.get("text_output", "")
+            if not text:
+                text = getattr(req_output, "text", "") or ""
+            print(f"[Response]\n{text}")
+        else:
+            images = getattr(req_output, "images", None) or []
+            if not images:
+                print("[Warning] No images generated.")
+                continue
+            for j, img in enumerate(images):
+                save_path = os.path.join(args.output, f"sensenova_u1_output_{j}.png")
+                img.save(save_path)
+                print(f"[Output] Saved {img.size[0]}x{img.size[1]} image to {save_path}")
 
 
 if __name__ == "__main__":

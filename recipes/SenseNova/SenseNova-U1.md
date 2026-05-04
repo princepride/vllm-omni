@@ -1,21 +1,22 @@
-# SenseNova-U1 for text-to-image and image-to-image generation
+# SenseNova-U1 for unified image generation and understanding
 
 ## Summary
 
 - Vendor: SenseNova
 - Model: `SenseNova/SenseNova-U1-8B-MoT`
-- Task: Text-to-image generation and image-to-image editing (with optional think-mode reasoning)
+- Task: text2img, img2img, img2text (visual understanding), text2text (chat)
 - Mode: Offline inference
 - Maintainer: Community
 
 ## When to use this recipe
 
-Use this recipe to run SenseNova-U1-8B-MoT text-to-image or image-to-image
-(editing) generation via vLLM-Omni. SenseNova-U1 is a unified Qwen3-based LLM
-with Mixture-of-Tokenizers (MoT) attention that handles text encoding, optional
-chain-of-thought reasoning, and flow-matching image denoising in a single
-pipeline — no separate text encoder or VAE needed. Image editing uses the same
-LLM with dual CFG (text + image guidance).
+Use this recipe to run SenseNova-U1-8B-MoT via vLLM-Omni. SenseNova-U1 is a
+unified Qwen3-based LLM with Mixture-of-Tokenizers (MoT) attention that handles
+text encoding, optional chain-of-thought reasoning, flow-matching image
+denoising, and visual understanding in a single pipeline — no separate text
+encoder or VAE needed. It supports four task modalities: text-to-image,
+image-to-image editing (with dual CFG), image-to-text understanding, and
+text-to-text chat.
 
 ## References
 
@@ -84,6 +85,29 @@ python examples/offline_inference/sensenova_u1/end2end.py \
 - img2img uses dual CFG: `--cfg-scale` controls text guidance, `--img-cfg-scale`
   controls image guidance (1.0 = image CFG disabled).
 - Pass multiple `--image` paths for multi-reference editing.
+
+#### Image Understanding (img2text)
+
+```bash
+python examples/offline_inference/sensenova_u1/end2end.py \
+    --modality img2text \
+    --prompt "Describe this image in detail" \
+    --image photo.jpg \
+    --max-tokens 512
+```
+
+#### Text-to-Text Chat (text2text)
+
+```bash
+python examples/offline_inference/sensenova_u1/end2end.py \
+    --modality text2text \
+    --prompt "Explain the theory of relativity in simple terms" \
+    --max-tokens 256
+```
+
+- For img2text and text2text, image generation parameters (height, width,
+  num-steps, cfg-scale) are ignored.
+- Use `--do-sample --temperature 0.7` for more diverse text responses.
 
 ### 2x H200 (144GB) — TP=2
 

@@ -11,7 +11,7 @@ SenseNova-U1 is a unified Qwen3-based LLM with Mixture-of-Tokenizers (MoT) atten
 | **Image generation** | Flow-matching Euler sampler, no separate VAE |
 | **Think mode** | Optional chain-of-thought reasoning before image generation |
 | **Parallelism** | Tensor Parallelism (TP) with fused QKV and fused gate/up projections |
-| **Modalities** | Text-to-image (t2i) and image-to-image editing (img2img) |
+| **Modalities** | text2img, img2img, img2text (understanding), text2text |
 
 ## Quick Start
 
@@ -25,7 +25,16 @@ python end2end.py --prompt "A cute cat" --think
 python end2end.py --prompt "Turn this into an oil painting" \
                   --image input.png --think
 
-# Custom resolution
+# Image understanding (img2text)
+python end2end.py --modality img2text \
+                  --prompt "Describe this image in detail" \
+                  --image photo.jpg
+
+# Text-to-text (pure chat)
+python end2end.py --modality text2text \
+                  --prompt "What is the capital of France?"
+
+# Custom resolution (image generation)
 python end2end.py --prompt "A futuristic cityscape at sunset" \
                   --width 2048 --height 1024 --think
 ```
@@ -85,12 +94,18 @@ python end2end.py \
 
 ## Full Parameter Reference
 
-### Generation Parameters
+### General Parameters
 
 | Parameter | Default | Description |
 | :-------- | :------ | :---------- |
-| `--prompt` | "A cute cat..." | Text prompt / editing instruction |
-| `--image` | None | Input image path(s) for img2img. Omit for t2i. |
+| `--modality` | `auto` | Task modality: `auto`, `text2img`, `img2img`, `img2text`, `text2text` |
+| `--prompt` | "A cute cat..." | Text prompt / editing instruction / question |
+| `--image` | None | Input image path(s) for img2img or img2text |
+
+### Image Generation Parameters (text2img / img2img)
+
+| Parameter | Default | Description |
+| :-------- | :------ | :---------- |
 | `--height` | 2048 | Height of generated image (pixels) |
 | `--width` | 2048 | Width of generated image (pixels) |
 | `--seed` | 42 | Random seed for reproducibility |
@@ -102,6 +117,14 @@ python end2end.py \
 | `--t-eps` | 0.02 | Epsilon for timestep schedule |
 | `--think` | False | Enable think mode |
 | `--print-think` | False | Print think text to stdout |
+
+### Text Generation Parameters (text2text / img2text)
+
+| Parameter | Default | Description |
+| :-------- | :------ | :---------- |
+| `--max-tokens` | 512 | Maximum number of tokens to generate |
+| `--do-sample` | False | Use sampling instead of greedy decoding |
+| `--temperature` | 0.7 | Sampling temperature (higher = more diverse) |
 
 ### Infrastructure Parameters
 
