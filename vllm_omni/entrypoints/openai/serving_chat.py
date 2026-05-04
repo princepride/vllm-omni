@@ -96,7 +96,9 @@ from vllm_omni.entrypoints.openai.stage_params import (
 from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
     get_supported_speakers_from_hf_config,
+    is_single_stage_diffusion,
     parse_lora_request,
+    resolve_diffusion_od_config,
     validate_requested_speaker,
 )
 from vllm_omni.lora.request import LoRARequest
@@ -148,37 +150,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_model_name = model_name
         return instance
 
-    def _is_single_stage_diffusion(self) -> bool:
-        """Return True if the engine is a single-stage diffusion pipeline."""
-        stage_configs = getattr(self.engine_client, "stage_configs", None) or []
-        if len(stage_configs) != 1:
-            return False
-        return getattr(stage_configs[0], "stage_type", None) in ("diffusion", "DIFFUSION")
-
     def _get_diffusion_extra_body_params(self) -> frozenset[str]:
-        """Return the pipeline-declared extra_body params (cached).
-
-        Each diffusion pipeline can declare ``EXTRA_BODY_PARAMS`` as a class
-        attribute.  The serving layer reads it once and caches the result so
-        that only the declared keys are forwarded from the request's
-        ``extra_body`` to ``OmniDiffusionSamplingParams.extra_args``.
-        """
+        """Return the pipeline-declared ``EXTRA_BODY_PARAMS`` (cached)."""
         if self._diffusion_extra_body_params is not None:
             return self._diffusion_extra_body_params
 
         params: frozenset[str] = frozenset()
         try:
-            # Omni mode: engine_client is AsyncOmni
-            engine = getattr(self, "engine_client", None)
-            od_config = None
-            if hasattr(engine, "get_diffusion_od_config"):
-                od_config = engine.get_diffusion_od_config()
-            # Diffusion mode: _diffusion_engine is AsyncOmni
-            if od_config is None and self._diffusion_engine is not None:
-                if hasattr(self._diffusion_engine, "get_diffusion_od_config"):
-                    od_config = self._diffusion_engine.get_diffusion_od_config()
-                else:
-                    od_config = getattr(self._diffusion_engine, "od_config", None)
+            od_config = resolve_diffusion_od_config(self.engine_client, self._diffusion_engine)
             if od_config is not None and getattr(od_config, "model_class_name", None):
                 params = get_extra_body_params(od_config.model_class_name)
         except Exception as e:
@@ -191,29 +170,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self,
         custom_output: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
-        """Pick pipeline-declared keys from *custom_output* for the response.
-
-        Each diffusion pipeline can declare ``EXTRA_OUTPUT_PARAMS`` as a class
-        attribute listing which ``DiffusionOutput.custom_output`` keys should
-        be surfaced in the API response ``metrics`` dict.  The allowed-key set
-        is resolved once on the first call and cached for the lifetime of this
-        serving instance.
-        """
+        """Pick pipeline-declared ``EXTRA_OUTPUT_PARAMS`` keys from *custom_output*."""
         if not custom_output:
             return None
 
         if self._diffusion_extra_output_params is None:
             params: frozenset[str] = frozenset()
             try:
-                engine = getattr(self, "engine_client", None)
-                od_config = None
-                if hasattr(engine, "get_diffusion_od_config"):
-                    od_config = engine.get_diffusion_od_config()
-                if od_config is None and self._diffusion_engine is not None:
-                    if hasattr(self._diffusion_engine, "get_diffusion_od_config"):
-                        od_config = self._diffusion_engine.get_diffusion_od_config()
-                    else:
-                        od_config = getattr(self._diffusion_engine, "od_config", None)
+                od_config = resolve_diffusion_od_config(self.engine_client, self._diffusion_engine)
                 if od_config is not None and getattr(od_config, "model_class_name", None):
                     params = get_extra_output_params(od_config.model_class_name)
             except Exception as e:
@@ -462,7 +426,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
                 _image_gen_height = None
                 _image_gen_width = None
-        elif request.modalities and ("text" in request.modalities) and self._is_single_stage_diffusion():
+        elif request.modalities and ("text" in request.modalities) and is_single_stage_diffusion(self.engine_client):
             # Single-stage diffusion text output (img2text / text2text).
             # Build a diffusion-style prompt with modalities=["text"] so the
             # pipeline routes to its text generation path.
