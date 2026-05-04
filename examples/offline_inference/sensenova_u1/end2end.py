@@ -18,6 +18,7 @@ See README.md for more examples.
 import argparse
 import os
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -94,8 +95,6 @@ def parse_args():
         help="Disable torch.compile and force eager execution.",
     )
 
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
     nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
@@ -145,16 +144,12 @@ def main():
     )
 
     for req_output in outputs:
-        ro = getattr(req_output, "request_output", None)
-        if ro:
-            custom = getattr(ro, "custom_output", {}) or {}
-            if args.print_think and custom.get("think_text"):
-                print(f"[Think]\n{custom['think_text']}\n")
+        # Single-stage DiT: think text lives on `_custom_output`, images on the request output directly.
+        custom = getattr(req_output, "_custom_output", {}) or {}
+        if args.print_think and custom.get("think_text"):
+            print(f"[Think]\n{custom['think_text']}\n")
 
-        images = getattr(req_output, "images", None)
-        if not images:
-            if ro:
-                images = getattr(ro, "images", None)
+        images = getattr(req_output, "images", None) or []
         if not images:
             print("[Warning] No images generated.")
             continue

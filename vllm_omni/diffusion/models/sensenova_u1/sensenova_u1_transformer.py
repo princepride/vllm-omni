@@ -12,6 +12,7 @@ Ported from the sensenova_u1 package with vllm tensor-parallel support:
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -21,10 +22,25 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+
+
+@dataclass
+class SenseNovaU1ModelOutput:
+    last_hidden_state: torch.Tensor
+    past_key_values: DynamicCache | None = None
+
+
+@dataclass
+class SenseNovaU1CausalLMOutput:
+    logits: torch.Tensor
+    past_key_values: DynamicCache | None = None
+    hidden_states: torch.Tensor | None = None
+
 
 try:
     from flash_attn import flash_attn_func
@@ -631,7 +647,6 @@ class SenseNovaU1Model(nn.Module):
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_mot_gen = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.current_index = -1
 
     def forward(
         self,
@@ -656,26 +671,20 @@ class SenseNovaU1Model(nn.Module):
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
 
-        # Resolve attention mask
+        # Resolve attention mask. Callers must always provide `indexes`; this
+        # keeps the model stateless and safe under concurrent requests.
+        assert indexes is not None, "SenseNovaU1Model.forward requires explicit `indexes`."
         if not isinstance(attention_mask, dict):
-            if input_ids is not None:
-                past_len = past_key_values.get_seq_length() if past_key_values else 0
-                seq_len = inputs_embeds.shape[1]
-                total_len = past_len + seq_len
-                # Standard causal mask for single-token autoregressive generation
-                mask = torch.zeros(1, 1, seq_len, total_len, device=inputs_embeds.device)
-                if seq_len > 1:
-                    causal = torch.tril(torch.ones(seq_len, seq_len, device=inputs_embeds.device))
-                    mask[:, :, :, past_len:] = torch.where(causal == 1, 0.0, float("-inf"))
-                causal_mask_mapping = {"full_attention": mask}
-                self.current_index += 1
-                indexes = torch.LongTensor([[self.current_index], [0], [0]]).to(inputs_embeds.device)
-            else:
-                causal_mask_mapping = {"full_attention": create_block_causal_mask(indexes[0])}
-                self.current_index = indexes[0].max().item()
+            past_len = past_key_values.get_seq_length() if past_key_values else 0
+            seq_len = inputs_embeds.shape[1]
+            total_len = past_len + seq_len
+            mask = torch.zeros(1, 1, seq_len, total_len, device=inputs_embeds.device)
+            if seq_len > 1:
+                causal = torch.tril(torch.ones(seq_len, seq_len, device=inputs_embeds.device))
+                mask[:, :, :, past_len:] = torch.where(causal == 1, 0.0, float("-inf"))
+            causal_mask_mapping = {"full_attention": mask}
         else:
             causal_mask_mapping = attention_mask
-            self.current_index = indexes[0].max().item()
 
         hidden_states = inputs_embeds
         for layer in self.layers:
@@ -696,14 +705,10 @@ class SenseNovaU1Model(nn.Module):
         else:
             hidden_states = self.norm_mot_gen(hidden_states)
 
-        return type(
-            "Output",
-            (),
-            {
-                "last_hidden_state": hidden_states,
-                "past_key_values": past_key_values if use_cache else None,
-            },
-        )()
+        return SenseNovaU1ModelOutput(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +723,9 @@ class SenseNovaU1ForCausalLM(nn.Module):
         self.model = SenseNovaU1Model(config, quant_config=quant_config, prefix=f"{prefix}.model")
         self.vocab_size = config.vocab_size
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=f"{prefix}.lm_head")
+        # LogitsProcessor handles the TP all-gather of vocab-sharded ParallelLMHead
+        # outputs so callers see full-vocab logits regardless of tp_size.
+        self.logits_processor = LogitsProcessor(config.vocab_size)
 
     def forward(
         self,
@@ -738,16 +746,12 @@ class SenseNovaU1ForCausalLM(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
-        logits = torch.nn.functional.linear(outputs.last_hidden_state, self.lm_head.weight)
-        return type(
-            "Output",
-            (),
-            {
-                "logits": logits,
-                "past_key_values": outputs.past_key_values,
-                "hidden_states": outputs.last_hidden_state,
-            },
-        )()
+        logits = self.logits_processor(self.lm_head, outputs.last_hidden_state)
+        return SenseNovaU1CausalLMOutput(
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.last_hidden_state,
+        )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

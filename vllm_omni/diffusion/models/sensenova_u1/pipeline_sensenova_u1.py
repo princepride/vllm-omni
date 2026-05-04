@@ -21,16 +21,21 @@ import json
 import math
 import os
 from collections.abc import Iterable
+from types import SimpleNamespace
+from typing import ClassVar
 
 import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
+from transformers import AutoTokenizer
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .sensenova_u1_transformer import (
@@ -71,14 +76,8 @@ SYSTEM_MESSAGE_FOR_GEN = (
 
 
 # ---------------------------------------------------------------------------
-# Simple config namespace parsed from config.json
+# Config parsed from config.json
 # ---------------------------------------------------------------------------
-
-
-class _ConfigNamespace:
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
 
 
 def _resolve_model_path(model_path: str) -> str:
@@ -101,7 +100,7 @@ def _load_sensenova_u1_config(model_path: str):
     vis_raw = raw.get("vision_config", {})
 
     # LLM config needs these extra fields for 3D RoPE
-    llm_cfg = _ConfigNamespace(
+    llm_cfg = SimpleNamespace(
         hidden_size=llm_raw.get("hidden_size", 4096),
         intermediate_size=llm_raw.get("intermediate_size", 11008),
         num_hidden_layers=llm_raw.get("num_hidden_layers", 32),
@@ -120,7 +119,7 @@ def _load_sensenova_u1_config(model_path: str):
         tie_word_embeddings=llm_raw.get("tie_word_embeddings", False),
     )
 
-    vis_cfg = _ConfigNamespace(
+    vis_cfg = SimpleNamespace(
         num_channels=vis_raw.get("num_channels", 3),
         patch_size=vis_raw.get("patch_size", 16),
         hidden_size=vis_raw.get("hidden_size", 1024),
@@ -132,11 +131,11 @@ def _load_sensenova_u1_config(model_path: str):
         use_return_dict=vis_raw.get("use_return_dict", True),
     )
 
-    top_cfg = _ConfigNamespace(
+    top_cfg = SimpleNamespace(
         downsample_ratio=raw.get("downsample_ratio", 0.5),
         template=raw.get("template", "neo1_0"),
         fm_head_layers=raw.get("fm_head_layers", 2),
-        fm_head_dim=raw.get("fm_head_dim", 1536),
+        fm_head_dim=raw.get("fm_head_dim", 4096),
         fm_head_mlp_ratio=raw.get("fm_head_mlp_ratio", 1.0),
         use_pixel_head=raw.get("use_pixel_head", False),
         noise_scale=raw.get("noise_scale", 1.0),
@@ -384,10 +383,12 @@ def get_sensenova_u1_post_process_func(od_config: OmniDiffusionConfig):
 # ---------------------------------------------------------------------------
 
 
-@torch.amp.autocast("cuda", dtype=torch.float32)
 def _optimized_scale(positive_flat, negative_flat):
-    dot = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
-    sq_norm = torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
+    # Manual fp32 cast keeps numerics stable without locking us to a CUDA-only autocast region.
+    pos = positive_flat.float()
+    neg = negative_flat.float()
+    dot = torch.sum(pos * neg, dim=1, keepdim=True)
+    sq_norm = torch.sum(neg**2, dim=1, keepdim=True) + 1e-8
     return dot / sq_norm
 
 
@@ -396,7 +397,7 @@ def _optimized_scale(positive_flat, negative_flat):
 # ---------------------------------------------------------------------------
 
 
-class SenseNovaU1Pipeline(nn.Module):
+class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelineProfilerMixin):
     """SenseNova-U1 text-to-image pipeline for vllm-omni.
 
     Builds the full model graph internally:
@@ -404,6 +405,14 @@ class SenseNovaU1Pipeline(nn.Module):
     - vision_model: NEOVisionModel (understanding branch)
     - fm_modules: ModuleDict with vision_model_mot_gen, timestep_embedder, fm_head, etc.
     """
+
+    # CPU-offload protocol: language_model carries the denoising blocks; the
+    # vision and FM modules are lightweight encoders pinned on GPU during the
+    # diffusion loop. There is no separate VAE.
+    _dit_modules: ClassVar[list[str]] = ["language_model"]
+    _encoder_modules: ClassVar[list[str]] = ["vision_model"]
+    _vae_modules: ClassVar[list[str]] = []
+    _resident_modules: ClassVar[list[str]] = ["fm_modules"]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -413,9 +422,6 @@ class SenseNovaU1Pipeline(nn.Module):
         self.local_model_path = _resolve_model_path(model_path)
 
         self.top_cfg, self.llm_cfg, self.vis_cfg = _load_sensenova_u1_config(model_path)
-
-        # Tokenizer
-        from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.local_model_path)
 
@@ -439,17 +445,16 @@ class SenseNovaU1Pipeline(nn.Module):
 
         if self.top_cfg.use_pixel_head:
             fm_head = ConvDecoder(llm_hidden_size)
-        elif self.top_cfg.fm_head_layers > 2:
-            fm_head = nn.Sequential(
-                nn.Linear(llm_hidden_size, 4096, bias=True),
-                nn.GELU(),
-                nn.Linear(4096, output_dim, bias=True),
-            )
         else:
+            # The reference implementation uses a fixed 2-layer GELU MLP with a 4096-d
+            # intermediate, regardless of `fm_head_layers` / `fm_head_dim` in config.json
+            # (those fields are unused in the released checkpoint). The deeper variant
+            # has not been ported yet.
+            fm_intermediate_dim = 4096
             fm_head = nn.Sequential(
-                nn.Linear(llm_hidden_size, 4096, bias=True),
+                nn.Linear(llm_hidden_size, fm_intermediate_dim, bias=True),
                 nn.GELU(),
-                nn.Linear(4096, output_dim, bias=True),
+                nn.Linear(fm_intermediate_dim, output_dim, bias=True),
             )
 
         self.fm_modules = nn.ModuleDict(
@@ -478,6 +483,10 @@ class SenseNovaU1Pipeline(nn.Module):
                 fall_back_to_pt=False,
             ),
         ]
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
+        )
 
     # -----------------------------------------------------------------------
     # Helpers
@@ -558,6 +567,17 @@ class SenseNovaU1Pipeline(nn.Module):
         sigma = shift * sigma / (1 + (shift - 1) * sigma)
         return 1 - sigma
 
+    def _ar_step(self, next_token, t_idx, past_key_values):
+        """One autoregressive token step. Constructs single-token `indexes` explicitly."""
+        indexes = torch.tensor([[t_idx + 1], [0], [0]], dtype=torch.long, device=self.device)
+        outputs = self.language_model(
+            input_ids=next_token.unsqueeze(0),
+            indexes=indexes,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        return outputs
+
     def _generate_think(self, prefix_outputs, past_key_values, t_idx, max_think_tokens=1024):
         eos_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         think_end_token_id = self.tokenizer.convert_tokens_to_ids("</think>")
@@ -569,24 +589,14 @@ class SenseNovaU1Pipeline(nn.Module):
             if token_item == eos_token_id:
                 break
             if token_item == think_end_token_id:
-                self.language_model.model.current_index = t_idx
-                outputs = self.language_model(
-                    input_ids=next_token.unsqueeze(0),
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
+                outputs = self._ar_step(next_token, t_idx, past_key_values)
                 past_key_values = outputs.past_key_values
                 t_idx += 1
                 think_token_ids.append(token_item)
                 break
 
             think_token_ids.append(token_item)
-            self.language_model.model.current_index = t_idx
-            outputs = self.language_model(
-                input_ids=next_token.unsqueeze(0),
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
+            outputs = self._ar_step(next_token, t_idx, past_key_values)
             past_key_values = outputs.past_key_values
             t_idx += 1
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
