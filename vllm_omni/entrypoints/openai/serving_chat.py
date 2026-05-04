@@ -2630,6 +2630,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 except Exception as e:  # pragma: no cover - safeguard
                     logger.warning("Failed to parse LoRA request: %s", e)
 
+            # Route text modality for single-stage diffusion (img2text / text2text)
+            requested_modalities = extra_body.get("modalities") or []
+            is_text_request = "text" in requested_modalities
+
+            if is_text_request:
+                gen_prompt["modalities"] = ["text"]
+
             # Add reference image if provided (from messages content)
             if pil_images:
                 if len(pil_images) == 1:
@@ -2674,8 +2681,38 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 result = output
             if result is None:
                 return self._create_error_response("No output generated from AsyncOmni")
-            # Extract images from result
-            # Handle nested OmniRequestOutput structure where images might be in request_output
+
+            # Text output path (img2text / text2text)
+            if is_text_request and result.final_output_type == "text":
+                text_body = (result.custom_output or {}).get("text_output", "")
+                message = ChatMessage(role="assistant", content=text_body)
+                choice = ChatCompletionResponseChoice(
+                    index=0,
+                    message=message,
+                    finish_reason="stop",
+                    logprobs=None,
+                    stop_reason=None,
+                )
+                response = OmniChatCompletionResponse(
+                    id=request_id,
+                    created=created_time,
+                    model=self._diffusion_model_name,
+                    choices=[choice],
+                    usage=UsageInfo(
+                        prompt_tokens=len(prompt.split()),
+                        completion_tokens=len(text_body.split()),
+                        total_tokens=len(prompt.split()) + len(text_body.split()),
+                    ),
+                    metrics=self._get_diffusion_extra_output_params(result.custom_output),
+                )
+                logger.info(
+                    "Diffusion chat completed for request %s: text output (%d chars)",
+                    request_id,
+                    len(text_body),
+                )
+                return response
+
+            # Image output path (text2img / img2img)
             images = getattr(result.request_output, "images", [])
             stage_durations = result.stage_durations
             peak_memory_mb = result.peak_memory_mb
