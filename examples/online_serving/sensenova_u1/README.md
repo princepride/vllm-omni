@@ -34,7 +34,7 @@ cd examples/online_serving/sensenova_u1
 python openai_chat_client.py \
     --prompt "A beautiful sunset over mountains" \
     --modality text2img \
-    --height 2048 --width 2048 --steps 50
+    --height 2048 --width 2048 --num-steps 50
 ```
 
 **curl:**
@@ -157,7 +157,7 @@ curl http://localhost:8091/v1/chat/completions \
 | `--modality` / `-m` | `text2img` | `text2img`, `img2img`, `img2text`, `text2text` |
 | `--height` | `2048` | Image height (image generation only) |
 | `--width` | `2048` | Image width (image generation only) |
-| `--steps` | `50` | Number of inference steps (image generation only) |
+| `--num-steps` | `50` | Number of inference steps (image generation only) |
 | `--seed` | `42` | Random seed |
 | `--cfg-scale` | `4.0` | CFG scale (image generation only) |
 | `--think` | `False` | Enable think mode |
