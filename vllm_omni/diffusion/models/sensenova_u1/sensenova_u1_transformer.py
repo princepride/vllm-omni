@@ -28,6 +28,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.layer import Attention
+
 
 @dataclass
 class SenseNovaU1ModelOutput:
@@ -41,47 +44,6 @@ class SenseNovaU1CausalLMOutput:
     past_key_values: DynamicCache | None = None
     hidden_states: torch.Tensor | None = None
     inputs_embeds: torch.Tensor | None = None
-
-
-try:
-    from flash_attn import flash_attn_func
-
-    _HAS_FLASH_ATTN = True
-except ImportError:
-    flash_attn_func = None  # type: ignore[assignment]
-    _HAS_FLASH_ATTN = False
-
-
-# ---------------------------------------------------------------------------
-# Attention backend dispatch
-# ---------------------------------------------------------------------------
-
-
-def _sdpa_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False):
-    """SDPA fallback for flash_attn_func. Layout: [B, S, H, D]."""
-    q_bhsd = q.transpose(1, 2)
-    k_bhsd = k.transpose(1, 2)
-    v_bhsd = v.transpose(1, 2)
-    h_q, h_kv = q_bhsd.shape[1], k_bhsd.shape[1]
-    if h_q != h_kv:
-        n_rep = h_q // h_kv
-        k_bhsd = k_bhsd.repeat_interleave(n_rep, dim=1)
-        v_bhsd = v_bhsd.repeat_interleave(n_rep, dim=1)
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q_bhsd,
-        k_bhsd,
-        v_bhsd,
-        dropout_p=dropout_p,
-        is_causal=causal,
-        scale=softmax_scale,
-    )
-    return out.transpose(1, 2).contiguous()
-
-
-def _flash_or_sdpa(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False):
-    if _HAS_FLASH_ATTN:
-        return flash_attn_func(q, k, v, dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal)
-    return _sdpa_attn_func(q, k, v, dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal)
 
 
 # ---------------------------------------------------------------------------
@@ -216,38 +178,6 @@ class Qwen3RMSNorm(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Eager attention (for prefix / mixed forward)
-# ---------------------------------------------------------------------------
-
-
-def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    batch, num_kv_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
-
-
-def _eager_attention_forward(
-    num_kv_groups: int,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-):
-    key_states = _repeat_kv(key, num_kv_groups)
-    value_states = _repeat_kv(value, num_kv_groups)
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_output = torch.matmul(attn_weights, value_states)
-    return attn_output.transpose(1, 2).contiguous()
-
-
-# ---------------------------------------------------------------------------
 # MLP
 # ---------------------------------------------------------------------------
 
@@ -379,6 +309,58 @@ class SenseNovaU1Attention(nn.Module):
         hw_config.max_position_embeddings = config.max_position_embeddings_hw
         self.rotary_emb_hw = Qwen3RotaryEmbedding(config=hw_config)
 
+        self.attn = Attention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            softmax_scale=self.scaling,
+            num_kv_heads=self.num_heads,
+            prefix=f"{prefix}.attn",
+        )
+        self.attn.attention = self.attn.sdpa_fallback
+
+    @staticmethod
+    def _align_mask_dtype(mask: torch.Tensor | None, query: torch.Tensor) -> torch.Tensor | None:
+        """SDPA requires float ``attn_mask`` to match query's dtype."""
+        if mask is None or not mask.is_floating_point() or mask.dtype == query.dtype:
+            return mask
+        return mask.to(query.dtype)
+
+    def _run_attn(
+        self,
+        query_bhsd: torch.Tensor,
+        key_bhsd: torch.Tensor,
+        value_bhsd: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run unified attention with [B, H, S, D] inputs. Returns [B, S, H, D]."""
+        if self.num_kv_groups > 1:
+            n = self.num_kv_groups
+            key_bhsd = key_bhsd.repeat_interleave(n, dim=1)
+            value_bhsd = value_bhsd.repeat_interleave(n, dim=1)
+        q = query_bhsd.transpose(1, 2).contiguous()
+        k = key_bhsd.transpose(1, 2).contiguous()
+        v = value_bhsd.transpose(1, 2).contiguous()
+        attention_mask = self._align_mask_dtype(attention_mask, q)
+        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        return self.attn(q, k, v, attn_metadata)
+
+    def _run_attn_bshd(
+        self,
+        query_bshd: torch.Tensor,
+        key_bshd: torch.Tensor,
+        value_bshd: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run unified attention with [B, S, H, D] inputs. Returns [B, S, H, D]."""
+        if self.num_kv_groups > 1:
+            n = self.num_kv_groups
+            key_bshd = key_bshd.repeat_interleave(n, dim=2)
+            value_bshd = value_bshd.repeat_interleave(n, dim=2)
+        attention_mask = self._align_mask_dtype(attention_mask, query_bshd)
+        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        return self.attn(query_bshd, key_bshd, value_bshd, attn_metadata)
+
     def _project_and_rope(self, hidden_states, indexes, qkv_proj, q_norm, k_norm, q_norm_hw, k_norm_hw):
         """Project Q/K/V via the given QKVParallelLinear and apply 3D RoPE."""
         input_shape = hidden_states.shape[:-1]  # (B, S)
@@ -418,7 +400,7 @@ class SenseNovaU1Attention(nn.Module):
         return query_states, key_states, value_states
 
     def forward_und(self, hidden_states, indexes, attention_mask, past_key_values=None, **kwargs):
-        """Understanding path — eager attention with full 4D mask."""
+        """Understanding path — unified Attention with explicit 4D mask."""
         input_shape = hidden_states.shape[:-1]
         query_states, key_states, value_states = self._project_and_rope(
             hidden_states,
@@ -439,20 +421,13 @@ class SenseNovaU1Attention(nn.Module):
                     key_states = torch.cat([layer.keys, key_states], dim=2)
                     value_states = torch.cat([layer.values, value_states], dim=2)
 
-        attn_output = _eager_attention_forward(
-            self.num_kv_groups,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            self.scaling,
-        )
+        attn_output = self._run_attn(query_states, key_states, value_states, attention_mask)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output, _ = self.o_proj(attn_output)
         return attn_output
 
     def forward_gen(self, hidden_states, indexes, attention_mask, past_key_values=None, **kwargs):
-        """Generation path — flash/SDPA bidirectional attention with KV cache."""
+        """Generation path — unified Attention, bidirectional with optional KV cache."""
         input_shape = hidden_states.shape[:-1]
         query_states, key_states, value_states = self._project_and_rope(
             hidden_states,
@@ -466,7 +441,7 @@ class SenseNovaU1Attention(nn.Module):
         update_cache = kwargs.get("update_cache", True)
 
         if attention_mask is None:
-            # Flash path: bidirectional within image block + attend to prefix
+            # Bidirectional path: no causal mask, optionally attend to a prefix.
             q = query_states.transpose(1, 2).contiguous()  # [B,S,H,D]
             k_cur = key_states.transpose(1, 2).contiguous()
             v_cur = value_states.transpose(1, 2).contiguous()
@@ -496,12 +471,12 @@ class SenseNovaU1Attention(nn.Module):
             else:
                 k, v = k_cur, v_cur
 
-            attn_output = _flash_or_sdpa(q, k, v, softmax_scale=self.scaling, causal=False)
+            attn_output = self._run_attn_bshd(q, k, v, None)
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output, _ = self.o_proj_mot_gen(attn_output)
             return attn_output
 
-        # Eager fallback with explicit mask
+        # Masked fallback with explicit 4D additive mask
         if past_key_values is not None:
             if update_cache:
                 key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
@@ -511,14 +486,7 @@ class SenseNovaU1Attention(nn.Module):
                     key_states = torch.cat([layer.keys, key_states], dim=2)
                     value_states = torch.cat([layer.values, value_states], dim=2)
 
-        attn_output = _eager_attention_forward(
-            self.num_kv_groups,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            self.scaling,
-        )
+        attn_output = self._run_attn(query_states, key_states, value_states, attention_mask)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output, _ = self.o_proj_mot_gen(attn_output)
         return attn_output
