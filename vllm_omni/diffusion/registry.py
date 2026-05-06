@@ -115,6 +115,11 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_i2v",
         "Wan22I2VPipeline",
     ),
+    "WanS2VPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_s2v",
+        "Wan22S2VPipeline",
+    ),
     "WanT2VDMD2Pipeline": (
         "wan2_2",
         "pipeline_wan2_2",
@@ -165,6 +170,11 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2_klein",
         "Flux2KleinPipeline",
     ),
+    "ErnieImagePipeline": (
+        "ernie_image",
+        "pipeline_ernie_image",
+        "ErnieImagePipeline",
+    ),
     "NextStep11Pipeline": (
         "nextstep_1_1",
         "pipeline_nextstep_1_1",
@@ -204,6 +214,11 @@ _DIFFUSION_MODELS = {
         "sensenova_u1",
         "pipeline_sensenova_u1",
         "SenseNovaU1Pipeline",
+    ),
+    "AudioXPipeline": (
+        "audiox",
+        "pipeline_audiox",
+        "AudioXPipeline",
     ),
     "HunyuanVideo15Pipeline": (
         "hunyuan_video",
@@ -252,6 +267,7 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "SenseNovaU1Pipeline",
+    "AudioXPipeline",
 }
 
 
@@ -427,7 +443,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX23Pipeline": "get_ltx2_post_process_func",
     "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
+    "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
@@ -437,6 +455,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "ErnieImagePipeline": "get_ernie_image_post_process_func",
     "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
@@ -463,6 +482,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
