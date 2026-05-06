@@ -37,9 +37,10 @@ class SenseNovaU1ModelOutput:
 
 @dataclass
 class SenseNovaU1CausalLMOutput:
-    logits: torch.Tensor
+    logits: torch.Tensor | None = None
     past_key_values: DynamicCache | None = None
     hidden_states: torch.Tensor | None = None
+    inputs_embeds: torch.Tensor | None = None
 
 
 try:
@@ -735,8 +736,23 @@ class SenseNovaU1ForCausalLM(nn.Module):
         past_key_values=None,
         inputs_embeds=None,
         use_cache=None,
+        embed_only: bool = False,
+        compute_logits: bool = True,
         **kwargs,
     ):
+        # Routing every access through ``forward`` keeps any externally-attached
+        # hooks (e.g. CPU-offload swap) firing for sub-module accesses such as
+        # token embedding lookup or hidden-state-only model runs. Callers should
+        # prefer this entry point over reaching into ``self.model`` /
+        # ``self.lm_head`` directly so that offloaded weights get materialised
+        # on the right device first.
+        if embed_only:
+            if input_ids is None:
+                raise ValueError("embed_only=True requires input_ids")
+            return SenseNovaU1CausalLMOutput(
+                inputs_embeds=self.model.embed_tokens(input_ids),
+            )
+
         outputs = self.model(
             input_ids=input_ids,
             indexes=indexes,
@@ -746,7 +762,7 @@ class SenseNovaU1ForCausalLM(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
-        logits = self.logits_processor(self.lm_head, outputs.last_hidden_state)
+        logits = self.logits_processor(self.lm_head, outputs.last_hidden_state) if compute_logits else None
         return SenseNovaU1CausalLMOutput(
             logits=logits,
             past_key_values=outputs.past_key_values,

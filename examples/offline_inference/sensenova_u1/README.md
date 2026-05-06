@@ -134,6 +134,49 @@ python end2end.py \
 | `--output` | `.` | Output directory for saved images |
 | `--tensor-parallel-size` | 1 | Number of GPUs for tensor parallelism |
 | `--enforce-eager` | False | Disable torch.compile |
+| `--enable-cpu-offload` | False | Enable module-wise (sequential) CPU offload to reduce peak VRAM |
+
+## Reducing GPU Memory Usage
+
+For hardware with limited VRAM, enable **module-wise CPU offload** with
+`--enable-cpu-offload`. The pipeline implements `SupportsModuleOffload`, so the
+vision encoder (`vision_model`) and the Qwen3 LLM (`language_model`) are
+swapped between CPU and GPU on demand:
+
+- During text/vision encoding, the LLM is on CPU.
+- During the diffusion loop, the vision encoder is on CPU.
+- Lightweight FM modules stay resident on GPU.
+
+This lowers peak VRAM at the cost of extra CPU<->GPU transfers (use pinned
+memory) — useful for running SenseNova-U1 on consumer-grade GPUs.
+
+```bash
+# Text-to-image with CPU offload
+python end2end.py \
+    --prompt "A cute cat sitting on a windowsill" \
+    --width 2048 --height 2048 \
+    --enable-cpu-offload --think
+
+# Image-to-image editing with CPU offload
+python end2end.py \
+    --prompt "Turn this into an oil painting" \
+    --image input.png \
+    --width 2048 --height 2048 \
+    --enable-cpu-offload --think
+
+# Image understanding (img2text) with CPU offload
+python end2end.py \
+    --modality img2text \
+    --prompt "Describe this image in detail" \
+    --image photo.jpg \
+    --enable-cpu-offload
+```
+
+> **Notes**
+> - CPU offload is **single-GPU only** (incompatible with `--tensor-parallel-size > 1`).
+> - First-step latency is higher because of the cold-start CPU<->GPU transfers.
+> - For more details and other offloading strategies, see
+>   [CPU Offloading for Diffusion Models](../../../docs/user_guide/diffusion/cpu_offload_diffusion.md).
 
 ## Reproducing the E2E Test
 

@@ -145,6 +145,16 @@ def parse_args():
         action="store_true",
         help="Disable torch.compile and force eager execution.",
     )
+    parser.add_argument(
+        "--enable-cpu-offload",
+        action="store_true",
+        help=(
+            "Enable model-level (sequential) CPU offloading. "
+            "Mutually exclusive between vision_model and language_model: "
+            "only one is on GPU at a time, reducing peak VRAM at the cost "
+            "of extra CPU<->GPU transfers."
+        ),
+    )
 
     nullify_stage_engine_defaults(parser)
     return parser.parse_args()
@@ -171,6 +181,7 @@ def main():
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
+        enable_cpu_offload=args.enable_cpu_offload,
     )
 
     extra_args = {

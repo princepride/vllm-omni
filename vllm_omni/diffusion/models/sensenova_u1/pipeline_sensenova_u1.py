@@ -665,7 +665,8 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
         input_ids = model_inputs["input_ids"].to(self.device)
         indexes = self._get_thw_indexes(input_ids[0], grid_hw)
         attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
-        input_embeds = self.language_model.get_input_embeddings()(input_ids)
+        # Route through ``language_model.__call__`` so CPU-offload hooks fire.
+        input_embeds = self.language_model(input_ids=input_ids, embed_only=True).inputs_embeds
         B, N, C = input_embeds.shape
         if pixel_values is not None:
             vit_embeds = self._extract_feature(pixel_values, grid_hw=grid_hw)
@@ -679,13 +680,14 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
 
     def _it2i_prefix_forward(self, input_embeds, indexes, attention_mask):
         """Run the prefix (text + vision embeddings) through the LM to get KV cache."""
-        out = self.language_model.model(
+        out = self.language_model(
             inputs_embeds=input_embeds,
             indexes=indexes,
             attention_mask=attention_mask,
             use_cache=True,
+            compute_logits=False,
         )
-        return out.past_key_values, out.last_hidden_state
+        return out.past_key_values, out.hidden_states
 
     def _build_t2i_image_indexes(self, token_h, token_w, text_len, device):
         t_image = torch.full((token_h * token_w,), text_len, dtype=torch.long, device=device)
@@ -695,19 +697,20 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
         return torch.stack([t_image, h_image, w_image], dim=0)
 
     def _t2i_prefix_forward(self, input_ids, indexes, attention_mask):
-        out = self.language_model.model(
+        out = self.language_model(
             input_ids=input_ids,
             indexes=indexes,
             attention_mask=attention_mask,
             use_cache=True,
+            compute_logits=False,
         )
-        return out.past_key_values, out.last_hidden_state
+        return out.past_key_values, out.hidden_states
 
     def _t2i_predict_v(
         self, input_embeds, indexes_image, attn_mask, past_key_values, t, z, image_token_num, image_size=None, **_kw
     ):
         B, L = z.shape[0], z.shape[1]
-        outputs = self.language_model.model(
+        outputs = self.language_model(
             inputs_embeds=input_embeds,
             image_gen_indicators=torch.ones(
                 (input_embeds.shape[0], input_embeds.shape[1]), dtype=torch.bool, device=input_embeds.device
@@ -717,13 +720,15 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
             past_key_values=past_key_values,
             update_cache=False,
             use_cache=True,
+            compute_logits=False,
         )
+        last_hidden_state = outputs.hidden_states
 
         if self.top_cfg.use_pixel_head:
             merge_size = self.merge_size
             token_h = image_size[1] // (self.patch_size * merge_size)
             token_w = image_size[0] // (self.patch_size * merge_size)
-            img_reshaped = outputs.last_hidden_state[:, -image_token_num:].view(B, token_h, token_w, -1)
+            img_reshaped = last_hidden_state[:, -image_token_num:].view(B, token_h, token_w, -1)
             img_2d = torch.einsum("b h w c -> b c h w", img_reshaped).contiguous()
             smoothed_img_2d = self.fm_modules["fm_head"](img_2d)
             smoothed_reshaped = smoothed_img_2d.view(
@@ -734,9 +739,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
                 B, L, self.patch_size * merge_size * self.patch_size * merge_size * 3
             )
         else:
-            x_pred = self.fm_modules["fm_head"](outputs.last_hidden_state[:, -image_token_num:].view(B, L, -1)).view(
-                B, L, -1
-            )
+            x_pred = self.fm_modules["fm_head"](last_hidden_state[:, -image_token_num:].view(B, L, -1)).view(B, L, -1)
 
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.top_cfg.t_eps)
         return v_pred
@@ -796,7 +799,8 @@ class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelinePro
         if input_ids.shape[1] == 0:
             return t_idx
         seq_len = input_ids.shape[1]
-        inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
+        # Route through ``language_model.__call__`` so CPU-offload hooks fire.
+        inputs_embeds = self.language_model(input_ids=input_ids, embed_only=True).inputs_embeds
         t_indexes = torch.arange(t_idx + 1, t_idx + 1 + seq_len, dtype=torch.long, device=self.device)
         h_indexes = torch.zeros(seq_len, dtype=torch.long, device=self.device)
         w_indexes = torch.zeros(seq_len, dtype=torch.long, device=self.device)
