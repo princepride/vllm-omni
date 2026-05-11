@@ -195,9 +195,12 @@ python end2end.py \
 The corresponding pytest:
 
 ```bash
-pytest -s -v tests/e2e/offline_inference/test_sensenova_u1_t2i.py \
+pytest -s -v tests/e2e/offline_inference/test_sensenova_u1_text2img.py \
     -m "advanced_model" --run-level "advanced_model"
 ```
+
+The img2img counterpart lives at
+`tests/e2e/offline_inference/test_sensenova_u1_img2img.py`.
 
 ## Online Serving
 

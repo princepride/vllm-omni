@@ -25,7 +25,7 @@ text-to-text chat.
 - Online serving:
   [`examples/online_serving/sensenova_u1/`](../../examples/online_serving/sensenova_u1/)
 - E2E tests:
-  [`tests/e2e/offline_inference/test_sensenova_u1_t2i.py`](../../tests/e2e/offline_inference/test_sensenova_u1_t2i.py),
+  [`tests/e2e/offline_inference/test_sensenova_u1_text2img.py`](../../tests/e2e/offline_inference/test_sensenova_u1_text2img.py),
   [`tests/e2e/offline_inference/test_sensenova_u1_img2img.py`](../../tests/e2e/offline_inference/test_sensenova_u1_img2img.py)
 - HuggingFace model page:
   [SenseNova/SenseNova-U1-8B-MoT](https://huggingface.co/SenseNova/SenseNova-U1-8B-MoT)
@@ -58,7 +58,7 @@ python examples/offline_inference/sensenova_u1/end2end.py \
 #### Verification
 
 ```bash
-pytest -s -v tests/e2e/offline_inference/test_sensenova_u1_t2i.py \
+pytest -s -v tests/e2e/offline_inference/test_sensenova_u1_text2img.py \
     -m "advanced_model" --run-level "advanced_model"
 ```
 
