@@ -207,8 +207,4 @@ class UnspecifiedOmniPlatform(OmniPlatform):
 
     @classmethod
     def get_device_count(cls) -> int:
-        # An unspecified platform reports zero accelerators. This is what
-        # ``PackagesEnvChecker`` (in ``vllm_omni.diffusion.envs``) relies on
-        # at module-import time on CPU-only environments (e.g. CI sanity
-        # runners or documentation builds), so the fallback must not raise.
         return 0
