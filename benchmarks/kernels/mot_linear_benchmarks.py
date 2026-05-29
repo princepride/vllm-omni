@@ -64,7 +64,7 @@ def clear_triton_cache():
     """Clear Triton JIT compilation cache and Python/CUDA memory."""
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
     try:
         if hasattr(triton, "runtime") and hasattr(triton.runtime, "cache") and hasattr(triton.runtime.cache, "clear"):
             triton.runtime.cache.clear()
@@ -487,18 +487,18 @@ def benchmark_config(
 
     # JIT warmup
     run()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     # Capture 1 invocations with CUDA Graph
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     # Warmup replays
     for _ in range(5):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -507,7 +507,7 @@ def benchmark_config(
     for _ in range(num_iters):
         if cache_flusher is not None:
             cache_flusher.zero_()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         start_event.record()
         graph.replay()

@@ -176,21 +176,21 @@ def _benchmark(fn, warmup: int = 20, iters: int = 100) -> float:
     cache_flusher = torch.empty(int(256 * 1024 * 1024 / 4), dtype=torch.int32, device="cuda")
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     t_flush_start = time.perf_counter()
     for _ in range(iters):
         cache_flusher.zero_()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     flush_time_total = time.perf_counter() - t_flush_start
 
     #  3. Measure the total time of "flush cache + operator execution"
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     t_total_start = time.perf_counter()
     for _ in range(iters):
         cache_flusher.zero_()
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     total_time = time.perf_counter() - t_total_start
 
     # 4. Asynchronous subtraction separation

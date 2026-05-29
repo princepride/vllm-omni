@@ -51,11 +51,11 @@ def _benchmark(fn, warmup: int = 20, iters: int = 200) -> float:
     """Return mean latency in milliseconds."""
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     t0 = time.perf_counter()
     for _ in range(iters):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return (time.perf_counter() - t0) / iters * 1000.0
 
 
