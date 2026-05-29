@@ -8,6 +8,7 @@ layer degrades to a standard RMSNorm using self.weight (und mode).
 
 import torch
 import torch.nn as nn
+from vllm import ir
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 
@@ -64,9 +65,7 @@ class MoTRMSNorm(CustomOp):
     ) -> torch.Tensor:
         if text_indices is None:
             # und mode – delegate to vllm's highly-optimised CUDA kernel
-            from vllm.model_executor.layers.layernorm import rms_norm
-
-            return rms_norm(x, self.weight.data, self.variance_epsilon)
+            return ir.ops.rms_norm(x, self.weight.data, self.variance_epsilon)
 
         # gen mode – fused MoT Triton kernel
         from vllm_omni.diffusion.layers.mot.ops.mot_rms_norm import (

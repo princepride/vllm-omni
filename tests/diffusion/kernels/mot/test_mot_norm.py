@@ -2,8 +2,8 @@
 """Layer-level correctness & performance test for MoTRMSNorm.
 
 Compares two equivalent computation paths:
-  - Reference: 2x vLLM RMSNorm CUDA kernel + PyTorch index scatter/gather
-    (rms_norm(x[text_idx], text_w) + rms_norm(x[vae_idx], vae_w))
+  - Reference: 2x vLLM IR RMSNorm op + PyTorch index scatter/gather
+    (ir.ops.rms_norm(x[text_idx], text_w) + ir.ops.rms_norm(x[vae_idx], vae_w))
   - Target:    1x MoTRMSNorm fused Triton kernel
     (mot_norm(x, text_indices, vae_indices))
 
@@ -17,8 +17,8 @@ import time
 
 import pytest
 import torch
+from vllm import ir
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.model_executor.layers.layernorm import rms_norm
 
 from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
 
@@ -67,10 +67,10 @@ def _reference_forward(
     vae_weight: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Reference: index-gather → 2x vLLM rms_norm CUDA kernel → scatter."""
+    """Reference: index-gather -> 2x vLLM IR RMSNorm op -> scatter."""
     output = torch.empty_like(x)
-    output[text_indices] = rms_norm(x[text_indices], text_weight, eps)
-    output[vae_indices] = rms_norm(x[vae_indices], vae_weight, eps)
+    output[text_indices] = ir.ops.rms_norm(x[text_indices], text_weight, eps)
+    output[vae_indices] = ir.ops.rms_norm(x[vae_indices], vae_weight, eps)
     return output
 
 
@@ -89,12 +89,12 @@ def _reference_forward_head_norm(
     """
     output = torch.empty_like(x)
     hidden_size = x.shape[-1]
-    output[text_indices] = rms_norm(
+    output[text_indices] = ir.ops.rms_norm(
         x[text_indices].reshape(-1, hidden_size),
         text_weight,
         eps,
     ).reshape_as(x[text_indices])
-    output[vae_indices] = rms_norm(
+    output[vae_indices] = ir.ops.rms_norm(
         x[vae_indices].reshape(-1, hidden_size),
         vae_weight,
         eps,
@@ -193,8 +193,8 @@ def test_mot_rms_norm(M: int, hidden_size: int, text_ratio: float):
 
     tag = f"RMSNorm M={M} H={hidden_size}"
 
-    # vLLM's rms_norm() uses vllm._custom_ops which may inspect global
-    # config; wrap in VllmConfig context for safety.
+    # vLLM's IR RMSNorm op may inspect global config; wrap in VllmConfig
+    # context for safety.
     with set_current_vllm_config(VllmConfig()):
         # --- Correctness (also warms up Triton JIT) ---
         with torch.no_grad():
