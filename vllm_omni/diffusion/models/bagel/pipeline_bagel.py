@@ -27,6 +27,7 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -150,11 +151,33 @@ class SiglipNaViTWrapper(nn.Module):
         return outputs.last_hidden_state.squeeze(0)
 
 
-class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
+class BagelPipeline(nn.Module, DiffusionPipelineBase, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
     """Bagel generation pipeline (MoT) packaged for vllm-omni diffusion engine.
 
     This pipeline is self-contained and uses the ported Bagel core files.
     """
+
+    EXTRA_BODY_PARAMS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "cfg_text_scale",
+            "cfg_img_scale",
+            "cfg_interval",
+            "cfg_renorm_type",
+            "cfg_renorm_min",
+            "negative_prompt",
+            "think",
+            "max_think_tokens",
+            "do_sample",
+            "text_temperature",
+            "timestep_shift",
+        }
+    )
+    EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "text_output",
+            "think_text",
+        }
+    )
 
     _dit_modules: ClassVar[list[str]] = ["language_model.model"]
     _encoder_modules: ClassVar[list[str]] = []

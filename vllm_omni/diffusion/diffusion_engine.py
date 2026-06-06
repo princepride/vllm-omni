@@ -25,6 +25,7 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
@@ -107,29 +108,58 @@ def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) 
 def get_extra_body_params(model_class_name: str) -> frozenset[str]:
     """Return the set of extra_body keys accepted by a pipeline.
 
-    Each pipeline can declare ``EXTRA_BODY_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which request-level parameters should be forwarded from
-    ``extra_body`` to ``OmniDiffusionSamplingParams.extra_args``.
-    Returns an empty frozenset when the pipeline does not declare any.
+    Pipelines inheriting from ``DiffusionPipelineBase`` expose this as a
+    formal class-level contract. During the migration window, legacy pipelines
+    that have not inherited from the base class yet still fall back to the old
+    informal class variable lookup.
     """
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is None:
         return frozenset()
+    if issubclass(model_cls, DiffusionPipelineBase):
+        return frozenset(model_cls.EXTRA_BODY_PARAMS)
+    logger.warning(
+        "Pipeline %r does not inherit from DiffusionPipelineBase; "
+        "falling back to legacy EXTRA_BODY_PARAMS lookup.",
+        model_cls.__qualname__,
+    )
     return frozenset(getattr(model_cls, "EXTRA_BODY_PARAMS", frozenset()))
 
 
 def get_extra_output_params(model_class_name: str) -> frozenset[str]:
     """Return the set of custom_output keys to expose in API response metrics.
 
-    Each pipeline can declare ``EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]]``
-    to advertise which ``DiffusionOutput.custom_output`` keys should be
-    copied into the response ``metrics`` dict.
-    Returns an empty frozenset when the pipeline does not declare any.
+    Pipelines inheriting from ``DiffusionPipelineBase`` expose this as a
+    formal class-level contract. During the migration window, legacy pipelines
+    that have not inherited from the base class yet still fall back to the old
+    informal class variable lookup.
     """
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is None:
         return frozenset()
+    if issubclass(model_cls, DiffusionPipelineBase):
+        return frozenset(model_cls.EXTRA_OUTPUT_PARAMS)
+    logger.warning(
+        "Pipeline %r does not inherit from DiffusionPipelineBase; "
+        "falling back to legacy EXTRA_OUTPUT_PARAMS lookup.",
+        model_cls.__qualname__,
+    )
     return frozenset(getattr(model_cls, "EXTRA_OUTPUT_PARAMS", frozenset()))
+
+
+def validate_diffusion_pipeline_cls(model_class_name: str) -> type[DiffusionPipelineBase]:
+    """Load a registered pipeline class and enforce the new base-class contract."""
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        raise ValueError(f"Unknown diffusion model: {model_class_name!r}")
+    if not issubclass(model_cls, DiffusionPipelineBase):
+        raise TypeError(
+            f"Pipeline {model_cls.__qualname__!r} must inherit from "
+            "DiffusionPipelineBase. Add DiffusionPipelineBase to its "
+            "base-class list and declare EXTRA_BODY_PARAMS / "
+            "EXTRA_OUTPUT_PARAMS (empty frozenset() is acceptable)."
+        )
+    return model_cls
 
 
 class DiffusionEngine:
@@ -146,6 +176,8 @@ class DiffusionEngine:
             config: The configuration for the diffusion engine.
         """
         self.od_config = od_config
+        self.extra_body_params = get_extra_body_params(od_config.model_class_name)
+        self.extra_output_params = get_extra_output_params(od_config.model_class_name)
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
