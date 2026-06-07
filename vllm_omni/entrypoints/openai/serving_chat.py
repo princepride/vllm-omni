@@ -24,6 +24,7 @@ from vllm.entrypoints.chat_utils import (
 )
 
 from vllm_omni.diffusion.diffusion_engine import get_extra_body_params, get_extra_output_params
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
@@ -405,8 +406,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
 
         num_inference_steps = None
-        cfg_text_scale = None
-        cfg_img_scale = None
+        extra_body: dict[str, Any] = {}
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
         # processor can construct the correct inputs.
@@ -424,9 +424,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 #   `extra_body` is flattented and merged into the payload's root.
                 #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
                 #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
-                extra_body = getattr(request, "extra_body", None)
-                if not extra_body:
-                    extra_body = request.model_extra or {}
+                extra_body = getattr(request, "extra_body", None) or request.model_extra or {}
 
                 height, width = self._resolve_height_width_from_extra_body(extra_body)
 
@@ -438,9 +436,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         num_inference_steps = None
 
                 negative_prompt = extra_body.get("negative_prompt")
-                cfg_text_scale = extra_body.get("cfg_text_scale")
-                cfg_img_scale = extra_body.get("cfg_img_scale")
-
                 engine_prompt_image: dict[str, Any] | None = None
                 if reference_images:
                     # Best-effort decode first reference image for i2i.
@@ -567,15 +562,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         sp.width = _image_gen_width
                     if hasattr(sp, "num_inference_steps") and num_inference_steps is not None:
                         sp.num_inference_steps = num_inference_steps
-                    if hasattr(sp, "extra_args") and sp.extra_args is not None:
-                        if cfg_text_scale is not None:
-                            sp.extra_args["cfg_text_scale"] = cfg_text_scale
-                        if cfg_img_scale is not None:
-                            sp.extra_args["cfg_img_scale"] = cfg_img_scale
-                        for _key in self._get_diffusion_extra_body_params():
-                            _val = extra_body.get(_key)
-                            if _val is not None:
-                                sp.extra_args[_key] = _val
+                    apply_declared_extra_args(sp, self._get_diffusion_extra_body_params(), extra_body)
 
                 self._log_inputs(
                     request_id,
@@ -2583,6 +2570,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     layers=layers,
                     resolution=resolution,
                 )
+                apply_declared_extra_args(
+                    default_stage_params,
+                    self._get_diffusion_extra_body_params(),
+                    extra_body,
+                )
                 if lora_body and isinstance(lora_body, dict):
                     try:
                         lora_req, lora_scale = parse_lora_request(lora_body)
@@ -2955,8 +2947,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             num_inference_steps = extra_body.get("num_inference_steps")
             guidance_scale = extra_body.get("guidance_scale")
             true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
-            cfg_text_scale = extra_body.get("cfg_text_scale")
-            cfg_img_scale = extra_body.get("cfg_img_scale")
             seed = extra_body.get("seed")
             if seed is None:
                 seed = getattr(request, "seed", None)
@@ -3014,14 +3004,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.guidance_scale = guidance_scale
             if true_cfg_scale is not None:
                 gen_params.true_cfg_scale = true_cfg_scale
-            if cfg_text_scale is not None:
-                gen_params.extra_args["cfg_text_scale"] = cfg_text_scale
-            if cfg_img_scale is not None:
-                gen_params.extra_args["cfg_img_scale"] = cfg_img_scale
-            for _key in self._get_diffusion_extra_body_params():
-                _val = extra_body.get(_key)
-                if _val is not None:
-                    gen_params.extra_args[_key] = _val
+            apply_declared_extra_args(gen_params, self._get_diffusion_extra_body_params(), extra_body)
             if num_frames is not None:
                 gen_params.num_frames = num_frames
             if guidance_scale_2 is not None:

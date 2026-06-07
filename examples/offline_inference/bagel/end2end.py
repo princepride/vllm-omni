@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 
 from vllm_omni.inputs.data import OmniPromptType
@@ -60,6 +61,9 @@ def parse_args():
         help="Path to deploy YAML. If unset, auto-loads vllm_omni/deploy/bagel.yaml based on the HF model_type.",
     )
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
+    parser.add_argument("--height", type=int, default=512, help="Output image height in pixels.")
+    parser.add_argument("--width", type=int, default=512, help="Output image width in pixels.")
+    parser.add_argument("--guidance-scale", type=float, default=None, help="Generic guidance scale.")
 
     parser.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (default: 4.0)")
     parser.add_argument("--cfg-img-scale", type=float, default=1.5, help="Image CFG scale (default: 1.5)")
@@ -120,6 +124,15 @@ def parse_args():
         default=0.3,
         help="Temperature for text generation sampling (default: 0.3).",
     )
+    parser.add_argument(
+        "--extra-args",
+        type=json.loads,
+        default=None,
+        help=(
+            "JSON object with additional model-specific sampling args. Keys "
+            "declared by the pipeline flow into OmniDiffusionSamplingParams.extra_args."
+        ),
+    )
 
     args = parser.parse_args()
     return args
@@ -148,7 +161,10 @@ def main():
 
     from PIL import Image
 
+    from vllm_omni.diffusion.diffusion_engine import get_extra_body_params
+    from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
     from vllm_omni.entrypoints.omni import Omni
+    from vllm_omni.entrypoints.openai.utils import resolve_diffusion_od_config
 
     omni_kwargs = vars(args).copy()
     omni_kwargs.pop("model", None)
@@ -161,8 +177,16 @@ def main():
 
     if args.quantization:
         omni_kwargs["quantization_config"] = args.quantization
+    omni_kwargs.pop("extra_args", None)
 
     omni = Omni(model=model_name, **omni_kwargs)
+    engine = getattr(omni, "engine", None)
+    od_config = resolve_diffusion_od_config(engine)
+    declared_extra_body_params = (
+        get_extra_body_params(od_config.model_class_name)
+        if od_config is not None and getattr(od_config, "model_class_name", None)
+        else frozenset()
+    )
 
     formatted_prompts = []
     for p in prompts:
@@ -216,31 +240,37 @@ def main():
     diffusion_params = params_list[diffusion_params_idx]
 
     if args.modality in ("text2img", "img2img"):
+        diffusion_params.height = args.height  # type: ignore
+        diffusion_params.width = args.width  # type: ignore
         diffusion_params.num_inference_steps = args.steps  # type: ignore
+        if args.guidance_scale is not None:
+            diffusion_params.guidance_scale = args.guidance_scale  # type: ignore
         diffusion_params.cfg_parallel_size = args.cfg_parallel_size  # type: ignore
         if args.seed is not None:
             diffusion_params.seed = args.seed  # type: ignore
 
-    extra = getattr(diffusion_params, "extra_args", {}) or {}
-    extra["cfg_text_scale"] = args.cfg_text_scale
-    extra["cfg_img_scale"] = args.cfg_img_scale
-    if args.cfg_interval is not None:
-        extra["cfg_interval"] = tuple(args.cfg_interval)
-    if args.cfg_renorm_type is not None:
-        extra["cfg_renorm_type"] = args.cfg_renorm_type
-    if args.cfg_renorm_min is not None:
-        extra["cfg_renorm_min"] = args.cfg_renorm_min
-    if args.negative_prompt is not None:
-        extra["negative_prompt"] = args.negative_prompt
+    declared_user_args = {
+        "cfg_text_scale": args.cfg_text_scale,
+        "cfg_img_scale": args.cfg_img_scale,
+        "cfg_interval": tuple(args.cfg_interval) if args.cfg_interval is not None else None,
+        "cfg_renorm_type": args.cfg_renorm_type,
+        "cfg_renorm_min": args.cfg_renorm_min,
+        "negative_prompt": args.negative_prompt,
+    }
 
     needs_text_gen = is_single_stage and (args.think or args.modality in ("text2text", "img2text"))
     if needs_text_gen:
-        if args.think:
-            extra["think"] = True
-        extra["max_think_tokens"] = args.max_think_tokens
-        extra["do_sample"] = args.do_sample
-        extra["text_temperature"] = args.text_temperature
-    diffusion_params.extra_args = extra  # type: ignore
+        declared_user_args.update(
+            {
+                "think": True if args.think else None,
+                "max_think_tokens": args.max_think_tokens,
+                "do_sample": args.do_sample,
+                "text_temperature": args.text_temperature,
+            }
+        )
+    if args.extra_args:
+        declared_user_args.update(args.extra_args)
+    apply_declared_extra_args(diffusion_params, declared_extra_body_params, declared_user_args)
 
     omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 

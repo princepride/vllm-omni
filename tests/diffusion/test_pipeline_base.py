@@ -14,7 +14,8 @@ from vllm_omni.diffusion.diffusion_engine import (
 )
 from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
-from vllm_omni.diffusion.utils.param_utils import build_sampling_params
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args, build_sampling_params
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
 class _ValidPipeline(DiffusionPipelineBase):
@@ -97,3 +98,25 @@ def test_extra_body_params_routing(caplog: pytest.LogCaptureFixture) -> None:
     assert params.guidance_scale == 3.5
     assert params.extra_args == {"cfg_text_scale": 4.0, "think": True}
     assert "Unknown diffusion sampling params ignored" in caplog.text
+
+
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_declared_extra_args_apply_to_existing_sampling_params() -> None:
+    params = OmniDiffusionSamplingParams(extra_args={"existing": 1})
+
+    apply_declared_extra_args(
+        params,
+        _ValidPipeline.EXTRA_BODY_PARAMS,
+        {
+            "cfg_text_scale": 4.0,
+            "think": False,
+            "unknown": "ignored",
+        },
+    )
+
+    assert params.extra_args == {
+        "existing": 1,
+        "cfg_text_scale": 4.0,
+        "think": False,
+    }

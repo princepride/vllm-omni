@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import base64
+import json
 from pathlib import Path
 
 import requests
@@ -21,8 +22,10 @@ def generate_image(
     height: int | None = None,
     width: int | None = None,
     steps: int | None = None,
+    guidance_scale: float | None = None,
     seed: int | None = None,
     negative_prompt: str | None = None,
+    extra_body: dict | None = None,
     modality: str = "text2img",  # "text2img" (default), "img2img", "img2text", "text2text"
 ) -> bytes | str | None:
     """Generate an image or text using the chat completions API.
@@ -34,8 +37,10 @@ def generate_image(
         height: Image height in pixels
         width: Image width in pixels
         steps: Number of inference steps
+        guidance_scale: Generic guidance scale
         seed: Random seed
         negative_prompt: Negative prompt
+        extra_body: Additional model-specific request parameters
         modality: Task modality hint
 
     Returns:
@@ -58,8 +63,8 @@ def generate_image(
 
     messages = [{"role": "user", "content": content}]
 
-    # Build request payload with all parameters at top level
-    # Note: vLLM ignores "extra_body", so we put parameters directly in the payload
+    # Build request payload. Generation parameters belong in extra_body so the
+    # server can route model-specific keys through the pipeline declaration.
     payload = {"messages": messages}
 
     # Set output modalities at top level
@@ -68,17 +73,21 @@ def generate_image(
     elif modality == "img2text" or modality == "text2text":
         payload["modalities"] = ["text"]
 
-    # Add generation parameters directly to payload
+    request_extra_body = dict(extra_body or {})
     if height is not None:
-        payload["height"] = height
+        request_extra_body["height"] = height
     if width is not None:
-        payload["width"] = width
+        request_extra_body["width"] = width
     if steps is not None:
-        payload["num_inference_steps"] = steps
+        request_extra_body["num_inference_steps"] = steps
+    if guidance_scale is not None:
+        request_extra_body["guidance_scale"] = guidance_scale
     if seed is not None:
-        payload["seed"] = seed
+        request_extra_body["seed"] = seed
     if negative_prompt:
-        payload["negative_prompt"] = negative_prompt
+        request_extra_body["negative_prompt"] = negative_prompt
+    if request_extra_body:
+        payload["extra_body"] = request_extra_body
 
     # Send request
     try:
@@ -143,8 +152,15 @@ def main():
     parser.add_argument("--height", type=int, default=512, help="Image height")
     parser.add_argument("--width", type=int, default=512, help="Image width")
     parser.add_argument("--steps", type=int, default=25, help="Inference steps")
+    parser.add_argument("--guidance-scale", type=float, default=None, help="Generic guidance scale")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
+    parser.add_argument(
+        "--extra-body",
+        type=json.loads,
+        default=None,
+        help='JSON object with additional model-specific parameters, e.g. \'{"cfg_text_scale": 4.0}\'',
+    )
 
     args = parser.parse_args()
 
@@ -159,8 +175,10 @@ def main():
         height=args.height,
         width=args.width,
         steps=args.steps,
+        guidance_scale=args.guidance_scale,
         seed=args.seed,
         negative_prompt=args.negative,
+        extra_body=args.extra_body,
         modality=args.modality,
     )
 

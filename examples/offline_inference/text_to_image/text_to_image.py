@@ -10,7 +10,11 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.data import logger
+from vllm_omni.diffusion.diffusion_engine import get_extra_body_params
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
+from vllm_omni.entrypoints.openai.utils import resolve_diffusion_od_config
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -38,6 +42,94 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
     return config
+
+
+def _is_bagel_pipeline(od_config: Any, model: str | None = None) -> bool:
+    model_class_name = getattr(od_config, "model_class_name", "") if od_config is not None else ""
+    model_type = getattr(od_config, "model_type", "") if od_config is not None else ""
+    model_name = model or ""
+    return any("bagel" in str(value).lower() for value in (model_class_name, model_type, model_name))
+
+
+def _build_text_to_image_prompt(args: argparse.Namespace, od_config: Any) -> dict[str, Any]:
+    if _is_bagel_pipeline(od_config, args.model):
+        prompt: dict[str, Any] = {
+            "prompt": f"<|im_start|>{args.prompt}<|im_end|>",
+            "modalities": ["image"],
+            "mm_processor_kwargs": {
+                "target_h": args.height,
+                "target_w": args.width,
+                "modalities": ["image"],
+            },
+        }
+        if args.negative_prompt is not None:
+            prompt["negative_prompt"] = args.negative_prompt
+        return prompt
+    return {
+        "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt,
+    }
+
+
+def _build_sampling_params_list(
+    omni: Omni,
+    args: argparse.Namespace,
+    generator: torch.Generator,
+    extra_args: dict[str, Any],
+    declared_extra_body_params: frozenset[str],
+    od_config: Any,
+) -> list[Any]:
+    """Build per-stage params while preserving deploy defaults.
+
+    Single-stage models receive one diffusion params object. Multi-stage models
+    keep non-diffusion stage defaults and apply image generation overrides only
+    to diffusion stages.
+    """
+    defaults = list(getattr(omni, "default_sampling_params_list", []) or [])
+    params_list = [clone_sampling_params(params) for params in defaults]
+    if not params_list:
+        params_list = [OmniDiffusionSamplingParams()]
+
+    stage_configs = list(getattr(getattr(omni, "engine", None), "stage_configs", []) or [])
+    is_bagel = _is_bagel_pipeline(od_config, args.model)
+    diffusion_params_seen = False
+    declared_user_args = {
+        "cfg_text_scale": getattr(args, "cfg_scale", None),
+        "negative_prompt": args.negative_prompt,
+        "timesteps_shift": args.timesteps_shift,
+        "cfg_schedule": args.cfg_schedule,
+        "use_norm": args.use_norm,
+        "use_system_prompt": args.use_system_prompt,
+        "system_prompt": args.system_prompt,
+    }
+
+    for idx, params in enumerate(params_list):
+        if not isinstance(params, OmniDiffusionSamplingParams):
+            if is_bagel and getattr(params, "extra_args", None) is None:
+                setattr(params, "extra_args", {})
+            if args.seed is not None and hasattr(params, "seed"):
+                params.seed = args.seed
+            continue
+        diffusion_params_seen = True
+        params.height = args.height
+        params.width = args.width
+        params.generator = generator
+        params.true_cfg_scale = args.cfg_scale
+        params.guidance_scale = args.guidance_scale
+        params.guidance_scale_2 = args.guidance_scale_2
+        params.num_inference_steps = args.num_inference_steps
+        params.num_outputs_per_prompt = args.num_images_per_prompt
+        if not is_bagel:
+            params.extra_args.update({key: value for key, value in extra_args.items() if value is not None})
+        if "lora_request" in extra_args:
+            params.lora_request = extra_args["lora_request"]
+        if "lora_scale" in extra_args:
+            params.lora_scale = extra_args["lora_scale"]
+        apply_declared_extra_args(params, declared_extra_body_params, declared_user_args)
+
+    if not diffusion_params_seen:
+        raise ValueError("No diffusion sampling params found in Omni default_sampling_params_list.")
+    return params_list
 
 
 def parse_args() -> argparse.Namespace:
@@ -405,6 +497,12 @@ def main():
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
     omni = Omni(**omni_kwargs)
+    od_config = resolve_diffusion_od_config(getattr(omni, "engine", None))
+    declared_extra_body_params = (
+        get_extra_body_params(od_config.model_class_name)
+        if od_config is not None and getattr(od_config, "model_class_name", None)
+        else frozenset()
+    )
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -456,22 +554,17 @@ def main():
         extra_args["lora_request"] = lora_request
         extra_args["lora_scale"] = args.lora_scale
 
+    sampling_params_list = _build_sampling_params_list(
+        omni=omni,
+        args=args,
+        generator=generator,
+        extra_args=extra_args,
+        declared_extra_body_params=declared_extra_body_params,
+        od_config=od_config,
+    )
     outputs = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-        },
-        OmniDiffusionSamplingParams(
-            height=args.height,
-            width=args.width,
-            generator=generator,
-            true_cfg_scale=args.cfg_scale,
-            guidance_scale=args.guidance_scale,
-            guidance_scale_2=args.guidance_scale_2,
-            num_inference_steps=args.num_inference_steps,
-            num_outputs_per_prompt=args.num_images_per_prompt,
-            extra_args=extra_args,
-        ),
+        _build_text_to_image_prompt(args, od_config),
+        sampling_params_list=sampling_params_list,
     )
 
     generation_end = time.perf_counter()
@@ -502,15 +595,15 @@ def main():
         raise ValueError("No output generated from omni.generate()")
     logger.info(f"Outputs: {outputs}")
 
-    first_output = outputs[0]
-    if not hasattr(first_output, "request_output") or not first_output.request_output:
-        raise ValueError("No request_output found in OmniRequestOutput")
-
-    req_out = first_output.request_output
-    if not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images'.")
-
-    images = req_out.images
+    images = None
+    for output in outputs:
+        images = getattr(output, "images", None)
+        if images:
+            break
+        req_out = getattr(output, "request_output", None)
+        images = getattr(req_out, "images", None) if req_out is not None else None
+        if images:
+            break
     if not images:
         raise ValueError("No images found in request_output")
 

@@ -16,6 +16,34 @@ logger = init_logger(__name__)
 _STANDARD_SAMPLING_PARAM_KEYS = {field.name for field in fields(OmniDiffusionSamplingParams)}
 
 
+def collect_declared_extra_args(
+    declared_params: frozenset[str],
+    user_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Return request keys declared by a pipeline, omitting unspecified values."""
+    return {key: user_kwargs[key] for key in declared_params if user_kwargs.get(key) is not None}
+
+
+def apply_declared_extra_args(
+    sampling_params: Any,
+    declared_params: frozenset[str],
+    user_kwargs: dict[str, Any],
+) -> None:
+    """Apply pipeline-declared request params to ``sampling_params.extra_args``.
+
+    This keeps online and offline callers on the same routing contract: standard
+    sampling fields stay on ``OmniDiffusionSamplingParams`` while model-specific
+    fields declared by the pipeline flow into ``extra_args``.
+    """
+    if not hasattr(sampling_params, "extra_args"):
+        return
+    extra_args = getattr(sampling_params, "extra_args", None)
+    if extra_args is None:
+        extra_args = {}
+        setattr(sampling_params, "extra_args", extra_args)
+    extra_args.update(collect_declared_extra_args(declared_params, user_kwargs))
+
+
 def build_sampling_params(
     pipeline_cls: type[DiffusionPipelineBase],
     height: int | None = None,
