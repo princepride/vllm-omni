@@ -119,8 +119,7 @@ def get_extra_body_params(model_class_name: str) -> frozenset[str]:
     if issubclass(model_cls, DiffusionPipelineBase):
         return frozenset(model_cls.EXTRA_BODY_PARAMS)
     logger.warning(
-        "Pipeline %r does not inherit from DiffusionPipelineBase; "
-        "falling back to legacy EXTRA_BODY_PARAMS lookup.",
+        "Pipeline %r does not inherit from DiffusionPipelineBase; falling back to legacy EXTRA_BODY_PARAMS lookup.",
         model_cls.__qualname__,
     )
     return frozenset(getattr(model_cls, "EXTRA_BODY_PARAMS", frozenset()))
@@ -140,8 +139,7 @@ def get_extra_output_params(model_class_name: str) -> frozenset[str]:
     if issubclass(model_cls, DiffusionPipelineBase):
         return frozenset(model_cls.EXTRA_OUTPUT_PARAMS)
     logger.warning(
-        "Pipeline %r does not inherit from DiffusionPipelineBase; "
-        "falling back to legacy EXTRA_OUTPUT_PARAMS lookup.",
+        "Pipeline %r does not inherit from DiffusionPipelineBase; falling back to legacy EXTRA_OUTPUT_PARAMS lookup.",
         model_cls.__qualname__,
     )
     return frozenset(getattr(model_cls, "EXTRA_OUTPUT_PARAMS", frozenset()))
