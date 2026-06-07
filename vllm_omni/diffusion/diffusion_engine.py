@@ -147,21 +147,6 @@ def get_extra_output_params(model_class_name: str) -> frozenset[str]:
     return frozenset(getattr(model_cls, "EXTRA_OUTPUT_PARAMS", frozenset()))
 
 
-def validate_diffusion_pipeline_cls(model_class_name: str) -> type[DiffusionPipelineBase]:
-    """Load a registered pipeline class and enforce the new base-class contract."""
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        raise ValueError(f"Unknown diffusion model: {model_class_name!r}")
-    if not issubclass(model_cls, DiffusionPipelineBase):
-        raise TypeError(
-            f"Pipeline {model_cls.__qualname__!r} must inherit from "
-            "DiffusionPipelineBase. Add DiffusionPipelineBase to its "
-            "base-class list and declare EXTRA_BODY_PARAMS / "
-            "EXTRA_OUTPUT_PARAMS (empty frozenset() is acceptable)."
-        )
-    return model_cls
-
-
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
@@ -176,8 +161,6 @@ class DiffusionEngine:
             config: The configuration for the diffusion engine.
         """
         self.od_config = od_config
-        self.extra_body_params = get_extra_body_params(od_config.model_class_name)
-        self.extra_output_params = get_extra_output_params(od_config.model_class_name)
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)

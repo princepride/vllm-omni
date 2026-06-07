@@ -90,12 +90,12 @@ def _build_sampling_params_list(
     if not params_list:
         params_list = [OmniDiffusionSamplingParams()]
 
-    stage_configs = list(getattr(getattr(omni, "engine", None), "stage_configs", []) or [])
     is_bagel = _is_bagel_pipeline(od_config, args.model)
     diffusion_params_seen = False
     declared_user_args = {
         "cfg_text_scale": getattr(args, "cfg_scale", None),
         "negative_prompt": args.negative_prompt,
+        "timestep_shift": args.timesteps_shift,
         "timesteps_shift": args.timesteps_shift,
         "cfg_schedule": args.cfg_schedule,
         "use_norm": args.use_norm,
@@ -497,7 +497,7 @@ def main():
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
     omni = Omni(**omni_kwargs)
-    od_config = resolve_diffusion_od_config(getattr(omni, "engine", None))
+    od_config = resolve_diffusion_od_config(None, getattr(omni, "engine", None))
     declared_extra_body_params = (
         get_extra_body_params(od_config.model_class_name)
         if od_config is not None and getattr(od_config, "model_class_name", None)
