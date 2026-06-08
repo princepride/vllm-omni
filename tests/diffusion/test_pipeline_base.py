@@ -3,13 +3,15 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 
 from vllm_omni.diffusion.diffusion_engine import (
+    build_text_to_image_prompt,
     get_extra_body_params,
     get_extra_output_params,
+    should_init_extra_args_for_non_diffusion_stages,
 )
 from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
@@ -20,6 +22,28 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 class _ValidPipeline(DiffusionPipelineBase):
     EXTRA_BODY_PARAMS: ClassVar[frozenset[str]] = frozenset({"cfg_text_scale", "think"})
     EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]] = frozenset({"think_text"})
+
+
+class _PromptPipeline(DiffusionPipelineBase):
+    INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES: ClassVar[bool] = True
+
+    @classmethod
+    def build_text_to_image_prompt(
+        cls,
+        prompt: str,
+        negative_prompt: str | None,
+        height: int | None = None,
+        width: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "prompt": f"<wrapped>{prompt}</wrapped>",
+            "negative_prompt": negative_prompt,
+            "modalities": ["image"],
+            "mm_processor_kwargs": {
+                "target_h": height,
+                "target_w": width,
+            },
+        }
 
 
 class _EmptyPipeline(DiffusionPipelineBase):
@@ -35,6 +59,7 @@ class _LegacyPipeline:
 def patch_registry(monkeypatch: pytest.MonkeyPatch):
     models = {
         "ValidPipeline": _ValidPipeline,
+        "PromptPipeline": _PromptPipeline,
         "EmptyPipeline": _EmptyPipeline,
         "LegacyPipeline": _LegacyPipeline,
     }
@@ -58,6 +83,7 @@ def test_valid_pipeline_uses_declared_params(patch_registry) -> None:
 def test_empty_frozensets_are_valid(patch_registry) -> None:
     assert get_extra_body_params("EmptyPipeline") == frozenset()
     assert get_extra_output_params("EmptyPipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("EmptyPipeline") is False
 
 
 @pytest.mark.diffusion
@@ -65,6 +91,42 @@ def test_empty_frozensets_are_valid(patch_registry) -> None:
 def test_legacy_pipeline_falls_back_during_migration(patch_registry) -> None:
     assert get_extra_body_params("LegacyPipeline") == frozenset({"legacy_param"})
     assert get_extra_output_params("LegacyPipeline") == frozenset({"legacy_output"})
+
+
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_pipeline_declared_prompt_builder_is_used(patch_registry) -> None:
+    assert build_text_to_image_prompt(
+        "PromptPipeline",
+        prompt="a cat",
+        negative_prompt="blurry",
+        height=512,
+        width=768,
+    ) == {
+        "prompt": "<wrapped>a cat</wrapped>",
+        "negative_prompt": "blurry",
+        "modalities": ["image"],
+        "mm_processor_kwargs": {
+            "target_h": 512,
+            "target_w": 768,
+        },
+    }
+    assert should_init_extra_args_for_non_diffusion_stages("PromptPipeline") is True
+
+
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_unknown_pipeline_uses_default_prompt_builder(patch_registry) -> None:
+    assert build_text_to_image_prompt(
+        "UnknownPipeline",
+        prompt="a cat",
+        negative_prompt=None,
+        height=512,
+        width=512,
+    ) == {
+        "prompt": "a cat",
+        "negative_prompt": None,
+    }
 
 
 @pytest.mark.diffusion

@@ -145,6 +145,41 @@ def get_extra_output_params(model_class_name: str) -> frozenset[str]:
     return frozenset(getattr(model_cls, "EXTRA_OUTPUT_PARAMS", frozenset()))
 
 
+def should_init_extra_args_for_non_diffusion_stages(model_class_name: str) -> bool:
+    """Return whether a pipeline needs ``extra_args`` on non-diffusion stages."""
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    if issubclass(model_cls, DiffusionPipelineBase):
+        return bool(model_cls.INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES)
+    return bool(getattr(model_cls, "INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES", False))
+
+
+def build_text_to_image_prompt(
+    model_class_name: str | None,
+    prompt: str,
+    negative_prompt: str | None,
+    height: int | None = None,
+    width: int | None = None,
+) -> dict[str, Any]:
+    """Build an offline text-to-image prompt using the pipeline contract."""
+    if model_class_name:
+        model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+        if model_cls is not None and issubclass(model_cls, DiffusionPipelineBase):
+            return model_cls.build_text_to_image_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=height,
+                width=width,
+            )
+    return DiffusionPipelineBase.build_text_to_image_prompt(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        height=height,
+        width=width,
+    )
+
+
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 

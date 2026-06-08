@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
 from math import isqrt
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -178,6 +178,28 @@ class BagelPipeline(nn.Module, DiffusionPipelineBase, SupportsComponentDiscovery
             "think_text",
         }
     )
+    INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES: ClassVar[bool] = True
+
+    @classmethod
+    def build_text_to_image_prompt(
+        cls,
+        prompt: str,
+        negative_prompt: str | None,
+        height: int | None = None,
+        width: int | None = None,
+    ) -> dict[str, Any]:
+        text_prompt: dict[str, Any] = {
+            "prompt": f"<|im_start|>{prompt}<|im_end|>",
+            "modalities": ["image"],
+            "mm_processor_kwargs": {
+                "target_h": height,
+                "target_w": width,
+                "modalities": ["image"],
+            },
+        }
+        if negative_prompt is not None:
+            text_prompt["negative_prompt"] = negative_prompt
+        return text_prompt
 
     _dit_modules: ClassVar[list[str]] = ["language_model.model"]
     _encoder_modules: ClassVar[list[str]] = []

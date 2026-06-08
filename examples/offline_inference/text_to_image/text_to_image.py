@@ -10,7 +10,11 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.data import logger
-from vllm_omni.diffusion.diffusion_engine import get_extra_body_params
+from vllm_omni.diffusion.diffusion_engine import (
+    build_text_to_image_prompt,
+    get_extra_body_params,
+    should_init_extra_args_for_non_diffusion_stages,
+)
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
@@ -44,31 +48,15 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
     return config
 
 
-def _is_bagel_pipeline(od_config: Any, model: str | None = None) -> bool:
-    model_class_name = getattr(od_config, "model_class_name", "") if od_config is not None else ""
-    model_type = getattr(od_config, "model_type", "") if od_config is not None else ""
-    model_name = model or ""
-    return any("bagel" in str(value).lower() for value in (model_class_name, model_type, model_name))
-
-
 def _build_text_to_image_prompt(args: argparse.Namespace, od_config: Any) -> dict[str, Any]:
-    if _is_bagel_pipeline(od_config, args.model):
-        prompt: dict[str, Any] = {
-            "prompt": f"<|im_start|>{args.prompt}<|im_end|>",
-            "modalities": ["image"],
-            "mm_processor_kwargs": {
-                "target_h": args.height,
-                "target_w": args.width,
-                "modalities": ["image"],
-            },
-        }
-        if args.negative_prompt is not None:
-            prompt["negative_prompt"] = args.negative_prompt
-        return prompt
-    return {
-        "prompt": args.prompt,
-        "negative_prompt": args.negative_prompt,
-    }
+    model_class_name = getattr(od_config, "model_class_name", None) if od_config is not None else None
+    return build_text_to_image_prompt(
+        model_class_name=model_class_name,
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+        height=args.height,
+        width=args.width,
+    )
 
 
 def _build_sampling_params_list(
@@ -90,22 +78,25 @@ def _build_sampling_params_list(
     if not params_list:
         params_list = [OmniDiffusionSamplingParams()]
 
-    is_bagel = _is_bagel_pipeline(od_config, args.model)
+    model_class_name = getattr(od_config, "model_class_name", None) if od_config is not None else None
+    init_extra_args_for_non_diffusion_stages = (
+        should_init_extra_args_for_non_diffusion_stages(model_class_name) if model_class_name else False
+    )
     diffusion_params_seen = False
     declared_user_args = {
+        "cfg_scale": getattr(args, "cfg_scale", None),
         "cfg_text_scale": getattr(args, "cfg_scale", None),
         "negative_prompt": args.negative_prompt,
         "timestep_shift": args.timesteps_shift,
-        "timesteps_shift": args.timesteps_shift,
         "cfg_schedule": args.cfg_schedule,
         "use_norm": args.use_norm,
         "use_system_prompt": args.use_system_prompt,
         "system_prompt": args.system_prompt,
     }
 
-    for idx, params in enumerate(params_list):
+    for params in params_list:
         if not isinstance(params, OmniDiffusionSamplingParams):
-            if is_bagel and getattr(params, "extra_args", None) is None:
+            if init_extra_args_for_non_diffusion_stages and getattr(params, "extra_args", None) is None:
                 setattr(params, "extra_args", {})
             if args.seed is not None and hasattr(params, "seed"):
                 params.seed = args.seed
@@ -119,7 +110,7 @@ def _build_sampling_params_list(
         params.guidance_scale_2 = args.guidance_scale_2
         params.num_inference_steps = args.num_inference_steps
         params.num_outputs_per_prompt = args.num_images_per_prompt
-        if not is_bagel:
+        if not declared_extra_body_params:
             params.extra_args.update({key: value for key, value in extra_args.items() if value is not None})
         if "lora_request" in extra_args:
             params.lora_request = extra_args["lora_request"]
