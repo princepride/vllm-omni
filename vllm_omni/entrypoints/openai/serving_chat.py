@@ -164,8 +164,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_model_name = model_name
         instance._diffusion_extra_body_params = None
         instance._diffusion_extra_output_params = None
-        instance.has_kv_connector = False
         instance.engine_client = None
+        instance.has_kv_connector = False
         try:
             od_config = resolve_diffusion_od_config(None, diffusion_engine)
             if od_config is not None and getattr(od_config, "model_class_name", None):
