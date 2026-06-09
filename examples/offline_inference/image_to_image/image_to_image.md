@@ -38,11 +38,32 @@ python image_edit.py \
   --guidance-scale 1.0
 ```
 
+### BAGEL Image-To-Image
+
+Use the same generic `image_edit.py` entrypoint for BAGEL. The script detects
+the BAGEL pipeline after loading the model and formats the request as
+`modalities=["img2img"]` with `multi_modal_data["img2img"]`.
+
+```bash
+python image_edit.py \
+  --model ByteDance-Seed/BAGEL-7B-MoT \
+  --image input.png \
+  --prompt "Make the scene look like a watercolor painting" \
+  --height 512 \
+  --width 512 \
+  --num-inference-steps 50 \
+  --extra-args '{"cfg_text_scale": 4.0, "cfg_img_scale": 1.5}' \
+  --negative-prompt "blurry, low quality" \
+  --seed 42 \
+  --output bagel_img2img.png
+```
+
 Key arguments:
 
 - `--model`: model name or path. Use `Qwen/Qwen-Image-Edit-2509` or later for multiple image support.
 - `--image`: path(s) to the source image(s) (PNG/JPG, converted to RGB). Can specify multiple images.
 - `--prompt` / `--negative-prompt`: text description (string).
+- `--extra-args`: JSON object copied to `OmniDiffusionSamplingParams.extra_args` for model-declared controls such as BAGEL's `cfg_text_scale` and `cfg_img_scale`.
 - `--cfg-scale`: true classifier-free guidance scale (default: 4.0). Classifier-free guidance is enabled by setting cfg_scale > 1 and providing a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, usually at the expense of lower image quality.
 - `--guidance-scale`: guidance scale for guidance-distilled models (default: 1.0, disabled). Unlike classifier-free guidance (--cfg-scale), guidance-distilled models take the guidance scale directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models.
 - `--num-inference-steps`: diffusion sampling steps (more steps = higher quality, slower).

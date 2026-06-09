@@ -1,22 +1,22 @@
 # BAGEL-7B-MoT
 
-> Text-to-image generation through the shared online and offline text-to-image examples
+> BAGEL image generation through the shared online and offline image examples
 
 ## Summary
 
 - Vendor: ByteDance Seed
 - Model: `ByteDance-Seed/BAGEL-7B-MoT`
-- Task: Text-to-image generation
+- Task: Text-to-image and image-to-image generation
 - Mode: Offline inference and OpenAI-compatible online serving
 - Maintainer: Community
 
 ## When to use this recipe
 
-Use this recipe when you want to run BAGEL text-to-image generation without
-the dedicated BAGEL example clients. The generic text-to-image examples can
-now format BAGEL prompts, select image output modality, and forward
-BAGEL-specific generation parameters through the pipeline-declared
-`extra_args` contract.
+Use this recipe when you want to run BAGEL through the shared image examples
+instead of model-specific example clients. The generic examples can format
+BAGEL text-to-image and image-to-image prompts, select the image output
+modality, attach reference images, and forward BAGEL-specific generation
+parameters through the pipeline-declared `extra_args` contract.
 
 ## References
 
@@ -24,8 +24,12 @@ BAGEL-specific generation parameters through the pipeline-declared
   [`ByteDance-Seed/BAGEL-7B-MoT`](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT)
 - Related offline example:
   [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
+- Related offline image-to-image example:
+  [`examples/offline_inference/image_to_image/image_edit.py`](../../examples/offline_inference/image_to_image/image_edit.py)
 - Related online example:
   [`examples/online_serving/text_to_image/openai_chat_client.py`](../../examples/online_serving/text_to_image/openai_chat_client.py)
+- Related online image-to-image example:
+  [`examples/online_serving/image_to_image/openai_chat_client.py`](../../examples/online_serving/image_to_image/openai_chat_client.py)
 - Default deploy configs:
   [`vllm_omni/deploy/bagel.yaml`](../../vllm_omni/deploy/bagel.yaml),
   [`vllm_omni/deploy/bagel_single_stage.yaml`](../../vllm_omni/deploy/bagel_single_stage.yaml)
@@ -48,9 +52,9 @@ move the diffusion stage to a second GPU in a custom deploy config.
 - vLLM version: Match the repository requirements for your checkout
 - vLLM-Omni version or commit: Use the commit you are deploying from
 
-#### Offline Command
+#### Offline Commands
 
-Run the shared offline text-to-image example from the repository root:
+Run text-to-image with the shared offline example from the repository root:
 
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \
@@ -63,6 +67,23 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --negative-prompt "blurry, low quality" \
   --seed 42 \
   --output /tmp/bagel_text2img.png
+```
+
+Run image-to-image with the shared offline image-to-image example:
+
+```bash
+python examples/offline_inference/image_to_image/image_edit.py \
+  --model ByteDance-Seed/BAGEL-7B-MoT \
+  --prompt "Make the scene look like a watercolor painting" \
+  --image /path/to/input.jpg \
+  --height 512 \
+  --width 512 \
+  --num-inference-steps 50 \
+  --cfg-scale 4.0 \
+  --extra-args '{"cfg_text_scale": 4.0, "cfg_img_scale": 1.5}' \
+  --negative-prompt "blurry, low quality" \
+  --seed 42 \
+  --output /tmp/bagel_img2img.png
 ```
 
 To force the single-stage topology:
@@ -80,9 +101,11 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output /tmp/bagel_text2img_single_stage.png
 ```
 
-The generic example detects BAGEL-style pipelines and wraps the prompt as
-`<|im_start|>...<|im_end|>`, sets `modalities: ["image"]`, and passes
-`target_h` / `target_w` through `mm_processor_kwargs`.
+The text-to-image example detects BAGEL-style pipelines and wraps prompts as
+`<|im_start|>...<|im_end|>`. The image-to-image example keeps the same generic
+CLI shape used by other edit models, and only switches to BAGEL's
+`modalities: ["img2img"]` / `multi_modal_data["img2img"]` format after the
+loaded pipeline is identified as BAGEL.
 
 #### Online Command
 
@@ -101,36 +124,70 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
   --deploy-config vllm_omni/deploy/bagel_single_stage.yaml
 ```
 
-Send a text-to-image request with the OpenAI-compatible chat endpoint:
+Send a text-to-image request with the OpenAI-compatible image endpoint:
 
 ```bash
+python examples/online_serving/text_to_image/openai_chat_client.py \
+  --server http://localhost:8091 \
+  --prompt "A beautiful sunset over mountains" \
+  --height 512 \
+  --width 512 \
+  --steps 50 \
+  --cfg-scale 4.0 \
+  --negative "blurry, low quality" \
+  --seed 42 \
+  --output /tmp/bagel_online_text2img.png
+```
+
+Send image-to-image with the shared online image-to-image client:
+
+```bash
+python examples/online_serving/image_to_image/openai_chat_client.py \
+  --server http://localhost:8091 \
+  --prompt "Make the scene look like a watercolor painting" \
+  --input /path/to/input.jpg \
+  --height 512 \
+  --width 512 \
+  --steps 50 \
+  --extra-body '{"cfg_text_scale": 4.0, "cfg_img_scale": 1.5}' \
+  --negative "blurry, low quality" \
+  --seed 42 \
+  --output /tmp/bagel_online_img2img.png
+```
+
+Equivalent curl request for image-to-image:
+
+```bash
+IMAGE_BASE64=$(base64 -w 0 /path/to/input.jpg)
+
 curl http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {"type": "text", "text": "<|im_start|>A beautiful sunset over mountains<|im_end|>"}
-        ]
-      }
-    ],
-    "modalities": ["image"],
-    "extra_body": {
-      "height": 512,
-      "width": 512,
-      "num_inference_steps": 50,
-      "cfg_text_scale": 4.0,
-      "negative_prompt": "blurry, low quality",
-      "seed": 42
+  -d "$(jq -n --arg img "$IMAGE_BASE64" '{
+    messages: [{
+      role: "user",
+      content: [
+        {type: "text", text: "Make the scene look like a watercolor painting"},
+        {type: "image_url", image_url: {url: ("data:image/jpeg;base64," + $img)}}
+      ]
+    }],
+    modalities: ["image"],
+    extra_body: {
+      height: 512,
+      width: 512,
+      num_inference_steps: 50,
+      cfg_text_scale: 4.0,
+      cfg_img_scale: 1.5,
+      negative_prompt: "blurry, low quality",
+      seed: 42
     }
-  }'
+  }')"
 ```
 
 The important parts are:
 
 - `modalities: ["image"]` requests image output from the chat endpoint.
-- BAGEL prompts should use the `<|im_start|>...<|im_end|>` wrapper.
+- Passing an image in message content triggers the shared serving path to build
+  an image-to-image request for pipelines that support it.
 - Generation controls belong in `extra_body`; declared BAGEL-specific keys
   such as `cfg_text_scale`, `cfg_img_scale`, `cfg_interval`,
   `cfg_renorm_type`, and `cfg_renorm_min` are routed to
@@ -182,11 +239,11 @@ ls -lh /tmp/bagel_online.png
 - Key flags: `--omni` enables vLLM-Omni serving; `--deploy-config` selects a
   custom topology such as `bagel_single_stage.yaml`.
 - Offline compatibility: use the generic `text_to_image.py` example for
-  text-to-image. Dedicated BAGEL example clients are intentionally not needed
-  for this path.
-- Known limitations: this recipe focuses on text-to-image. BAGEL also supports
-  image-to-image, image-to-text, text-to-text, and think mode through its model
-  pipeline, but those workflows may need task-specific request formatting.
+  text-to-image and the generic `image_edit.py` example for image-to-image.
+  Dedicated BAGEL example clients are intentionally not needed.
+- This recipe focuses on image generation. BAGEL text-output workflows
+  (`img2text`, `text2text`, think-only text) are model capabilities, but they
+  are not exposed through a dedicated BAGEL example in this branch.
 
 ### 2x CUDA GPUs
 
@@ -224,8 +281,8 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
 
 #### Verification
 
-Use the same chat completion request from the `1x A100 80GB` section and check
-that the server returns an image.
+Use either shared online client command from the `1x A100 80GB` section and
+check that the server returns an image.
 
 #### Notes
 

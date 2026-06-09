@@ -98,6 +98,8 @@ from PIL import Image
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
+from vllm_omni.entrypoints.openai.utils import resolve_diffusion_od_config
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -111,6 +113,83 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
     return config
+
+
+def _is_bagel_pipeline(model_class_name: str | None) -> bool:
+    return bool(model_class_name and "bagel" in model_class_name.lower())
+
+
+def _build_image_to_image_prompt(
+    args: argparse.Namespace,
+    input_image: Image.Image | list[Image.Image],
+    model_class_name: str | None,
+) -> dict[str, Any]:
+    if _is_bagel_pipeline(model_class_name):
+        prompt: dict[str, Any] = {
+            "prompt": f"<|fim_middle|><|im_start|>{args.prompt}<|im_end|>",
+            "modalities": ["img2img"],
+            "multi_modal_data": {"img2img": input_image},
+            "mm_processor_kwargs": {"modalities": ["img2img"]},
+        }
+        if args.height is not None:
+            prompt["mm_processor_kwargs"]["target_h"] = args.height
+        if args.width is not None:
+            prompt["mm_processor_kwargs"]["target_w"] = args.width
+    else:
+        prompt = {
+            "prompt": args.prompt,
+            "multi_modal_data": {"image": input_image},
+        }
+
+    if args.negative_prompt is not None:
+        prompt["negative_prompt"] = args.negative_prompt
+    return prompt
+
+
+def _build_extra_args(args: argparse.Namespace) -> dict[str, Any]:
+    extra_args = dict(args.extra_args or {})
+    if args.negative_prompt is not None:
+        extra_args["negative_prompt"] = args.negative_prompt
+    return {key: value for key, value in extra_args.items() if value is not None}
+
+
+def _build_diffusion_sampling_params(
+    args: argparse.Namespace,
+    generator: torch.Generator,
+) -> OmniDiffusionSamplingParams:
+    return OmniDiffusionSamplingParams(
+        generator=generator,
+        true_cfg_scale=args.cfg_scale,
+        guidance_scale=args.guidance_scale,
+        guidance_scale_2=args.guidance_scale_2,
+        num_inference_steps=args.num_inference_steps,
+        num_outputs_per_prompt=args.num_outputs_per_prompt,
+        layers=args.layers,
+        resolution=args.resolution,
+        height=args.height,
+        width=args.width,
+        extra_args=_build_extra_args(args),
+    )
+
+
+def _resolve_sampling_params_for_omni(
+    omni: Omni,
+    diffusion_params: OmniDiffusionSamplingParams,
+) -> OmniDiffusionSamplingParams | list[Any]:
+    if getattr(omni, "num_stages", 1) == 1:
+        return diffusion_params
+
+    params_list = [clone_sampling_params(params) for params in getattr(omni, "default_sampling_params_list", [])]
+    for idx, params in enumerate(params_list):
+        if isinstance(params, OmniDiffusionSamplingParams):
+            merged_extra_args = dict(getattr(params, "extra_args", {}) or {})
+            merged_extra_args.update(diffusion_params.extra_args)
+            diffusion_params.extra_args = merged_extra_args
+            params_list[idx] = diffusion_params
+            break
+    else:
+        raise ValueError("No diffusion sampling params found in Omni default_sampling_params_list.")
+    return params_list
 
 
 def parse_args() -> argparse.Namespace:
@@ -186,6 +265,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--guidance-scale-2", type=float, default=None, help="image guidance scale for image-to-image generation."
+    )
+    parser.add_argument("--height", type=int, default=None, help="Optional output image height.")
+    parser.add_argument("--width", type=int, default=None, help="Optional output image width.")
+    parser.add_argument(
+        "--extra-args",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON object copied to OmniDiffusionSamplingParams.extra_args, e.g. \'{"cfg_text_scale": 4.0}\'.',
     )
     parser.add_argument(
         "--output",
@@ -468,6 +555,8 @@ def main():
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    od_config = resolve_diffusion_od_config(None, getattr(omni, "engine", None))
+    model_class_name = getattr(od_config, "model_class_name", None) if od_config is not None else None
     print("Pipeline loaded")
 
     profiler_enabled = args.profiler_config is not None
@@ -478,6 +567,8 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    if args.height is not None or args.width is not None:
+        print(f"  Output size: {args.width or 'auto'}x{args.height or 'auto'}")
     if isinstance(input_image, list):
         print(f"  Number of input images: {len(input_image)}")
         for idx, img in enumerate(input_image):
@@ -496,6 +587,13 @@ def main():
         print("[Profiler] Starting profiling...")
         omni.start_profile()
 
+    prompt = _build_image_to_image_prompt(args, input_image, model_class_name)
+    diffusion_params = _build_diffusion_sampling_params(args, generator)
+    sampling_params = _resolve_sampling_params_for_omni(
+        omni=omni,
+        diffusion_params=diffusion_params,
+    )
+
     # Generate edited image
     sampling_params = OmniDiffusionSamplingParams(
         width=args.width,
@@ -511,11 +609,7 @@ def main():
     if args.resolution:
         sampling_params.resolution = args.resolution
     outputs = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-            "multi_modal_data": {"image": input_image},
-        },
+        prompt,
         sampling_params,
     )
     generation_end = time.perf_counter()
