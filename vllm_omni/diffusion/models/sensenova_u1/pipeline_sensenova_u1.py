@@ -35,7 +35,6 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -489,7 +488,7 @@ def _optimized_scale(positive_flat, negative_flat):
 # ---------------------------------------------------------------------------
 
 
-class SenseNovaU1Pipeline(nn.Module, DiffusionPipelineBase, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
+class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
     """SenseNova-U1 text-to-image and image-to-image pipeline for vllm-omni.
 
     Builds the full model graph internally:
@@ -504,30 +503,6 @@ class SenseNovaU1Pipeline(nn.Module, DiffusionPipelineBase, SupportsComponentDis
     """
 
     support_image_input = True
-
-    # Model-specific parameters accepted via ``extra_body`` in the online
-    # serving API.  The serving layer reads this set and forwards matching
-    # keys from the request payload to ``OmniDiffusionSamplingParams.extra_args``.
-    EXTRA_BODY_PARAMS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "think",
-            "cfg_scale",
-            "cfg_norm",
-            "timestep_shift",
-            "t_eps",
-            "img_cfg_scale",
-            "max_tokens",
-        }
-    )
-
-    # Keys from ``DiffusionOutput.custom_output`` that should be surfaced in
-    # the API response ``metrics`` dict.  The serving layer reads this set and
-    # copies matching entries from ``custom_output`` into the response.
-    EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "think_text",
-        }
-    )
 
     # CPU-offload protocol: language_model carries the denoising blocks; the
     # vision and FM modules are lightweight encoders pinned on GPU during the

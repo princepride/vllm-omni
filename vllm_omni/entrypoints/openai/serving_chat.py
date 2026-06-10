@@ -23,12 +23,12 @@ from vllm.entrypoints.chat_utils import (
     make_tool_call_id,
 )
 
-from vllm_omni.diffusion.diffusion_engine import get_extra_body_params, get_extra_output_params
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.model_extras import get_extra_body_params, get_extra_output_params
 from vllm_omni.metrics import definitions as _metric_defs
 from vllm_omni.metrics.modality import (
     observe_audio_first_packet,
@@ -176,7 +176,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return instance
 
     def _get_diffusion_extra_body_params(self) -> frozenset[str]:
-        """Return the pipeline-declared ``EXTRA_BODY_PARAMS`` (cached)."""
+        """Return model-specific extra_body params from the extra registry."""
         if self._diffusion_extra_body_params is not None:
             return self._diffusion_extra_body_params
 
@@ -186,7 +186,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if od_config is not None and getattr(od_config, "model_class_name", None):
                 params = get_extra_body_params(od_config.model_class_name)
         except Exception as e:
-            logger.warning("Failed to read EXTRA_BODY_PARAMS from pipeline: %s", e)
+            logger.warning("Failed to read model extra_body params: %s", e)
 
         self._diffusion_extra_body_params = params
         return params
@@ -195,7 +195,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self,
         custom_output: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
-        """Pick pipeline-declared ``EXTRA_OUTPUT_PARAMS`` keys from *custom_output*."""
+        """Pick model-specific extra output keys from *custom_output*."""
         if not custom_output:
             return None
 
@@ -206,7 +206,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if od_config is not None and getattr(od_config, "model_class_name", None):
                     params = get_extra_output_params(od_config.model_class_name)
             except Exception as e:
-                logger.warning("Failed to read EXTRA_OUTPUT_PARAMS from pipeline: %s", e)
+                logger.warning("Failed to read model extra output params: %s", e)
             self._diffusion_extra_output_params = params
 
         if not self._diffusion_extra_output_params:

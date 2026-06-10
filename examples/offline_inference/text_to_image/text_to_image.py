@@ -10,11 +10,6 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.data import logger
-from vllm_omni.diffusion.diffusion_engine import (
-    build_text_to_image_prompt,
-    get_extra_body_params,
-    should_init_extra_args_for_non_diffusion_stages,
-)
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
@@ -22,6 +17,11 @@ from vllm_omni.entrypoints.openai.utils import resolve_diffusion_od_config
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
+from vllm_omni.model_extras import (
+    build_text_to_image_prompt,
+    get_extra_body_params,
+    should_init_extra_args_for_non_diffusion_stages,
+)
 from vllm_omni.platforms import current_omni_platform
 
 
