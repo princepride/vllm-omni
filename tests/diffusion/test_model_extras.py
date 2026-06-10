@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import pytest
+from PIL import Image
 
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import (
+    build_image_to_image_prompt,
     build_text_to_image_prompt,
     get_extra_body_params,
     get_extra_output_params,
@@ -65,7 +67,7 @@ def test_unknown_pipeline_has_empty_extra_registry() -> None:
 
 @pytest.mark.diffusion
 @pytest.mark.cpu
-def test_bagel_prompt_builder_is_used() -> None:
+def test_bagel_text_to_image_prompt_builder() -> None:
     assert build_text_to_image_prompt(
         "BagelPipeline",
         prompt="a cat",
@@ -86,16 +88,49 @@ def test_bagel_prompt_builder_is_used() -> None:
 
 @pytest.mark.diffusion
 @pytest.mark.cpu
-def test_unknown_pipeline_uses_default_prompt_builder() -> None:
+def test_bagel_image_to_image_prompt_builder() -> None:
+    dummy_image = Image.new("RGB", (64, 64))
+    result = build_image_to_image_prompt(
+        "BagelPipeline",
+        prompt="paint it",
+        negative_prompt="ugly",
+        input_image=dummy_image,
+        height=256,
+        width=256,
+    )
+    assert result["prompt"] == "<|fim_middle|><|im_start|>paint it<|im_end|>"
+    assert result["modalities"] == ["img2img"]
+    assert result["multi_modal_data"]["img2img"] is dummy_image
+    assert result["mm_processor_kwargs"]["target_h"] == 256
+    assert result["mm_processor_kwargs"]["target_w"] == 256
+    assert result["negative_prompt"] == "ugly"
+
+
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_unknown_pipeline_uses_default_text_to_image_prompt() -> None:
     assert build_text_to_image_prompt(
         "UnknownPipeline",
         prompt="a cat",
         negative_prompt=None,
         height=512,
         width=512,
-    ) == {
-        "prompt": "a cat",
-        "negative_prompt": None,
+    ) == {"prompt": "a cat"}
+
+
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_unknown_pipeline_uses_default_image_to_image_prompt() -> None:
+    dummy_image = Image.new("RGB", (64, 64))
+    result = build_image_to_image_prompt(
+        "UnknownPipeline",
+        prompt="edit",
+        negative_prompt=None,
+        input_image=dummy_image,
+    )
+    assert result == {
+        "prompt": "edit",
+        "multi_modal_data": {"image": dummy_image},
     }
 
 

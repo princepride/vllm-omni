@@ -3,24 +3,20 @@
 
 from __future__ import annotations
 
-from typing import Any
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
 def apply_declared_extra_args(
-    sampling_params: Any,
+    sampling_params: OmniDiffusionSamplingParams,
     declared_params: frozenset[str],
-    user_kwargs: dict[str, Any],
+    user_kwargs: dict[str, object],
 ) -> None:
-    """Apply pipeline-declared request params to ``sampling_params.extra_args``.
+    """Route pipeline-declared request params into ``sampling_params.extra_args``.
 
-    This keeps online and offline callers on the same routing contract: standard
-    sampling fields stay on ``OmniDiffusionSamplingParams`` while model-specific
-    fields declared by the pipeline flow into ``extra_args``.
+    Both online serving and offline examples call this so that model-specific
+    keys (e.g. ``cfg_text_scale`` for BAGEL) end up in ``extra_args`` instead
+    of being silently dropped.
     """
-    if not hasattr(sampling_params, "extra_args"):
-        return
-    extra_args = getattr(sampling_params, "extra_args", None)
-    if extra_args is None:
-        extra_args = {}
-        setattr(sampling_params, "extra_args", extra_args)
-    extra_args.update({key: user_kwargs[key] for key in declared_params if user_kwargs.get(key) is not None})
+    sampling_params.extra_args.update(
+        {key: user_kwargs[key] for key in declared_params if user_kwargs.get(key) is not None}
+    )

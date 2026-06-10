@@ -1,55 +1,92 @@
 # BAGEL-7B-MoT
 
-> BAGEL image generation with vLLM-Omni and OpenAI-compatible serving
+> BAGEL image generation through the shared online and offline image examples
 
 ## Summary
 
 - Vendor: ByteDance Seed
 - Model: `ByteDance-Seed/BAGEL-7B-MoT`
-- Task: Text-to-image, image-to-image, and multimodal generation
+- Task: Text-to-image and image-to-image generation
 - Mode: Offline inference and OpenAI-compatible online serving
 - Maintainer: Community
 
-## When To Use This Recipe
+## When to use this recipe
 
-Use this recipe when you want to run BAGEL through the in-repo BAGEL examples
-or verify that BAGEL-specific online generation parameters are routed through
-`extra_body` into `OmniDiffusionSamplingParams.extra_args`.
+Use this recipe when you want to run BAGEL through the shared image examples
+instead of model-specific example clients. The generic examples can format
+BAGEL text-to-image and image-to-image prompts, select the image output
+modality, attach reference images, and forward BAGEL-specific generation
+parameters through the pipeline-declared `extra_args` contract.
 
 ## References
 
-- Upstream model: [`ByteDance-Seed/BAGEL-7B-MoT`](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT)
-- Offline example: [`examples/offline_inference/bagel/end2end.py`](../../examples/offline_inference/bagel/end2end.py)
-- Online client: [`examples/online_serving/bagel/openai_chat_client.py`](../../examples/online_serving/bagel/openai_chat_client.py)
-- Server scripts:
-  [`examples/online_serving/bagel/run_server.sh`](../../examples/online_serving/bagel/run_server.sh),
-  [`examples/online_serving/bagel/run_server_stage_cli.sh`](../../examples/online_serving/bagel/run_server_stage_cli.sh)
+- Upstream model:
+  [`ByteDance-Seed/BAGEL-7B-MoT`](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT)
+- Related offline example:
+  [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
+- Related offline image-to-image example:
+  [`examples/offline_inference/image_to_image/image_edit.py`](../../examples/offline_inference/image_to_image/image_edit.py)
+- Related online example:
+  [`examples/online_serving/text_to_image/openai_chat_client.py`](../../examples/online_serving/text_to_image/openai_chat_client.py)
+- Related online image-to-image example:
+  [`examples/online_serving/image_to_image/openai_chat_client.py`](../../examples/online_serving/image_to_image/openai_chat_client.py)
 - Default deploy configs:
   [`vllm_omni/deploy/bagel.yaml`](../../vllm_omni/deploy/bagel.yaml),
   [`vllm_omni/deploy/bagel_single_stage.yaml`](../../vllm_omni/deploy/bagel_single_stage.yaml)
 
 ## Hardware Support
 
-The default BAGEL deploy config places both stages on one 80 GB GPU. For more
-headroom, copy the deploy config and move the diffusion stage to another GPU.
+This recipe documents the CUDA layouts used by the in-repo BAGEL deploy
+configs. The default two-stage config shares one 80 GB GPU; for more headroom,
+move the diffusion stage to a second GPU in a custom deploy config.
+
+## GPU
 
 ### 1x A100 80GB
 
-#### Offline Command
+#### Environment
 
-Run the BAGEL offline example from the repository root:
+- OS: Linux
+- Python: Match the repository requirements for your checkout
+- Driver / runtime: NVIDIA CUDA environment with one A100 80 GB GPU
+- vLLM version: Match the repository requirements for your checkout
+- vLLM-Omni version or commit: Use the commit you are deploying from
+
+#### Offline Commands
+
+Run text-to-image with the shared offline example from the repository root:
 
 ```bash
-python examples/offline_inference/bagel/end2end.py \
+python examples/offline_inference/text_to_image/text_to_image.py \
   --model ByteDance-Seed/BAGEL-7B-MoT \
   --prompt "A beautiful sunset over mountains" \
-  --mode text2image \
   --height 512 \
   --width 512 \
+  --num-inference-steps 50 \
+  --cfg-scale 4.0 \
+  --negative-prompt "blurry, low quality" \
+  --seed 42 \
   --output /tmp/bagel_text2img.png
 ```
 
-#### Online Command
+Run image-to-image with the shared offline image-to-image example:
+
+```bash
+python examples/offline_inference/image_to_image/image_edit.py \
+  --model ByteDance-Seed/BAGEL-7B-MoT \
+  --prompt "Make the scene look like a watercolor painting" \
+  --image /tmp/bagel_text2img.png \
+  --height 512 \
+  --width 512 \
+  --extra-args '{"cfg_text_scale": 4.0, "cfg_img_scale": 1.5}' \
+  --output /tmp/bagel_img2img.png
+```
+
+The `--extra-args` JSON forwards BAGEL-specific parameters (e.g. `cfg_text_scale`,
+`cfg_img_scale`, `cfg_interval`, `cfg_renorm_type`) into
+`OmniDiffusionSamplingParams.extra_args` via the model-extras registry.
+
+#### Online Commands
 
 Start the OpenAI-compatible server:
 

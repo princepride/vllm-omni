@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from PIL import Image
+
 
 def build_text_to_image_prompt(
     prompt: str,
@@ -24,6 +26,28 @@ def build_text_to_image_prompt(
     if negative_prompt is not None:
         text_prompt["negative_prompt"] = negative_prompt
     return text_prompt
+
+
+def build_image_to_image_prompt(
+    prompt: str,
+    negative_prompt: str | None,
+    input_image: Image.Image | list[Image.Image],
+    height: int | None = None,
+    width: int | None = None,
+) -> dict[str, Any]:
+    img_prompt: dict[str, Any] = {
+        "prompt": f"<|fim_middle|><|im_start|>{prompt}<|im_end|>",
+        "modalities": ["img2img"],
+        "multi_modal_data": {"img2img": input_image},
+        "mm_processor_kwargs": {"modalities": ["img2img"]},
+    }
+    if height is not None:
+        img_prompt["mm_processor_kwargs"]["target_h"] = height
+    if width is not None:
+        img_prompt["mm_processor_kwargs"]["target_w"] = width
+    if negative_prompt is not None:
+        img_prompt["negative_prompt"] = negative_prompt
+    return img_prompt
 
 
 BAGEL_EXTRA_BODY_PARAMS = frozenset(
