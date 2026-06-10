@@ -10,7 +10,6 @@ Usage:
 
 import argparse
 import base64
-import json
 from io import BytesIO
 from pathlib import Path
 
@@ -29,16 +28,6 @@ def _encode_image_as_data_url(input_path: Path) -> str:
     return f"data:{mime_type};base64,{image_b64}"
 
 
-def parse_extra_body(value: str) -> dict[str, object]:
-    try:
-        extra_body = json.loads(value)
-    except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"--extra-body must be valid JSON: {e}") from e
-    if not isinstance(extra_body, dict):
-        raise argparse.ArgumentTypeError("--extra-body must be a JSON object")
-    return extra_body
-
-
 def edit_image(
     input_image: str | Path | list[str | Path],
     prompt: str,
@@ -49,7 +38,6 @@ def edit_image(
     guidance_scale: float | None = None,
     seed: int | None = None,
     negative_prompt: str | None = None,
-    extra_body: dict[str, object] | None = None,
 ) -> bytes | None:
     """Edit an image using the chat completions API.
 
@@ -63,7 +51,6 @@ def edit_image(
         guidance_scale: CFG guidance scale
         seed: Random seed
         negative_prompt: Negative prompt
-        extra_body: Additional model-specific request parameters
 
     Returns:
         Edited image bytes or None if failed
@@ -88,24 +75,24 @@ def edit_image(
     ]
 
     # Build extra_body with generation parameters
-    request_extra_body = dict(extra_body or {})
+    extra_body = {}
     if height is not None:
-        request_extra_body["height"] = height
+        extra_body["height"] = height
     if width is not None:
-        request_extra_body["width"] = width
+        extra_body["width"] = width
     if steps is not None:
-        request_extra_body["num_inference_steps"] = steps
+        extra_body["num_inference_steps"] = steps
     if guidance_scale is not None:
-        request_extra_body["guidance_scale"] = guidance_scale
+        extra_body["guidance_scale"] = guidance_scale
     if seed is not None:
-        request_extra_body["seed"] = seed
+        extra_body["seed"] = seed
     if negative_prompt:
-        request_extra_body["negative_prompt"] = negative_prompt
+        extra_body["negative_prompt"] = negative_prompt
 
     # Build request payload
-    payload: dict[str, object] = {"messages": messages, "modalities": ["image"]}
-    if request_extra_body:
-        payload["extra_body"] = request_extra_body
+    payload = {"messages": messages}
+    if extra_body:
+        payload["extra_body"] = extra_body
 
     # Send request
     try:
@@ -144,12 +131,6 @@ def main():
     parser.add_argument("--width", type=int, default=1024, help="Output image width")
     parser.add_argument("--steps", type=int, default=50, help="Inference steps")
     parser.add_argument("--guidance", type=float, default=7.5, help="Guidance scale")
-    parser.add_argument(
-        "--extra-body",
-        type=parse_extra_body,
-        default=None,
-        help='JSON object merged into request extra_body, e.g. \'{"cfg_text_scale": 4.0}\'.',
-    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
 
@@ -171,7 +152,6 @@ def main():
         guidance_scale=args.guidance,
         seed=args.seed,
         negative_prompt=args.negative,
-        extra_body=args.extra_body,
     )
 
     if image_bytes:

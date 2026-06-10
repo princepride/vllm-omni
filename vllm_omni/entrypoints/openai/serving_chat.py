@@ -28,12 +28,12 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
-from vllm_omni.model_extras import get_extra_body_params, get_extra_output_params
 from vllm_omni.metrics import definitions as _metric_defs
 from vllm_omni.metrics.modality import (
     observe_audio_first_packet,
     observe_audio_streaming_finalize,
 )
+from vllm_omni.model_extras import get_extra_body_params, get_extra_output_params
 
 try:
     import soundfile

@@ -21,12 +21,6 @@ vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
 vllm serve Qwen/Qwen-Image-Edit-2509 --omni --port 8092
 ```
 
-### BAGEL Image-To-Image
-
-```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091
-```
-
 ### Start with Parameters
 
 
@@ -123,14 +117,6 @@ python openai_chat_client.py --input input.png --prompt "Convert to oil painting
 
 # Multi-image editing (Qwen-Image-Edit-2509 server required)
 python openai_chat_client.py --input input1.png input2.png --prompt "Combine these images into a single scene" --output output.png
-
-# BAGEL image-to-image
-python openai_chat_client.py \
-  --server http://localhost:8091 \
-  --input input.png \
-  --prompt "Make the scene look like a watercolor painting" \
-  --extra-body '{"cfg_text_scale": 4.0, "cfg_img_scale": 1.5}' \
-  --output bagel_img2img.png
 ```
 
 ### Method 4: Using Gradio Demo

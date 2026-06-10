@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-
-
 SENSENOVA_U1_EXTRA_BODY_PARAMS = frozenset(
     {
         "think",

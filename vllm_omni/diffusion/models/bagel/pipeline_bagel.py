@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
 from math import isqrt
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import numpy as np
 import torch

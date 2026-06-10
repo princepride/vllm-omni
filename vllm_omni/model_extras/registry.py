@@ -10,6 +10,8 @@ from vllm_omni.model_extras.bagel import (
     BAGEL_EXTRA_BODY_PARAMS,
     BAGEL_EXTRA_OUTPUT_PARAMS,
     BAGEL_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.bagel import (
     build_text_to_image_prompt as build_bagel_text_to_image_prompt,
 )
 from vllm_omni.model_extras.sensenova_u1 import (
