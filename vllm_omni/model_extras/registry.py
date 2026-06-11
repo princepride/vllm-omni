@@ -24,6 +24,8 @@ from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
 )
 
+# TODO: extend with TextToVideoPromptBuilder, ImageToVideoPromptBuilder
+# once a video model needs model-specific prompt construction (follow-up PR).
 TextToImagePromptBuilder = Callable[
     [str, str | None, int | None, int | None],
     dict[str, Any],
