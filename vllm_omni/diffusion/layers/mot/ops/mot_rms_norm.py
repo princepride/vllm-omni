@@ -171,7 +171,7 @@ def mot_rms_norm(
     assert input.shape[-1] == text_weight.shape[-1], (
         f"Input last dimension ({input.shape[-1]}) must match Text weight dimension ({text_weight.shape[-1]})"
     )
-    assert input.shape[-1] == vae_weight.shape[0], (
+    assert input.shape[-1] == vae_weight.shape[-1], (
         f"Input last dimension ({input.shape[-1]}) must match VAE weight dimension ({vae_weight.shape[-1]})"
     )
 

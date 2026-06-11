@@ -76,7 +76,11 @@ class MoTQKVParallelLinear(QKVParallelLinear):
         )
 
         # ---- 2) Create vae weights (permanent submodule) ----
-        assert self.quant_method is not None
+        if self.quant_method is None:
+            raise ValueError(
+                f"quant_method must not be None for MoTQKVParallelLinear (prefix={prefix!r}). "
+                "Ensure a valid QuantizationConfig is provided or the default UnquantizedLinearMethod is set."
+            )
 
         # NOTE: We instantiate a bare torch.nn.Module() here as a lightweight namespace
         # container to hold the secondary VAE weights.
@@ -318,7 +322,11 @@ class MoTQKVParallelLinear(QKVParallelLinear):
 
         For unsupported quantization types, call standard forward for text/vae tokens.
         """
-        assert self.quant_method is not None
+        if self.quant_method is None:
+            raise ValueError(
+                "quant_method must not be None in MoTQKVParallelLinear._mot_fallback. "
+                "This indicates an initialization error."
+            )
 
         bias_text = self.bias if not self.skip_bias_add else None
         bias_vae = self.gen_exp.bias if not self.skip_bias_add else None

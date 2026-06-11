@@ -69,7 +69,11 @@ class MoTRowParallelLinear(RowParallelLinear):
         )
 
         # ---- Step 2: Create vae weights (permanent submodule) ----
-        assert self.quant_method is not None
+        if self.quant_method is None:
+            raise ValueError(
+                f"quant_method must not be None for MoTRowParallelLinear (prefix={prefix!r}). "
+                "Ensure a valid QuantizationConfig is provided or the default UnquantizedLinearMethod is set."
+            )
 
         # NOTE: We instantiate a bare torch.nn.Module() here as a lightweight namespace
         # container to hold the secondary VAE weights.
@@ -330,7 +334,11 @@ class MoTRowParallelLinear(RowParallelLinear):
 
         For unsupported quantization types, call standard forward separately for text/vae tokens.
         """
-        assert self.quant_method is not None
+        if self.quant_method is None:
+            raise ValueError(
+                "quant_method must not be None in MoTRowParallelLinear._mot_fallback. "
+                "This indicates an initialization error."
+            )
 
         # RowParallelLinear: bias only fused at rank 0
         bias_text = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias

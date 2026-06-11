@@ -21,7 +21,6 @@ from transformers.models.qwen2.modeling_qwen2 import (
 from transformers.utils import ModelOutput
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -32,6 +31,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.logger import init_logger
 from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
@@ -50,6 +50,8 @@ from vllm_omni.diffusion.layers.mot.mot_qkv_parallel_linear import MoTQKVParalle
 from vllm_omni.diffusion.layers.mot.mot_row_parallel_linear import MoTRowParallelLinear
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
+
+logger = init_logger(__name__)
 
 
 def patchify(imgs, p):
@@ -628,8 +630,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp_moe_gen",
         )
 
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = MoTRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -674,15 +675,11 @@ class Qwen2MoTDecoderLayer(nn.Module):
             packed_query_sequence = self.post_attention_layernorm(packed_query_sequence)
             packed_query_sequence = self.mlp(packed_query_sequence)
         elif mode == "gen":
-            packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-            packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
-            packed_text_query_sequence = self.post_attention_layernorm(packed_text_query_sequence).to(torch.bfloat16)
-            packed_vae_query_sequence = self.post_attention_layernorm_moe_gen(packed_vae_query_sequence).to(
-                torch.bfloat16
-            )
-            packed_normed = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
-            packed_normed[packed_text_indexes] = packed_text_query_sequence
-            packed_normed[packed_vae_token_indexes] = packed_vae_query_sequence
+            packed_normed = self.post_attention_layernorm(
+                packed_query_sequence, text_indices, vae_indices
+            ).to(torch.bfloat16)
+            packed_text_query_sequence = packed_normed[packed_text_indexes]
+            packed_vae_query_sequence = packed_normed[packed_vae_token_indexes]
             packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
             packed_query_sequence_[packed_text_indexes] = self.mlp(packed_text_query_sequence)
             packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
@@ -905,6 +902,7 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
             (".o_proj_moe_gen.", ".o_proj.gen_exp."),
             # Norm _moe_gen.weight → {norm_name}.gen_weight
             (".input_layernorm_moe_gen.", ".input_layernorm.gen_"),
+            (".post_attention_layernorm_moe_gen.", ".post_attention_layernorm.gen_"),
             (".q_norm_moe_gen.", ".q_norm.gen_"),
             (".k_norm_moe_gen.", ".k_norm.gen_"),
             (".norm_moe_gen.", ".norm.gen_"),
@@ -915,13 +913,17 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
 
         def handle_weight(name, loaded_weight, shard_id=None):
             param = params_dict.get(name)
-            if param is not None:
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                if shard_id is not None:
-                    weight_loader(param, loaded_weight, shard_id)
-                else:
-                    weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+            if param is None:
+                logger.warning_once(
+                    "Skipping weight %r: no matching parameter found in model.", name
+                )
+                return
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if shard_id is not None:
+                weight_loader(param, loaded_weight, shard_id)
+            else:
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
 
         for name, loaded_weight in weights:
             # match direct remap
