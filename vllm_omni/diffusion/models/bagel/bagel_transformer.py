@@ -20,6 +20,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 from transformers.utils import ModelOutput
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -31,7 +32,6 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.logger import init_logger
 from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
@@ -675,9 +675,9 @@ class Qwen2MoTDecoderLayer(nn.Module):
             packed_query_sequence = self.post_attention_layernorm(packed_query_sequence)
             packed_query_sequence = self.mlp(packed_query_sequence)
         elif mode == "gen":
-            packed_normed = self.post_attention_layernorm(
-                packed_query_sequence, text_indices, vae_indices
-            ).to(torch.bfloat16)
+            packed_normed = self.post_attention_layernorm(packed_query_sequence, text_indices, vae_indices).to(
+                torch.bfloat16
+            )
             packed_text_query_sequence = packed_normed[packed_text_indexes]
             packed_vae_query_sequence = packed_normed[packed_vae_token_indexes]
             packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
@@ -914,9 +914,7 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
         def handle_weight(name, loaded_weight, shard_id=None):
             param = params_dict.get(name)
             if param is None:
-                logger.warning_once(
-                    "Skipping weight %r: no matching parameter found in model.", name
-                )
+                logger.warning_once("Skipping weight %r: no matching parameter found in model.", name)
                 return
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             if shard_id is not None:
