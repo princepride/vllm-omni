@@ -157,23 +157,26 @@ def _run_timing(
 
 
 @pytest.mark.parametrize(
-    "M, hidden_size, text_ratio",
+    "M, hidden_size, text_ratio, dtype",
     [
-        (2048, 3584, 0.01),
-        (8192, 3584, 0.01),
-        (2048, 128, 0.01),
-        (8192, 128, 0.01),
+        (2048, 3584, 0.01, torch.bfloat16),
+        (8192, 3584, 0.01, torch.bfloat16),
+        (2048, 128, 0.01, torch.bfloat16),
+        (8192, 128, 0.01, torch.bfloat16),
+        (2048, 3584, 0.01, torch.float16),
+        (8192, 3584, 0.01, torch.float16),
     ],
     ids=[
-        "M2048_H3584_layernorm",
-        "M8192_H3584_layernorm",
-        "M2048_H128_qknorm",
-        "M8192_H128_qknorm",
+        "M2048_H3584_layernorm_bf16",
+        "M8192_H3584_layernorm_bf16",
+        "M2048_H128_qknorm_bf16",
+        "M8192_H128_qknorm_bf16",
+        "M2048_H3584_layernorm_fp16",
+        "M8192_H3584_layernorm_fp16",
     ],
 )
-def test_mot_rms_norm(M: int, hidden_size: int, text_ratio: float):
+def test_mot_rms_norm(M: int, hidden_size: int, text_ratio: float, dtype: torch.dtype):
     torch.manual_seed(42)
-    dtype = torch.bfloat16
 
     # --- Build MoT layer ---
     mot_norm = MoTRMSNorm(hidden_size, eps=_EPS).cuda()
@@ -276,3 +279,79 @@ def test_mot_rms_norm_head_norm(
             mot_out = mot_norm(x, text_idx, vae_idx)
 
         _check_and_report(ref, mot_out, tag)
+
+
+# =========================================================================
+#  Test: und-mode (text_indices=None) — degrades to standard RMSNorm
+# =========================================================================
+
+
+@pytest.mark.parametrize(
+    "M, hidden_size, dtype",
+    [
+        (2048, 3584, torch.bfloat16),
+        (2048, 3584, torch.float16),
+        (2048, 128, torch.bfloat16),
+    ],
+    ids=["M2048_H3584_bf16", "M2048_H3584_fp16", "M2048_H128_bf16"],
+)
+def test_mot_rms_norm_und_mode(M: int, hidden_size: int, dtype: torch.dtype):
+    """und-mode: text_indices=None should apply self.weight to all tokens (standard RMSNorm)."""
+    torch.manual_seed(42)
+
+    mot_norm = MoTRMSNorm(hidden_size, eps=_EPS).cuda()
+    with torch.no_grad():
+        W_text = torch.randn(hidden_size, dtype=dtype, device="cuda")
+        mot_norm.weight.data.copy_(W_text)
+
+    x = torch.randn(M, hidden_size, dtype=dtype, device="cuda")
+
+    with set_current_vllm_config(VllmConfig()):
+        with torch.no_grad():
+            ref = ir.ops.rms_norm(x, W_text, _EPS)
+            mot_out = mot_norm(x, text_indices=None, vae_indices=None)
+
+    _check_and_report(ref, mot_out, f"RMSNorm und-mode M={M} H={hidden_size}")
+
+
+# =========================================================================
+#  Test: boundary cases (all-text, all-VAE)
+# =========================================================================
+
+
+@pytest.mark.parametrize(
+    "boundary_mode",
+    ["all_text", "all_vae"],
+    ids=["all_text", "all_vae"],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_mot_rms_norm_boundary(boundary_mode: str, dtype: torch.dtype):
+    """Boundary: all tokens routed to one expert."""
+    torch.manual_seed(42)
+    M = 1024
+    hidden_size = 3584
+
+    mot_norm = MoTRMSNorm(hidden_size, eps=_EPS).cuda()
+    with torch.no_grad():
+        W_text = torch.randn(hidden_size, dtype=dtype, device="cuda")
+        W_vae = torch.randn(hidden_size, dtype=dtype, device="cuda")
+        mot_norm.weight.data.copy_(W_text)
+        mot_norm.gen_weight.data.copy_(W_vae)
+
+    x = torch.randn(M, hidden_size, dtype=dtype, device="cuda")
+    all_indices = torch.arange(M, dtype=torch.long, device="cuda")
+    empty_indices = torch.empty(0, dtype=torch.long, device="cuda")
+
+    if boundary_mode == "all_text":
+        text_idx, vae_idx = all_indices, empty_indices
+        expected_weight = W_text
+    else:
+        text_idx, vae_idx = empty_indices, all_indices
+        expected_weight = W_vae
+
+    with set_current_vllm_config(VllmConfig()):
+        with torch.no_grad():
+            ref = ir.ops.rms_norm(x, expected_weight, _EPS)
+            mot_out = mot_norm(x, text_idx, vae_idx)
+
+    _check_and_report(ref, mot_out, f"RMSNorm boundary={boundary_mode} M={M}")

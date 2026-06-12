@@ -298,8 +298,10 @@ def _run_timing(
 @pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.parametrize(
     "image_num, K, N, dtype",
-    [(num, 3584, 4608, "w16a16_bf16") for num in _IMAGE_NUM],
-    ids=[f"img{num}_K3584_N4608" for num in _IMAGE_NUM],
+    [(num, 3584, 4608, "w16a16_bf16") for num in _IMAGE_NUM]
+    + [(num, 3584, 4608, "w16a16_fp16") for num in _IMAGE_NUM],
+    ids=[f"img{num}_K3584_N4608_bf16" for num in _IMAGE_NUM]
+    + [f"img{num}_K3584_N4608_fp16" for num in _IMAGE_NUM],
 )
 def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str, bias: bool):
     dcfg = _parse_dtype(dtype)
@@ -383,8 +385,10 @@ def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str, bias: bool
 @pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.parametrize(
     "image_num, K, N, dtype",
-    [(num, 3584, 3584, "w16a16_bf16") for num in _IMAGE_NUM],
-    ids=[f"img{num}_K3584_N3584" for num in _IMAGE_NUM],
+    [(num, 3584, 3584, "w16a16_bf16") for num in _IMAGE_NUM]
+    + [(num, 3584, 3584, "w16a16_fp16") for num in _IMAGE_NUM],
+    ids=[f"img{num}_K3584_N3584_bf16" for num in _IMAGE_NUM]
+    + [f"img{num}_K3584_N3584_fp16" for num in _IMAGE_NUM],
 )
 def test_mot_o_proj(
     image_num: int,
@@ -457,3 +461,233 @@ def test_mot_o_proj(
                 lambda: mot_linear(x, text_idx, vae_idx),
                 tag,
             )
+
+
+# =========================================================================
+#  Test: und-mode (text_indices=None) — falls back to standard forward
+# =========================================================================
+
+
+@pytest.mark.parametrize("bias", [True, False])
+@pytest.mark.parametrize(
+    "K, N, dtype",
+    [
+        (3584, 4608, "w16a16_bf16"),
+        (3584, 4608, "w16a16_fp16"),
+    ],
+    ids=["QKV_K3584_N4608_bf16", "QKV_K3584_N4608_fp16"],
+)
+def test_mot_qkv_und_mode(K: int, N: int, dtype: str, bias: bool):
+    """und-mode: text_indices=None should produce same output as standard QKVParallelLinear."""
+    dcfg = _parse_dtype(dtype)
+    torch.manual_seed(42)
+    M = 1026
+
+    with set_current_vllm_config(VllmConfig()):
+        ref_linear = QKVParallelLinear(
+            hidden_size=K,
+            head_size=_BAGEL_HEAD_SIZE,
+            total_num_heads=_BAGEL_TOTAL_NUM_HEADS,
+            total_num_kv_heads=_BAGEL_TOTAL_NUM_KV_HEADS,
+            bias=bias,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+        mot_linear = MoTQKVParallelLinear(
+            hidden_size=K,
+            head_size=_BAGEL_HEAD_SIZE,
+            total_num_heads=_BAGEL_TOTAL_NUM_HEADS,
+            total_num_kv_heads=_BAGEL_TOTAL_NUM_KV_HEADS,
+            bias=bias,
+            vae_bias=bias,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+
+        with torch.no_grad():
+            mot_linear.weight.copy_(ref_linear.weight)
+            if bias and ref_linear.bias is not None:
+                mot_linear.bias.copy_(ref_linear.bias)
+
+        x = torch.randn(M, K, dtype=dcfg.torch_dtype, device="cuda")
+
+        with torch.no_grad():
+            ref_out, _ = ref_linear(x)
+            mot_out, _ = mot_linear(x, text_indices=None, vae_indices=None)
+
+        _check_and_report(ref_out, mot_out, f"QKV und-mode M={M} K={K}")
+
+
+@pytest.mark.parametrize("bias", [True, False])
+@pytest.mark.parametrize(
+    "K, N, dtype",
+    [
+        (3584, 3584, "w16a16_bf16"),
+        (3584, 3584, "w16a16_fp16"),
+    ],
+    ids=["Row_K3584_N3584_bf16", "Row_K3584_N3584_fp16"],
+)
+def test_mot_row_und_mode(K: int, N: int, dtype: str, bias: bool):
+    """und-mode: text_indices=None should produce same output as standard RowParallelLinear."""
+    dcfg = _parse_dtype(dtype)
+    torch.manual_seed(42)
+    M = 1026
+
+    with set_current_vllm_config(VllmConfig()):
+        ref_linear = RowParallelLinear(
+            K,
+            N,
+            bias=bias,
+            input_is_parallel=True,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+        mot_linear = MoTRowParallelLinear(
+            K,
+            N,
+            bias=bias,
+            vae_bias=bias,
+            input_is_parallel=True,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+
+        with torch.no_grad():
+            mot_linear.weight.copy_(ref_linear.weight)
+            if bias and ref_linear.bias is not None:
+                mot_linear.bias.copy_(ref_linear.bias)
+
+        x = torch.randn(M, K, dtype=dcfg.torch_dtype, device="cuda")
+
+        with torch.no_grad():
+            ref_out, _ = ref_linear(x)
+            mot_out, _ = mot_linear(x, text_indices=None, vae_indices=None)
+
+        _check_and_report(ref_out, mot_out, f"Row und-mode M={M} K={K}")
+
+
+# =========================================================================
+#  Test: boundary cases (all-text, all-VAE)
+# =========================================================================
+
+
+@pytest.mark.parametrize(
+    "boundary_mode",
+    ["all_text", "all_vae"],
+    ids=["all_text", "all_vae"],
+)
+@pytest.mark.parametrize("dtype", ["w16a16_bf16", "w16a16_fp16"])
+def test_mot_qkv_boundary(boundary_mode: str, dtype: str):
+    """Boundary: all tokens routed to one expert."""
+    dcfg = _parse_dtype(dtype)
+    torch.manual_seed(42)
+    M = 512
+    K = 3584
+
+    with set_current_vllm_config(VllmConfig()):
+        text_linear = QKVParallelLinear(
+            hidden_size=K,
+            head_size=_BAGEL_HEAD_SIZE,
+            total_num_heads=_BAGEL_TOTAL_NUM_HEADS,
+            total_num_kv_heads=_BAGEL_TOTAL_NUM_KV_HEADS,
+            bias=False,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+        vae_linear = QKVParallelLinear(
+            hidden_size=K,
+            head_size=_BAGEL_HEAD_SIZE,
+            total_num_heads=_BAGEL_TOTAL_NUM_HEADS,
+            total_num_kv_heads=_BAGEL_TOTAL_NUM_KV_HEADS,
+            bias=False,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+        mot_linear = MoTQKVParallelLinear(
+            hidden_size=K,
+            head_size=_BAGEL_HEAD_SIZE,
+            total_num_heads=_BAGEL_TOTAL_NUM_HEADS,
+            total_num_kv_heads=_BAGEL_TOTAL_NUM_KV_HEADS,
+            bias=False,
+            vae_bias=False,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+
+        _sync_weights(text_linear, vae_linear, mot_linear)
+
+        all_indices = torch.arange(M, dtype=torch.long, device="cuda")
+        empty_indices = torch.empty(0, dtype=torch.long, device="cuda")
+
+        if boundary_mode == "all_text":
+            text_idx, vae_idx = all_indices, empty_indices
+        else:
+            text_idx, vae_idx = empty_indices, all_indices
+
+        x = torch.randn(M, K, dtype=dcfg.torch_dtype, device="cuda")
+
+        with torch.no_grad():
+            ref = _reference_forward(x, text_idx, vae_idx, text_linear, vae_linear)
+            mot_out, _ = mot_linear(x, text_idx, vae_idx)
+
+        _check_and_report(ref, mot_out, f"QKV boundary={boundary_mode} M={M}")
+
+
+@pytest.mark.parametrize(
+    "boundary_mode",
+    ["all_text", "all_vae"],
+    ids=["all_text", "all_vae"],
+)
+@pytest.mark.parametrize("dtype", ["w16a16_bf16", "w16a16_fp16"])
+def test_mot_row_boundary(boundary_mode: str, dtype: str):
+    """Boundary: all tokens routed to one expert for RowParallel."""
+    dcfg = _parse_dtype(dtype)
+    torch.manual_seed(42)
+    M = 512
+    K = 3584
+    N = 3584
+
+    with set_current_vllm_config(VllmConfig()):
+        text_linear = RowParallelLinear(
+            K,
+            N,
+            bias=False,
+            input_is_parallel=True,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+        vae_linear = RowParallelLinear(
+            K,
+            N,
+            bias=False,
+            input_is_parallel=True,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+        mot_linear = MoTRowParallelLinear(
+            K,
+            N,
+            bias=False,
+            vae_bias=False,
+            input_is_parallel=True,
+            params_dtype=dcfg.torch_dtype,
+            disable_tp=True,
+        ).cuda()
+
+        _sync_weights(text_linear, vae_linear, mot_linear)
+
+        all_indices = torch.arange(M, dtype=torch.long, device="cuda")
+        empty_indices = torch.empty(0, dtype=torch.long, device="cuda")
+
+        if boundary_mode == "all_text":
+            text_idx, vae_idx = all_indices, empty_indices
+        else:
+            text_idx, vae_idx = empty_indices, all_indices
+
+        x = torch.randn(M, K, dtype=dcfg.torch_dtype, device="cuda")
+
+        with torch.no_grad():
+            ref = _reference_forward(x, text_idx, vae_idx, text_linear, vae_linear)
+            mot_out, _ = mot_linear(x, text_idx, vae_idx)
+
+        _check_and_report(ref, mot_out, f"Row boundary={boundary_mode} M={M}")
