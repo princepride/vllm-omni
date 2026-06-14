@@ -893,6 +893,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             (".mlp_moe_gen.gate_up_proj", ".mlp_moe_gen.up_proj"),
             # MoTRMSNorm gen_weight ← checkpoint _moe_gen.weight
             (".input_layernorm.gen_", ".input_layernorm_moe_gen."),
+            (".post_attention_layernorm.gen_", ".post_attention_layernorm_moe_gen."),
             (".q_norm.gen_", ".q_norm_moe_gen."),
             (".k_norm.gen_", ".k_norm_moe_gen."),
             (".norm.gen_", ".norm_moe_gen."),
