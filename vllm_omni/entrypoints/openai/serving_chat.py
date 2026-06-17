@@ -23,7 +23,6 @@ from vllm.entrypoints.chat_utils import (
     make_tool_call_id,
 )
 
-from vllm_omni.diffusion.io_support import get_extra_body_params, get_extra_output_params
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
@@ -34,6 +33,7 @@ from vllm_omni.metrics.modality import (
     observe_audio_first_packet,
     observe_audio_streaming_finalize,
 )
+from vllm_omni.model_extras import get_extra_body_params, get_extra_output_params
 
 try:
     import soundfile
