@@ -20,9 +20,7 @@ NUM_TOKENS = 8
 HIDDEN_DIM = 16
 NUM_TIMESTEPS = 5
 # Official BAGEL samples num_timesteps points then drops the terminal t=0,
-# yielding num_timesteps - 1 denoise steps. See Bagel.generate_image and
-# https://github.com/vllm-project/vllm-omni/issues/4470. (Lance opts into the
-# num_timesteps + 1 convention via LanceBagel._denoise_schedule_extra_step.)
+# yielding num_timesteps - 1 denoise steps.
 EXPECTED_STEPS = NUM_TIMESTEPS - 1
 
 
