@@ -16,7 +16,12 @@ def apply_declared_extra_args(
     Both online serving and offline examples call this so that model-specific
     keys (e.g. ``cfg_text_scale`` for BAGEL) end up in ``extra_args`` instead
     of being silently dropped.
+
+    This is a no-op when no declared params are present in ``user_kwargs``, so
+    it is safe to call on non-diffusion (e.g. AR) sampling params whose
+    ``extra_args`` defaults to ``None``.
     """
-    sampling_params.extra_args.update(
-        {key: user_kwargs[key] for key in declared_params if user_kwargs.get(key) is not None}
-    )
+    declared = {key: user_kwargs[key] for key in declared_params if user_kwargs.get(key) is not None}
+    if not declared:
+        return
+    sampling_params.extra_args = {**(sampling_params.extra_args or {}), **declared}
