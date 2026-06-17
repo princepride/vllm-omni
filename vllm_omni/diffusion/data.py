@@ -456,7 +456,12 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
 
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
-    if model_type == "lance" or "LancePipeline" in architectures or cfg.get("model_name") == "Lance" or is_lance_subfolder:
+    if (
+        model_type == "lance"
+        or "LancePipeline" in architectures
+        or cfg.get("model_name") == "Lance"
+        or is_lance_subfolder
+    ):
         return "LancePipeline"
     if model_type == "neo_chat":
         return "SenseNovaU1Pipeline"
