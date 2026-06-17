@@ -1697,13 +1697,9 @@ class Bagel(nn.Module):
             frame_condition_token_indexes = frame_condition_token_indexes.to(x_t.device).long()
             pinned_x_t = x_t[frame_condition_token_indexes].clone()
 
-        # Build the flow-matching schedule. Official BAGEL samples
-        # ``num_timesteps`` points over [1, 0] and drops the terminal t=0 (no
-        # dt), giving ``num_timesteps - 1`` Euler steps. Lance samples one extra
-        # point for ``num_timesteps`` steps. The ``_denoise_schedule_extra_step``
-        # class flag (overridden by ``LanceBagel``) selects the convention so
-        # that BAGEL stays bit-compatible with upstream ByteDance-Seed/BAGEL.
-        # See https://github.com/vllm-project/vllm-omni/issues/4470.
+        # Build the flow-matching schedule. BAGEL drops the terminal t=0 for
+        # ``num_timesteps - 1`` Euler steps; Lance keeps it for ``num_timesteps``.
+        # ``_denoise_schedule_extra_step`` (overridden by ``LanceBagel``) selects which.
         num_sample_points = num_timesteps + 1 if self._denoise_schedule_extra_step else num_timesteps
         timesteps = torch.linspace(1, 0, num_sample_points, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
