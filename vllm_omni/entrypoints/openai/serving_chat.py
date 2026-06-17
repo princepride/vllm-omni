@@ -167,13 +167,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_extra_output_params = None
         instance.engine_client = None
         instance.has_kv_connector = False
-        try:
-            od_config = resolve_diffusion_od_config(None, diffusion_engine)
-            if od_config is not None and getattr(od_config, "model_class_name", None):
-                instance._diffusion_extra_body_params = get_extra_body_params(od_config.model_class_name)
-                instance._diffusion_extra_output_params = get_extra_output_params(od_config.model_class_name)
-        except Exception as e:
-            logger.warning("Failed to initialize diffusion pipeline extra params: %s", e)
+        # Extra body/output params are resolved lazily on first use; see
+        # _get_diffusion_extra_body_params / _get_diffusion_extra_output_params.
         return instance
 
     def _get_diffusion_extra_body_params(self) -> frozenset[str]:
