@@ -268,6 +268,19 @@ def parse_args() -> argparse.Namespace:
         help="[NextStep-1.1 only] Apply layer normalization to sampled tokens.",
     )
     parser.add_argument(
+        "--extra-body",
+        type=parse_profiler_config,
+        default=None,
+        help=(
+            "Model-specific generation params as a JSON object, e.g. "
+            '\'{"timestep_shift": 3.0, "cfg_text_scale": 4.0, "cfg_interval": [0.4, 1.0]}\'. '
+            "Each key is filtered against the model's declared extra_body_params "
+            "(see vllm_omni/model_extras), so unknown keys for the chosen model are "
+            "silently dropped. Values here take precedence over the equivalent "
+            "model-specific flags above."
+        ),
+    )
+    parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
@@ -467,6 +480,7 @@ def main():
     diffusion_params = OmniDiffusionSamplingParams(
         height=args.height,
         width=args.width,
+        seed=args.seed,
         generator=generator,
         true_cfg_scale=args.cfg_scale,
         guidance_scale=args.guidance_scale,
@@ -475,6 +489,9 @@ def main():
         num_outputs_per_prompt=args.num_images_per_prompt,
     )
 
+    # Base layer: backward-compatible model-specific flags. New model params should
+    # instead be declared in vllm_omni/model_extras and passed via --extra-body, so
+    # this dict does not need to grow per-model.
     user_extra = {
         "cfg_scale": args.cfg_scale,
         "cfg_text_scale": args.cfg_scale,
@@ -486,6 +503,10 @@ def main():
         "use_system_prompt": args.use_system_prompt,
         "system_prompt": args.system_prompt,
     }
+    # Override layer: generic JSON passthrough wins over the flags above. Keys are
+    # still filtered against the model's declared extra_body_params downstream.
+    if args.extra_body:
+        user_extra.update(args.extra_body)
     if declared_extra_body_params:
         apply_declared_extra_args(diffusion_params, declared_extra_body_params, user_extra)
     else:

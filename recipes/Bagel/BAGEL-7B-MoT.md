@@ -54,20 +54,52 @@ move the diffusion stage to a second GPU in a custom deploy config.
 
 #### Offline Commands
 
-Run text-to-image with the shared offline example from the repository root:
+Run text-to-image with the shared offline example from the repository root.
+Pick the topology with `--stage-configs-path` and forward BAGEL-specific
+generation parameters as a JSON object through `--extra-body`:
 
 ```bash
+# Two-stage (Thinker + DiT), shares one GPU by default
 python examples/offline_inference/text_to_image/text_to_image.py \
   --model ByteDance-Seed/BAGEL-7B-MoT \
+  --stage-configs-path vllm_omni/deploy/bagel.yaml \
   --prompt "A beautiful sunset over mountains" \
-  --height 512 \
-  --width 512 \
+  --height 1024 \
+  --width 1024 \
   --num-inference-steps 50 \
-  --cfg-scale 4.0 \
   --negative-prompt "blurry, low quality" \
   --seed 42 \
+  --extra-body '{"timestep_shift": 3.0, "cfg_text_scale": 4.0, "cfg_img_scale": 1.5, "cfg_interval": [0.4, 1.0], "cfg_renorm_type": "global", "cfg_renorm_min": 0.0, "think": false}' \
   --output /tmp/bagel_text2img.png
 ```
+
+```bash
+# Single-stage (DiT only, with internal LLM/ViT/VAE)
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model ByteDance-Seed/BAGEL-7B-MoT \
+  --stage-configs-path vllm_omni/deploy/bagel_single_stage.yaml \
+  --prompt "A beautiful sunset over mountains" \
+  --height 1024 \
+  --width 1024 \
+  --num-inference-steps 50 \
+  --seed 42 \
+  --extra-body '{"timestep_shift": 3.0, "cfg_text_scale": 4.0, "cfg_interval": [0.4, 1.0], "cfg_renorm_type": "global", "cfg_renorm_min": 0.0}' \
+  --output /tmp/bagel_text2img_single.png
+```
+
+The `--extra-body` JSON forwards BAGEL-specific parameters into
+`OmniDiffusionSamplingParams.extra_args`. Keys are filtered against the model's
+declared `extra_body_params` (see
+[`vllm_omni/model_extras/bagel.py`](../../vllm_omni/model_extras/bagel.py)), so
+unknown keys for BAGEL are silently dropped. This is the preferred way to pass
+model-specific params — `timestep_shift` (use `3.0` for 1024×1024; the
+deprecated `--timesteps-shift` flag defaults to `1.0` and is NextStep-oriented),
+`cfg_text_scale`, `cfg_img_scale`, `cfg_interval`, `cfg_renorm_type`,
+`cfg_renorm_min`, and `think`. `--seed` makes generation reproducible.
+
+> **Note**: the two-stage `bagel.yaml` runs both stages on GPU 0. If you hit
+> CUDA OOM during warmup, lower stage-0 `gpu_memory_utilization` in the YAML or
+> split the stages across two GPUs (see the `2x CUDA GPUs` section).
 
 Run image-to-image with the shared offline image-to-image example:
 
