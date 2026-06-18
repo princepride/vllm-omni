@@ -17,6 +17,7 @@ from vllm_omni.model_extras import (
 )
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_bagel_extra_registry_declares_request_and_response_params() -> None:
     assert get_extra_body_params("BagelPipeline") == frozenset(
@@ -38,6 +39,7 @@ def test_bagel_extra_registry_declares_request_and_response_params() -> None:
     assert should_init_extra_args_for_non_diffusion_stages("BagelPipeline") is True
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_sensenova_extra_registry_declares_request_and_response_params() -> None:
     assert get_extra_body_params("SenseNovaU1Pipeline") == frozenset(
@@ -55,6 +57,7 @@ def test_sensenova_extra_registry_declares_request_and_response_params() -> None
     assert should_init_extra_args_for_non_diffusion_stages("SenseNovaU1Pipeline") is False
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_unknown_pipeline_has_empty_extra_registry() -> None:
     assert get_extra_body_params("UnknownPipeline") == frozenset()
@@ -62,6 +65,7 @@ def test_unknown_pipeline_has_empty_extra_registry() -> None:
     assert should_init_extra_args_for_non_diffusion_stages("UnknownPipeline") is False
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_bagel_text_to_image_prompt_builder() -> None:
     assert build_text_to_image_prompt(
@@ -82,6 +86,7 @@ def test_bagel_text_to_image_prompt_builder() -> None:
     }
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_bagel_image_to_image_prompt_builder() -> None:
     dummy_image = Image.new("RGB", (64, 64))
@@ -101,6 +106,7 @@ def test_bagel_image_to_image_prompt_builder() -> None:
     assert result["negative_prompt"] == "ugly"
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_unknown_pipeline_uses_default_text_to_image_prompt() -> None:
     assert build_text_to_image_prompt(
@@ -112,6 +118,7 @@ def test_unknown_pipeline_uses_default_text_to_image_prompt() -> None:
     ) == {"prompt": "a cat"}
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_unknown_pipeline_uses_default_image_to_image_prompt() -> None:
     dummy_image = Image.new("RGB", (64, 64))
@@ -127,6 +134,7 @@ def test_unknown_pipeline_uses_default_image_to_image_prompt() -> None:
     }
 
 
+@pytest.mark.core_model
 @pytest.mark.cpu
 def test_declared_extra_args_apply_to_existing_sampling_params() -> None:
     params = OmniDiffusionSamplingParams(extra_args={"existing": 1})
