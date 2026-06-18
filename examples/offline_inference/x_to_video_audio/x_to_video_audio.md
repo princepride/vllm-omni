@@ -87,6 +87,40 @@ python x_to_video_audio.py \
 ```
 
 
+## MagiHuman (`--model-type magi-human`)
+
+MagiHuman is a text → video+audio model with a DiT MoE backbone and a ~9B-param
+T5Gemma text encoder. It takes **no image/audio conditioning inputs** — only a
+detailed text prompt describing the visual look, dialogue, and background sound —
+and natively supports Tensor Parallelism. For an 80GB node, `--tensor-parallel-size 4`
+is recommended to shard the MoE weights and the text encoder.
+
+> Install [MagiCompiler](https://github.com/SandAI-org/MagiCompiler) for correct
+> attention-kernel behaviour (the pipeline otherwise falls back to stubs).
+
+```bash
+python x_to_video_audio.py \
+  --model-type magi-human \
+  --model /path/to/daVinci-MagiHuman \
+  --prompt "A young woman with long, wavy golden blonde hair... <dialogue and background sound>" \
+  --tensor-parallel-size 4 \
+  --height 256 --width 448 \
+  --num-inference-steps 8 \
+  --seconds 5 \
+  --sr-height 1080 --sr-width 1920 --sr-num-inference-steps 5 \
+  --seed 52 \
+  --output output_magihuman.mp4
+```
+
+MagiHuman-specific arguments (declared in `vllm_omni/model_extras/magi_human.py`,
+routed via `extra_body` → `extra_args`):
+
+- `--seconds`: output duration in seconds (default 5).
+- `--sr-height` / `--sr-width`: super-resolution output resolution.
+- `--sr-num-inference-steps`: super-resolution denoising steps.
+
+## DreamID-Omni arguments
+
 Key arguments:
 - `--prompt`: text description (string).
 - `--model`: path to the model local directory.
