@@ -33,13 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-path", type=str, nargs="+", help="list of image-path")
     parser.add_argument("--audio-path", type=str, nargs="+", help="list of audio-path")
     parser.add_argument("--prompt-file", type=str, default=None, help="Text prompt in json format.")
-
-    # MagiHuman-specific knobs (text -> video+audio; declared in model_extras/magi_human.py).
-    parser.add_argument("--seconds", type=int, default=5, help="[magi-human] Output duration in seconds.")
-    parser.add_argument("--sr-height", type=int, default=1080, help="[magi-human] Super-resolution height.")
-    parser.add_argument("--sr-width", type=int, default=1920, help="[magi-human] Super-resolution width.")
     parser.add_argument(
-        "--sr-num-inference-steps", type=int, default=5, help="[magi-human] Super-resolution denoising steps."
+        "--extra-body",
+        type=str,
+        default=None,
+        help="[magi-human] JSON dict of model-specific extra params (declared in vllm_omni/model_extras/), "
+        'merged into sampling extra_args. Example: \'{"image_path": "/path/to/img.jpg", "seconds": 5}\'.',
     )
 
     parser.add_argument("--height", type=int, default=704, help="Video height.")
@@ -169,19 +168,18 @@ def main() -> None:
             text_prompt = re.sub(r"\n\s*\n", "\n", text_prompt).strip()
 
     if args.model_type == "magi-human":
-        # MagiHuman: text -> video+audio, no image/audio conditioning inputs.
+        # MagiHuman: text -> video+audio; model-specific params via --extra-body JSON
+        # (declared in vllm_omni/model_extras/magi_human.py).
+        import json
+
         prompt = text_prompt
+        extra_args = json.loads(args.extra_body) if args.extra_body else {}
         sampling_params = OmniDiffusionSamplingParams(
             height=args.height,
             width=args.width,
             num_inference_steps=args.num_inference_steps,
             seed=args.seed,
-            extra_args={
-                "seconds": args.seconds,
-                "sr_height": args.sr_height,
-                "sr_width": args.sr_width,
-                "sr_num_inference_steps": args.sr_num_inference_steps,
-            },
+            extra_args=extra_args,
         )
     else:
         image, audio = load_image_and_audio(args.image_path, args.audio_path)
