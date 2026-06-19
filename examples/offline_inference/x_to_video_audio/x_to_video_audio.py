@@ -168,10 +168,6 @@ def main() -> None:
             text_prompt = re.sub(r"\n\s*\n", "\n", text_prompt).strip()
 
     if args.model_type == "magi-human":
-        # MagiHuman: text -> video+audio; model-specific params via --extra-body JSON
-        # (declared in vllm_omni/model_extras/magi_human.py).
-        import json
-
         prompt = text_prompt
         extra_args = json.loads(args.extra_body) if args.extra_body else {}
         sampling_params = OmniDiffusionSamplingParams(
