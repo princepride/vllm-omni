@@ -106,7 +106,7 @@ def parse_args() -> argparse.Namespace:
         type=parse_extra_body,
         default=None,
         help="JSON dict of model-specific extra_body params (declared in vllm_omni/model_extras/), "
-        'merged into sampling extra_args. Example (Helios-Distilled): '
+        "merged into sampling extra_args. Example (Helios-Distilled): "
         '\'{"is_enable_stage2": true, "pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": true}\'.',
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
