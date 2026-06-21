@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import json
 import re
 import time
 from typing import Any
@@ -154,8 +155,6 @@ def main() -> None:
 
     text_prompt = args.prompt
     if args.prompt_file:
-        import json
-
         with open(args.prompt_file) as f:
             text_prompt = json.load(f)
             text_prompt = re.sub(
