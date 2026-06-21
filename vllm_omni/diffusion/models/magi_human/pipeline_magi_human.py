@@ -1421,7 +1421,6 @@ class _T5GemmaEncoder:
             # Propagate some outer config values
             config_encoder.vocab_size = config.vocab_size
             config_encoder.rms_norm_eps = getattr(config, "rms_norm_eps", config_encoder.rms_norm_eps)
-            config_encoder.rope_theta = getattr(config, "rope_theta", getattr(config_encoder, "rope_theta", 10000.0))
             self.model = T5GemmaEncoderModelTP(config_encoder).to(device).to(weight_dtype)
             self.is_tp = True
         else:
