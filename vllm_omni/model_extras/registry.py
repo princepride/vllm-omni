@@ -19,13 +19,13 @@ from vllm_omni.model_extras.bagel import (
 from vllm_omni.model_extras.bagel import (
     build_text_to_image_prompt as build_bagel_text_to_image_prompt,
 )
-from vllm_omni.model_extras.magi_human import (
-    MAGI_HUMAN_EXTRA_BODY_PARAMS,
-    MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
-)
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
+)
+from vllm_omni.model_extras.magi_human import (
+    MAGI_HUMAN_EXTRA_BODY_PARAMS,
+    MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
 )
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
