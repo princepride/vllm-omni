@@ -1686,6 +1686,10 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery,
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae", "audio_vae"]
 
+    # Frames whose longer side exceeds this are VAE-decoded in tiles;
+    # above base-rate (<=512px), below SR (1080p), so only SR decodes tile.
+    _VAE_TILING_MIN_FRAME: ClassVar[int] = 720
+
     def __init__(self, od_config: OmniDiffusionConfig, **kwargs):
         super().__init__()
         model_path = od_config.model
@@ -2119,6 +2123,13 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery,
         mean = self.vae_latent_mean.to(latent.device, dtype=latent.dtype).view(1, -1, 1, 1, 1)
         std = self.vae_latent_std.to(latent.device, dtype=latent.dtype).view(1, -1, 1, 1, 1)
         latent = latent * std + mean
+
+        # Tile the VAE decode for SR-resolution frames to bound peak memory.
+        _, _, _, latent_h, latent_w = latent.shape
+        frame_h = latent_h * self.vae_stride[1]
+        frame_w = latent_w * self.vae_stride[2]
+        if max(frame_h, frame_w) > self._VAE_TILING_MIN_FRAME and hasattr(self.vae, "enable_tiling"):
+            self.vae.enable_tiling()
 
         videos = self.vae.decode(latent.to(self.dtype))
         if hasattr(videos, "sample"):
