@@ -22,6 +22,7 @@ _OMNI_RUNNER_PARAM = (
     {
         "init_timeout": 1200,
         "tensor_parallel_size": 2,
+        "vae_use_tiling": True,
     },
 )
 
@@ -32,6 +33,7 @@ _OMNI_RUNNER_PARAM_OFFLOAD = (
         "init_timeout": 1200,
         "tensor_parallel_size": 2,
         "enable_cpu_offload": True,
+        "vae_use_tiling": True,
     },
 )
 
