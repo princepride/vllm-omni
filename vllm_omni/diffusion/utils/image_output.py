@@ -6,87 +6,73 @@ from typing import Any
 
 import torch
 from PIL import Image
+from vllm.outputs import RequestOutput
+
+from vllm_omni.outputs import OmniRequestOutput
 
 
 def extract_images_from_outputs(outputs: Any) -> list[Image.Image]:
-    """Extract PIL images from common Omni output wrappers."""
-    images: list[Image.Image] = []
+    """Extract PIL images from known Omni output types.
 
-    for candidate in _iter_output_candidates(outputs):
-        images.extend(_coerce_images(getattr(candidate, "images", None)))
+    Supported inputs:
+    - OmniRequestOutput / list[OmniRequestOutput]
+    - RequestOutput / list[RequestOutput] (compatibility fallback)
+    """
+    for output in _iter_known_outputs(outputs):
+        images = _coerce_images(getattr(output, "images", None))
         if images:
             return images
 
-    for candidate in _iter_output_candidates(outputs):
-        for mm_output in _iter_multimodal_outputs(candidate):
-            image_payload = mm_output.get("image") or mm_output.get("images")
-            images.extend(_coerce_images(image_payload))
+        for payload in _iter_multimodal_image_payloads(output):
+            images = _coerce_images(payload)
             if images:
                 return images
 
-    return images
+    return []
 
 
-def _iter_output_candidates(value: Any, seen: set[int] | None = None) -> Iterable[Any]:
-    seen = seen or set()
+def _iter_known_outputs(value: Any) -> Iterable[OmniRequestOutput | RequestOutput]:
     if value is None:
         return
-
-    value_id = id(value)
-    if value_id in seen:
-        return
-    seen.add(value_id)
-
-    if isinstance(value, Mapping):
+    if isinstance(value, OmniRequestOutput | RequestOutput):
         yield value
-        for key in ("request_output", "outputs", "output", "payload"):
-            if key in value:
-                yield from _iter_output_candidates(value[key], seen)
         return
-
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         for item in value:
-            yield from _iter_output_candidates(item, seen)
+            if isinstance(item, OmniRequestOutput | RequestOutput):
+                yield item
+
+
+def _iter_multimodal_image_payloads(output: OmniRequestOutput | RequestOutput) -> Iterable[Any]:
+    mm = getattr(output, "multimodal_output", None)
+    if mm is not None:
+        yield from _image_values_from_mapping_like(mm)
+
+    request_output = getattr(output, "request_output", None)
+    if isinstance(request_output, RequestOutput):
+        yield from _iter_request_output_payloads(request_output)
+    elif isinstance(output, RequestOutput):
+        yield from _iter_request_output_payloads(output)
+
+
+def _iter_request_output_payloads(request_output: RequestOutput) -> Iterable[Any]:
+    mm = getattr(request_output, "multimodal_output", None)
+    if mm is not None:
+        yield from _image_values_from_mapping_like(mm)
+    for completion in getattr(request_output, "outputs", []):
+        mm = getattr(completion, "multimodal_output", None)
+        if mm is not None:
+            yield from _image_values_from_mapping_like(mm)
+
+
+def _image_values_from_mapping_like(value: Any) -> Iterable[Any]:
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        value = value.to_dict()
+    if not isinstance(value, Mapping):
         return
-
-    yield value
-
-    unwrap = getattr(value, "unwrap", None)
-    if callable(unwrap):
-        unwrapped = unwrap()
-        if unwrapped is not value:
-            yield from _iter_output_candidates(unwrapped, seen)
-
-    request_output = getattr(value, "request_output", None)
-    if request_output is not None:
-        yield from _iter_output_candidates(request_output, seen)
-
-    nested_outputs = getattr(value, "outputs", None)
-    if nested_outputs:
-        yield from _iter_output_candidates(nested_outputs, seen)
-
-    raw_output = getattr(value, "output", None)
-    if raw_output is not None:
-        yield from _iter_output_candidates(raw_output, seen)
-
-
-def _iter_multimodal_outputs(candidate: Any) -> Iterable[Mapping[str, Any]]:
-    if isinstance(candidate, Mapping):
-        if "image" in candidate or "images" in candidate:
-            yield candidate
-        payload = candidate.get("payload")
-        if isinstance(payload, Mapping):
-            yield payload
-        for key in ("multimodal_output", "_multimodal_output"):
-            mm_output = candidate.get(key)
-            if isinstance(mm_output, Mapping):
-                yield mm_output
-        return
-
-    for attr in ("multimodal_output", "_multimodal_output"):
-        mm_output = getattr(candidate, attr, None)
-        if isinstance(mm_output, Mapping):
-            yield mm_output
+    for key in ("image", "images", "model_outputs"):
+        if key in value:
+            yield value[key]
 
 
 def _coerce_images(payload: Any) -> list[Image.Image]:
@@ -96,7 +82,7 @@ def _coerce_images(payload: Any) -> list[Image.Image]:
         return [payload]
     if isinstance(payload, torch.Tensor):
         return _tensor_to_images(payload)
-    if isinstance(payload, (list, tuple)):
+    if isinstance(payload, list | tuple):
         images: list[Image.Image] = []
         for item in payload:
             images.extend(_coerce_images(item))
@@ -117,6 +103,7 @@ def _tensor_to_images(tensor: torch.Tensor) -> list[Image.Image]:
     if img.shape[0] in (1, 3, 4):
         img = img.permute(1, 2, 0)
 
+    # Some diffusion models emit image tensors normalized in [-1, 1].
     if img.min().item() < 0.0:
         img = img / 2 + 0.5
     img = img.clamp(0, 1).mul(255).to(torch.uint8).contiguous().numpy()

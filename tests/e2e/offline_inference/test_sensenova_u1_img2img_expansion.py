@@ -38,7 +38,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 #       --model SenseNova/SenseNova-U1-8B-MoT \
 #       --prompt "Turn this into an oil painting" \
 #       --image 2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg \
-#       --resolution 2048 \
+#       --width 2560 --height 1669 \
 #       --seed 42 --num-inference-steps 50 \
 #       --cfg-scale 4.0 \
 #       --extra-args '{"think": true, "img_cfg_scale": 1.0, "cfg_norm": "none", "timestep_shift": 3.0}'
