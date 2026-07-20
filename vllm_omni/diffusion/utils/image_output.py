@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -10,8 +10,11 @@ from vllm.outputs import RequestOutput
 
 from vllm_omni.outputs import OmniRequestOutput
 
+ImageOutput = OmniRequestOutput | RequestOutput
+ImageOutputs = ImageOutput | Sequence[ImageOutput] | None
 
-def extract_images_from_outputs(outputs: Any) -> list[Image.Image]:
+
+def extract_images_from_outputs(outputs: ImageOutputs) -> list[Image.Image]:
     """Extract PIL images from known Omni output types.
 
     Supported inputs:
@@ -19,9 +22,10 @@ def extract_images_from_outputs(outputs: Any) -> list[Image.Image]:
     - RequestOutput / list[RequestOutput] (compatibility fallback)
     """
     for output in _iter_known_outputs(outputs):
-        images = _coerce_images(getattr(output, "images", None))
-        if images:
-            return images
+        if isinstance(output, OmniRequestOutput):
+            images = _coerce_images(output.images)
+            if images:
+                return images
 
         for payload in _iter_multimodal_image_payloads(output):
             images = _coerce_images(payload)
@@ -31,27 +35,25 @@ def extract_images_from_outputs(outputs: Any) -> list[Image.Image]:
     return []
 
 
-def _iter_known_outputs(value: Any) -> Iterable[OmniRequestOutput | RequestOutput]:
+def _iter_known_outputs(value: ImageOutputs) -> Iterable[ImageOutput]:
     if value is None:
         return
     if isinstance(value, OmniRequestOutput | RequestOutput):
         yield value
         return
-    if isinstance(value, list | tuple):
+    if isinstance(value, Sequence):
         for item in value:
             if isinstance(item, OmniRequestOutput | RequestOutput):
                 yield item
 
 
 def _iter_multimodal_image_payloads(output: OmniRequestOutput | RequestOutput) -> Iterable[Any]:
-    mm = getattr(output, "multimodal_output", None)
-    if mm is not None:
-        yield from _image_values_from_mapping_like(mm)
-
-    request_output = getattr(output, "request_output", None)
-    if isinstance(request_output, RequestOutput):
-        yield from _iter_request_output_payloads(request_output)
-    elif isinstance(output, RequestOutput):
+    if isinstance(output, OmniRequestOutput):
+        if output.multimodal_output is not None:
+            yield from _image_values_from_mapping_like(output.multimodal_output)
+        if output.request_output is not None:
+            yield from _iter_request_output_payloads(output.request_output)
+    else:
         yield from _iter_request_output_payloads(output)
 
 
