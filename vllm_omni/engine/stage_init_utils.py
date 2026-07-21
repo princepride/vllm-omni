@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
@@ -36,6 +36,21 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
 
 logger = init_logger(__name__)
+
+
+class StageConfigLike(Protocol):
+    """Resolved stage-config interface consumed by initialization helpers."""
+
+    stage_id: int
+    stage_type: Literal["llm", "diffusion"]
+    engine_args: Any
+    runtime: Any
+    engine_input_source: list[int]
+    final_output: bool
+    final_output_type: str | None
+    is_comprehension: bool
+
+    def get(self, key: str, default: Any = None) -> Any: ...
 
 
 @dataclass
@@ -346,7 +361,7 @@ class StageMetadata:
     replica_id: int = 0
 
 
-def extract_stage_metadata(stage_config: Any) -> StageMetadata:
+def extract_stage_metadata(stage_config: StageConfigLike) -> StageMetadata:
     """Pure data extraction from a stage_config object."""
     stage_id: int = stage_config.stage_id
     stage_type: Literal["llm", "diffusion"] = stage_config.stage_type
