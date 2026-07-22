@@ -153,8 +153,8 @@ def format_diffusion_outputs(
         "postprocess_time_ms": timings.postprocess_time_s * 1000,
     }
 
-    # Detect text output by the primary payload, not by text metadata. Image
-    # outputs can also carry text metadata such as think_text.
+    # Only the primary payload determines the response type. Some image models
+    # include reasoning text in metadata, but their final output is still an image.
     is_text_output = postprocess_output.primary_key == "text"
 
     is_audio_output = supports_audio_output(od_config.model_class_name)
