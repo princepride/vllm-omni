@@ -18,7 +18,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
-from omegaconf import DictConfig
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
@@ -347,10 +346,10 @@ class StageMetadata:
     replica_id: int = 0
 
 
-def extract_stage_metadata(stage_config: DictConfig) -> StageMetadata:
+def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     """Pure data extraction from a stage_config object."""
     stage_id: int = stage_config.stage_id
-    stage_type: Literal["llm", "diffusion"] = stage_config.get("stage_type", "llm")
+    stage_type: Literal["llm", "diffusion"] = _get_attr_or_item(stage_config, "stage_type", "llm")
     engine_args = stage_config.engine_args
 
     if current_omni_platform.is_rocm():
@@ -371,24 +370,24 @@ def extract_stage_metadata(stage_config: DictConfig) -> StageMetadata:
     final_output: bool = stage_config.final_output
     final_output_type: str | None = stage_config.final_output_type
 
-    default_sp = _to_dict(stage_config.get("default_sampling_params", {}))
+    default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
     SPClass = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
     default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
 
     custom_process_input_func: Callable | None = None
-    _cpif_path = stage_config.get("custom_process_input_func")
+    _cpif_path = _get_attr_or_item(stage_config, "custom_process_input_func")
     if _cpif_path:
         mod_path, fn_name = _cpif_path.rsplit(".", 1)
         custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
 
     prompt_expand_func: Callable | None = None
-    _pef_path = stage_config.get("prompt_expand_func")
+    _pef_path = _get_attr_or_item(stage_config, "prompt_expand_func")
     if _pef_path:
         _mod, _fn = _pef_path.rsplit(".", 1)
         prompt_expand_func = getattr(importlib.import_module(_mod), _fn)
 
     cfg_kv_collect_func: Callable | None = None
-    _ckf_path = stage_config.get("cfg_kv_collect_func")
+    _ckf_path = _get_attr_or_item(stage_config, "cfg_kv_collect_func")
     if _ckf_path:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
@@ -696,7 +695,7 @@ def build_engine_args_dict(
     if "tensor_parallel_size" in engine_args and engine_args["tensor_parallel_size"] is None:
         del engine_args["tensor_parallel_size"]
 
-    stage_type = stage_config.stage_type
+    stage_type = _get_attr_or_item(stage_config, "stage_type", "llm")
     stage_id = stage_config.stage_id
 
     engine_args_dict = _to_dict(engine_args)
@@ -736,7 +735,7 @@ def build_engine_args_dict(
         engine_args_dict.setdefault("enable_prefix_caching", False)
 
     # Check whether the stage's default_sampling_params defines extra_args.
-    default_sp = _to_dict(stage_config.get("default_sampling_params", {}))
+    default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
     engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
 
     # TODO: Remove this after the performance regression is fixed
