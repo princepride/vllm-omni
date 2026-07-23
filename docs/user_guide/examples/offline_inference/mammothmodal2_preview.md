@@ -16,8 +16,7 @@ Text-to-image now runs through the shared offline image example
 
 ### Image-to-Text (I2T)
 
-```bash
-python - <<'PY'
+```python
 from PIL import Image
 from vllm import SamplingParams
 from vllm.multimodal.image import convert_image_mode
@@ -50,5 +49,4 @@ finally:
 
 ro = getattr(outputs[-1], "request_output", outputs[-1])
 print(ro.outputs[0].text.strip())
-PY
 ```
