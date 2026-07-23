@@ -128,7 +128,7 @@ def main():
         "Summarize this image.<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
-    
+
     omni = Omni(
         model="./MammothModa2-Preview",
         deploy_config="vllm_omni/deploy/mammoth_moda2_ar.yaml",
@@ -146,7 +146,7 @@ def main():
         )
     finally:
         omni.close()
-    
+
     ro = getattr(outputs[-1], "request_output", outputs[-1])
     print(ro.outputs[0].text.strip())
 
