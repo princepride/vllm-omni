@@ -30,7 +30,14 @@ from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLProcessingInfo,
 )
 from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalDataParser
+from vllm.model_executor.models.qwen3_vl import (
+    Qwen3VLDummyInputsBuilder,
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLMultiModalProcessor,
+    Qwen3VLProcessingInfo,
+)
 from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
     init_vllm_registered_model,
@@ -531,7 +538,6 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
 
         return loaded_params
 
-
 @MULTIMODAL_REGISTRY.register_processor(
     MammothModa2ARMultiModalProcessor,
     info=MammothModa2ARProcessingInfo,
@@ -682,6 +688,53 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         return logits
 
 
+class MammothModa2Qwen3ProcessingInfo(Qwen3VLProcessingInfo):
+    """Qwen3-VL processing using MammothModa2's nested AR configuration."""
+
+    def get_hf_config(self):
+        mammoth_cfg: Mammothmoda2Config = self.ctx.get_hf_config(Mammothmoda2Config)
+        return mammoth_cfg.llm_config
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"image": None}
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    Qwen3VLMultiModalProcessor,
+    info=MammothModa2Qwen3ProcessingInfo,
+    dummy_inputs=Qwen3VLDummyInputsBuilder,
+)
+class MammothModa2Qwen3ARForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    """MammothModa2-Dev image-understanding stage backed by Qwen3-VL."""
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "llm_model.model.visual.": "visual.",
+            "llm_model.lm_head.": "language_model.lm_head.",
+            "llm_model.model.language_model.": "language_model.model.",
+            "gen_image_condition_refiner.": None,
+            "gen_transformer.": None,
+            "gen_vae.": None,
+            "gen_tokenizer.": None,
+        }
+    )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Generation-only experts and vocabulary are not used by the AR-only
+        # image-understanding pipeline. The base Qwen3-VL weights are loaded
+        # unchanged through vLLM's existing loader.
+        ar_weights = (
+            (name, weight)
+            for name, weight in weights
+            if ".gen_mlp." not in name
+            and "gen_embed_tokens." not in name
+            and not name.startswith("llm_model.gen_head.")
+        )
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(ar_weights, mapper=self.hf_to_vllm_mapper)
+
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     MammothModa2ARMultiModalProcessor,
     info=MammothModa2ARProcessingInfo,
@@ -716,7 +769,11 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "ar"),
                 hf_config=cfg.llm_config if hasattr(cfg, "llm_config") else cfg.text_config,
-                architectures=["MammothModa2ARForConditionalGeneration"],
+                architectures=[
+                    "MammothModa2Qwen3ARForConditionalGeneration"
+                    if getattr(cfg.llm_config, "model_type", "") == "mammothmoda2_qwen3_vl"
+                    else "MammothModa2ARForConditionalGeneration"
+                ],
             )
             self.model = self.ar
         elif self.model_stage == "dit":
@@ -749,6 +806,26 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         if hasattr(self.model, "get_language_model"):
             return self.model.get_language_model()
         return self.model
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings=None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if isinstance(self.model, MammothModa2Qwen3ARForConditionalGeneration):
+            return self.model.embed_input_ids(
+                input_ids,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
+            )
+        return SupportsMultiModal.embed_input_ids(
+            self,
+            input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
 
     def get_multimodal_embeddings(self, **kwargs: object):
         # Backward compatibility: route through embed_multimodal.
