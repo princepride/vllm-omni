@@ -1,8 +1,5 @@
 # MammothModa2-Preview
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/mammothmodal2_preview>.
-
-
 ## Run examples (MammothModa2-Preview)
 
 Download model
@@ -17,19 +14,41 @@ Text-to-image now runs through the shared offline image example
 `recipes/MammothModa2/MammothModa2-Preview.md` for the full command and the
 `extra_body` knobs (`text_guidance_scale`, `cfg_range`, `num_inference_steps`).
 
-### Image Summary
+### Image-to-Text (I2T)
 
 ```bash
-python examples/offline_inference/mammothmodal2_preview/run_mammothmoda2_image_summarize.py \
-  --model ./MammothModa2-Preview \
-  --deploy-config ./vllm_omni/deploy/mammoth_moda2_ar.yaml \
-  --question "Summarize this image." \
-  --image ./image.png
+python - <<'PY'
+from PIL import Image
+from vllm import SamplingParams
+from vllm.multimodal.image import convert_image_mode
+from vllm_omni import Omni
+
+prompt = (
+    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+    "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+    "Summarize this image.<|im_end|>\n"
+    "<|im_start|>assistant\n"
+)
+
+omni = Omni(
+    model="./MammothModa2-Preview",
+    deploy_config="vllm_omni/deploy/mammoth_moda2_ar.yaml",
+)
+try:
+    outputs = list(
+        omni.generate(
+            [{
+                "prompt": prompt,
+                "multi_modal_data": {"image": convert_image_mode(Image.open("./image.png"), "RGB")},
+                "additional_information": {"omni_task": ["chat"]},
+            }],
+            [SamplingParams(temperature=0.2, top_p=0.9, top_k=-1, max_tokens=512, seed=42)],
+        )
+    )
+finally:
+    omni.close()
+
+ro = getattr(outputs[-1], "request_output", outputs[-1])
+print(ro.outputs[0].text.strip())
+PY
 ```
-
-## Example materials
-
-??? abstract "run_mammothmoda2_image_summarize.py"
-    ``````py
-    --8<-- "examples/offline_inference/mammothmodal2_preview/run_mammothmoda2_image_summarize.py"
-    ``````
