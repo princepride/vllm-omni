@@ -115,8 +115,7 @@ python -c "from PIL import Image; print(Image.open('mammoth_t2i.png').size)"
 For the simplest offline image-understanding run, use a short inline Python
 snippet from the repository root:
 
-```bash
-python - <<'PY'
+```python
 from PIL import Image
 from vllm import SamplingParams
 from vllm.multimodal.image import convert_image_mode
@@ -154,5 +153,4 @@ finally:
 
 ro = getattr(outputs[-1], "request_output", outputs[-1])
 print(ro.outputs[0].text.strip())
-PY
 ```
