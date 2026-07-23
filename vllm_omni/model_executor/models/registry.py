@@ -99,6 +99,11 @@ _OMNI_MODELS = {
         "mammoth_moda2",
         "MammothModa2ARForConditionalGeneration",
     ),
+    "MammothModa2Qwen3ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ARForConditionalGeneration",
+    ),
     "MammothModa2DiTPipeline": (
         "mammoth_moda2",
         "pipeline_mammothmoda2_dit",
