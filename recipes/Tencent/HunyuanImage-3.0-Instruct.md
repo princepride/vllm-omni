@@ -1,14 +1,15 @@
 # HunyuanImage-3.0-Instruct
 
-> Text and image generation/understanding through shared examples, plus DiT
-> serving and benchmark with FP8 and distributed parallelism.
+> DiT-only text-to-image serving and benchmark with FP8, tensor parallelism,
+> sequence parallelism, CFG parallelism, and ModelOpt mixed FP8/NVFP4
+> checkpoints.
 
 ## Summary
 
 - Vendor: Tencent Hunyuan
 - Model: `tencent/HunyuanImage-3.0-Instruct`
-- Task: Text-to-image, image-to-image, text-to-text, and image-to-text
-- Mode: Offline inference, online serving, and performance benchmarking
+- Task: Text-to-image generation; text-to-text and image-to-text understanding
+- Mode: Offline understanding, online serving, and performance benchmarking
 - Maintainer: Community
 
 ## When to use this recipe
@@ -30,9 +31,9 @@ FP8/NVFP4 configuration:
 ## References
 
 - Model: <https://huggingface.co/tencent/HunyuanImage-3.0-Instruct>
-- Offline image generation example:
-  [`examples/offline_inference/text_to_image/text_to_image.py`](../../examples/offline_inference/text_to_image/text_to_image.py)
-- Shared understanding example:
+- Existing model-specific offline example:
+  [`examples/offline_inference/hunyuan_image3`](../../examples/offline_inference/hunyuan_image3)
+- Shared T2T/I2T example:
   [`examples/offline_inference/x_to_text/x_to_text.py`](../../examples/offline_inference/x_to_text/x_to_text.py)
 - Related PRs:
   [#2495](https://github.com/vllm-project/vllm-omni/pull/2495) for DiT performance CI,
@@ -43,23 +44,9 @@ FP8/NVFP4 configuration:
 
 ## GPU
 
-### Shared offline examples
+### Shared T2T/I2T offline example
 
-HunyuanImage-3.0 uses the same task-oriented examples as other models.
-Text-to-image automatically discovers the checkpoint's default
-AR-to-DiT deploy config:
-
-```bash
-python examples/offline_inference/text_to_image/text_to_image.py \
-  --model tencent/HunyuanImage-3.0-Instruct \
-  --prompt "A cinematic photo of a glass observatory on Mars at sunrise" \
-  --height 1024 \
-  --width 1024 \
-  --guidance-scale 5.0 \
-  --output hunyuan_image3_output.png
-```
-
-For text-to-text, the shared understanding example automatically selects the
+For text-to-text, the shared x-to-text example automatically selects the
 AR-only Hunyuan deploy config and applies the checkpoint's prompt tokens and
 stop-token rules:
 
@@ -79,8 +66,8 @@ python examples/offline_inference/x_to_text/x_to_text.py \
 ```
 
 The AR-only default uses four GPUs. Pass `--deploy-config` to override the
-layout. The sections below retain the validated DiT-only serving and benchmark
-configurations.
+layout. Image-output tasks remain documented by the existing model-specific
+example and the DiT sections below.
 
 ### 4x H100/H800 80GB
 
