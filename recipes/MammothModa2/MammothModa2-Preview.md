@@ -110,9 +110,8 @@ python examples/offline_inference/x_to_text/x_to_text.py \
   --prompt "Explain multimodal generation in three sentences."
 ```
 
-Add an image for image-to-text or image summarization; the shared example uses
-MammothModa2's chat and vision-token template, so the model-specific
-`run_mammothmoda2_image_summarize.py` script is not required:
+Add an image for image-to-text or image summarization. The shared example
+uses MammothModa2's chat and vision-token template:
 
 ```bash
 python examples/offline_inference/x_to_text/x_to_text.py \
