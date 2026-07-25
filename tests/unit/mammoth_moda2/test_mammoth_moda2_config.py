@@ -20,6 +20,8 @@ from vllm_omni.transformers_utils.configs.mammoth_moda2 import (
     Mammothmoda2Qwen3VLTextConfig,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 @pytest.mark.cpu
 class TestMammothmoda2Config:
@@ -114,6 +116,7 @@ class TestMammothmoda2Qwen3VLConfig:
 
         assert isinstance(config.llm_config, Mammothmoda2Qwen3VLConfig)
         assert isinstance(config.get_text_config(), Mammothmoda2Qwen3VLTextConfig)
-        assert config.get_text_config().vocab_size == 151936
+        # vLLM validates sampling against the complete base + visual vocabulary.
+        assert config.get_text_config().vocab_size == 152064 + 32800
         assert config.get_text_config().gen_vocab_start_index == 152064
         assert config.llm_config.vision_config.deepstack_visual_indexes == [8, 16, 24]

@@ -1,6 +1,6 @@
 # MammothModa2
 
-> MammothModa2-Preview text-to-image generation and MammothModa2-Dev image understanding
+> MammothModa2-Preview and MammothModa2-Dev unified understanding and generation
 
 ## Summary
 
@@ -111,17 +111,16 @@ ls -lh mammoth_t2i.png
 python -c "from PIL import Image; print(Image.open('mammoth_t2i.png').size)"
 ```
 
-## MammothModa2-Dev image understanding
+## MammothModa2-Dev unified inference
 
 MammothModa2-Dev uses a Qwen3-VL AR backbone, while MammothModa2-Preview uses
 Qwen2.5-VL. vLLM-Omni selects the matching implementation from the nested
 `llm_config.model_type`; no checkpoint edits or `trust_remote_code` flag are
 required.
 
-The current Dev integration supports the AR-only image-understanding path.
-Generation-only experts (`gen_mlp`), the extra visual vocabulary, and the image
-generation head are not loaded, so text-to-image generation with
-MammothModa2-Dev is not supported yet.
+Text-to-text and image-to-text use the AR-only deploy. Text-to-image loads the
+Qwen3 generation experts (`gen_mlp`), extra visual vocabulary and image head,
+then sends the generated visual tokens and hidden states to the DiT stage.
 
 Download the checkpoint:
 

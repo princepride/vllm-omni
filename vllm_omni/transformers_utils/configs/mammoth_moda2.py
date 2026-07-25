@@ -213,9 +213,7 @@ class Mammothmoda2Qwen2_5_VLConfig(Qwen2_5_VLConfig):
         self.extra_gen_vocab = getattr(self.text_config, "extra_gen_vocab", extra_gen_vocab)
         self.gen_vocab_size = getattr(self.text_config, "gen_vocab_size", gen_vocab_size)
         self.moe_type = getattr(self.text_config, "moe_type", moe_type)
-        self.gen_vocab_start_index = getattr(
-            self.text_config, "gen_vocab_start_index", gen_vocab_start_index
-        )
+        self.gen_vocab_start_index = getattr(self.text_config, "gen_vocab_start_index", gen_vocab_start_index)
         self.tokenizer_class = "MammothUTokenizer"
 
 
@@ -237,12 +235,13 @@ class Mammothmoda2Qwen3VLTextConfig(Qwen3VLTextConfig):
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
+        self.base_vocab_size = int(self.vocab_size)
         self.extra_gen_vocab = extra_gen_vocab
         self.gen_vocab_size = gen_vocab_size
-        self.gen_vocab_start_index = (
-            self.vocab_size if gen_vocab_start_index is None else gen_vocab_start_index
-        )
+        self.gen_vocab_start_index = self.vocab_size if gen_vocab_start_index is None else gen_vocab_start_index
         self.moe_type = moe_type
+        if self.extra_gen_vocab:
+            self.vocab_size = int(self.gen_vocab_start_index) + int(self.gen_vocab_size)
 
 
 class Mammothmoda2Qwen3VLConfig(Qwen3VLConfig):
