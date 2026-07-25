@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
-from transformers import AutoTokenizer
 
 from vllm_omni import Omni
+from vllm_omni.model_extras import build_x_to_text_prompt, get_x_to_text_model_family
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _HUNYUAN_AR_DEPLOY_CONFIG = _REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3_ar.yaml"
@@ -35,67 +35,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _model_family(model: str, trust_remote_code: bool) -> str:
-    del trust_remote_code  # Reading config.json does not execute checkpoint code.
-    from vllm.transformers_utils.config import get_hf_file_to_dict
-
-    config = get_hf_file_to_dict("config.json", model) or {}
-    model_type = str(config.get("model_type", "")).lower()
-    architectures = {str(value).lower() for value in (config.get("architectures") or [])}
-    if model_type == "bagel" or "bagelforconditionalgeneration" in architectures:
-        return "bagel"
-    if model_type == "hunyuan_image_3_moe" or any("hunyuanimage3" in value for value in architectures):
-        return "hunyuan_image3"
-    if "mammoth" in model_type or any("mammothmoda2" in value for value in architectures):
-        return "mammoth_moda2"
-    return "generic"
-
-
-def _bagel_prompt(prompt: str, has_image: bool) -> dict[str, Any]:
-    image_token = "<|image_pad|>\n" if has_image else ""
-    return {
-        "prompt": f"<|im_start|>user\n{image_token}{prompt}<|im_end|>\n<|im_start|>assistant\n",
-        "modalities": ["text"],
-    }
-
-
-def _mammoth_prompt(prompt: str, has_image: bool) -> dict[str, Any]:
-    vision = "<|vision_start|><|image_pad|><|vision_end|>" if has_image else ""
-    return {
-        "prompt": (
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            f"<|im_start|>user\n{vision}{prompt}<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        ),
-        "modalities": ["text"],
-        "additional_information": {"omni_task": ["chat"]},
-    }
-
-
-def _hunyuan_prompt(model: str, prompt: str, has_image: bool) -> tuple[dict[str, Any], list[int]]:
-    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
-        build_prompt_tokens,
-        resolve_stop_token_ids,
-        resolve_sys_type,
-    )
-
-    task = "i2t" if has_image else "t2t"
-    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    build_kwargs: dict[str, Any] = {"task": task, "bot_task": None}
-    if has_image:
-        build_kwargs["num_images"] = 1
-    built = build_prompt_tokens(prompt, tokenizer, **build_kwargs)
-    return (
-        {
-            "prompt": prompt,
-            "prompt_token_ids": built.token_ids,
-            "modalities": ["text"],
-            "use_system_prompt": resolve_sys_type(None),
-        },
-        resolve_stop_token_ids(task=task, bot_task=None, tokenizer=tokenizer, image_size="auto"),
-    )
-
-
 def _extract_text(outputs: list[Any]) -> str:
     chunks: list[str] = []
     for output in outputs:
@@ -107,20 +46,15 @@ def _extract_text(outputs: list[Any]) -> str:
 
 def main() -> None:
     args = parse_args()
-    family = _model_family(args.model, args.trust_remote_code)
+    family = get_x_to_text_model_family(args.model)
     image = Image.open(args.image).convert("RGB") if args.image else None
 
-    if family == "bagel":
-        prompt_dict = _bagel_prompt(args.prompt, image is not None)
-        stop_token_ids = None
-    elif family == "hunyuan_image3":
-        prompt_dict, stop_token_ids = _hunyuan_prompt(args.model, args.prompt, image is not None)
-    elif family == "mammoth_moda2":
-        prompt_dict = _mammoth_prompt(args.prompt, image is not None)
-        stop_token_ids = None
-    else:
-        prompt_dict = {"prompt": args.prompt, "modalities": ["text"]}
-        stop_token_ids = None
+    prompt_dict, stop_token_ids = build_x_to_text_prompt(
+        model_family=family,
+        model=args.model,
+        prompt=args.prompt,
+        has_image=image is not None,
+    )
 
     if image is not None:
         prompt_dict["multi_modal_data"] = {"image": image}
