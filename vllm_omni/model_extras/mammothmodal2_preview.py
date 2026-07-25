@@ -88,5 +88,7 @@ def build_x_to_text_prompt(
         },
         None,
     )
+
+
 MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS = frozenset()
 MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES = True
