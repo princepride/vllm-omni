@@ -6,7 +6,7 @@
 
 - Vendor: ByteDance Research
 - Models: `bytedance-research/MammothModa2-Preview`, `bytedance-research/MammothModa2-Dev`
-- Tasks: Preview text-to-image (AR → DiT); Dev image-to-text (AR-only)
+- Tasks: Preview and Dev text-to-image (AR → DiT); Dev text/image understanding
 - Mode: Offline inference
 - Maintainer: Community
 
