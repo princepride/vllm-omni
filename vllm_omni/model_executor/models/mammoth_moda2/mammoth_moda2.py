@@ -475,6 +475,10 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             start=self.start_layer,
         ):
             hidden_states, residual = layer(positions, hidden_states, residual, gen_token_mask)
+            # The vision encoder's deepstack_visual_indexes select which vision
+            # layers produce these features. The resulting tensors are keyed
+            # 0..N-1 and, as in Qwen3-Omni, are injected into the first N
+            # language-model layers.
             if deepstack_input_embeds is not None and idx < len(deepstack_input_embeds):
                 hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{idx}"]
 

@@ -556,7 +556,7 @@ def main():
         elif init_non_diffusion and hasattr(params, "extra_args"):
             if params.extra_args is None:
                 params.extra_args = {}
-            params.extra_args.update(diffusion_params.extra_args)
+            params.extra_args.update(diffusion_params.extra_args or {})
             if args.seed is not None and hasattr(params, "seed"):
                 params.seed = args.seed
 
@@ -574,7 +574,7 @@ def main():
     if not diffusion_replaced and len(sampling_params_list) == 1:
         sampling_params_list = [diffusion_params]
 
-    outputs = omni.generate([prompt_dict], sampling_params_list=sampling_params_list)
+    outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
 
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
