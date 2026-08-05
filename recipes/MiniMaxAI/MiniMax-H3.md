@@ -367,11 +367,22 @@ document per request, so a batch costs one DiT forward. That packing requires
 forward per request. `--max-num-seqs 1` keeps the conservative single-request
 step path. Cache acceleration (`--cache-backend`) is not available in step mode.
 
-Because H3's denoise sequences are already long, expect the benefit in
-throughput and queueing fairness rather than single-request latency: with
-several in-flight requests, one request's encode or VAE decode no longer blocks
-another's denoise. Batch size is bounded by memory, so raise `--max-num-seqs`
-gradually and watch peak GPU memory.
+!!! warning "Batching does not currently improve H3 throughput"
+    Keep `--max-num-seqs 1` unless you specifically need step-level scheduling.
+    Measured on two H100s (TP2, 672x384, 30 steps, 4 requests at concurrency 4):
+
+    | Configuration | Wall time | Mean latency | Peak memory |
+    |---------------|-----------|--------------|-------------|
+    | request mode | 174.8 s | 111.5 s | 72.4 GB |
+    | `--step-execution --max-num-seqs 1` | 179.0 s | 113.8 s | 72.4 GB |
+    | `--step-execution --max-num-seqs 4` | 182.1 s | 175.7 s | 78.3 GB |
+
+    A single H3 denoise step is a compute-bound dense GEMM over an already long
+    packed sequence, so fusing N requests costs N times the FLOPs and buys no
+    amortization — unlike LLM decoding, which is memory-bandwidth bound. Mean
+    latency also degrades because co-batched requests finish together instead of
+    staggered. Step execution exists here for scheduler-level control (admitting
+    and retiring requests between denoise steps) rather than for throughput.
 
 ### Online FP8 quantization
 
