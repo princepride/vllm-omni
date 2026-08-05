@@ -398,15 +398,25 @@ class MiniMaxH3Attention(nn.Module):
             raise ValueError(
                 f"max_seqlen must be within the packed sequence, got {max_seqlen} for length {packed_total}"
             )
-        used = min(max_seqlen, packed_total)
+        # A step-mode batch packs one document per request (plus that request's
+        # padding tail), so its valid rows are block-diagonal rather than a
+        # prefix: neither a KV prefix length nor a 1-D key mask can describe
+        # them. Those layouts rely on cu_seqlens alone, which is why
+        # denoise_step() only packs several requests on a backend that consumes
+        # it. Reading the tensor's element count stays on the host, so this
+        # keeps the no-.item() contract above.
+        multi_request = cu_seqlens.numel() > 3
+        used = packed_total if multi_request else min(max_seqlen, packed_total)
         attn_mask = None
-        # Ring attention can dispatch to a different implementation from the
-        # configured backend, so this no-mask fast path is local-only.
-        prefix_slice = (
-            not getattr(self.attention, "use_ring", False) and self.attention.attn_backend.supports_prefix_kv_slicing
-        )
-        if used < packed_total and not prefix_slice:
-            attn_mask = torch.arange(packed_total, device=q.device)[None] < used
+        if not multi_request:
+            # Ring attention can dispatch to a different implementation from the
+            # configured backend, so this no-mask fast path is local-only.
+            prefix_slice = (
+                not getattr(self.attention, "use_ring", False)
+                and self.attention.attn_backend.supports_prefix_kv_slicing
+            )
+            if used < packed_total and not prefix_slice:
+                attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
             extra={

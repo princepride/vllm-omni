@@ -351,6 +351,28 @@ No restart is needed: `task=fl2va` routes to `FL2VA/transformer`, while
 `task=ref2va` routes to
 `Ref2VA/transformer`. T2VA uses the FL2VA DiT.
 
+### Step execution and continuous batching
+
+H3 implements the step-wise execution contract, so the scheduler can admit and
+retire requests between denoise steps instead of running one request end to
+end. Add the feature gate, then raise `--max-num-seqs` to co-batch:
+
+```bash
+--step-execution --max-num-seqs 4
+```
+
+Co-batched requests are packed into a single sequence that keeps one attention
+document per request, so a batch costs one DiT forward. That packing requires
+`--diffusion-attention-backend FLASH_ATTN`; other backends fall back to one
+forward per request. `--max-num-seqs 1` keeps the conservative single-request
+step path. Cache acceleration (`--cache-backend`) is not available in step mode.
+
+Because H3's denoise sequences are already long, expect the benefit in
+throughput and queueing fairness rather than single-request latency: with
+several in-flight requests, one request's encode or VAE decode no longer blocks
+another's denoise. Batch size is bounded by memory, so raise `--max-num-seqs`
+gradually and watch peak GPU memory.
+
 ### Online FP8 quantization
 
 MiniMax H3 supports load-time FP8 quantization of the DiT. The checkpoint
@@ -655,7 +677,10 @@ reduction.
 
 - Combined serving requires sibling `FL2VA` and `Ref2VA` directories, loads
   both task-specific DiTs, and loads shared components once from `FL2VA`.
-- H3 currently executes one generation request per diffusion batch.
+- Request mode executes one generation request per diffusion batch. Use
+  `--step-execution` with `--max-num-seqs N` to admit several requests at once
+  (see [Step execution](../../docs/user_guide/diffusion/step_execution.md)); step
+  mode does not support `cache_backend`.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.
 - Online FP8 is not compatible with layerwise offload.
