@@ -369,7 +369,8 @@ step path. Cache acceleration (`--cache-backend`) is not available in step mode.
 
 !!! warning "Batching does not currently improve H3 throughput"
     Keep `--max-num-seqs 1` unless you specifically need step-level scheduling.
-    Measured on two H100s (TP2, 672x384, 30 steps, 4 requests at concurrency 4):
+    Measured on two H100s (TP2, BF16, 672x384, 209 frames, 30 steps, 4 requests
+    at concurrency 4; one packed request is 16384 rows):
 
     | Configuration | Wall time | Mean latency | Peak memory |
     |---------------|-----------|--------------|-------------|
@@ -378,11 +379,17 @@ step path. Cache acceleration (`--cache-backend`) is not available in step mode.
     | `--step-execution --max-num-seqs 4` | 182.1 s | 175.7 s | 78.3 GB |
 
     A single H3 denoise step is a compute-bound dense GEMM over an already long
-    packed sequence, so fusing N requests costs N times the FLOPs and buys no
-    amortization — unlike LLM decoding, which is memory-bandwidth bound. Mean
-    latency also degrades because co-batched requests finish together instead of
-    staggered. Step execution exists here for scheduler-level control (admitting
-    and retiring requests between denoise steps) rather than for throughput.
+    packed sequence, so fusing N requests costs N times the FLOPs and buys almost
+    no amortization — unlike LLM decoding, which is memory-bandwidth bound. Going
+    from one request per step to four cuts the per-request denoise cost only from
+    1.323 s to 1.291 s (2.4%), which the step-mode bookkeeping then spends. Mean
+    latency degrades further because co-batched requests finish together instead
+    of staggered. Step execution exists here for scheduler-level control
+    (admitting and retiring requests between denoise steps), not for throughput.
+
+    Quantization moves the absolute numbers without changing this: with online
+    `int8` the same workload runs in 153.3 s at 56.9 GB (request mode), and
+    `--max-num-seqs 4` is still 5.0% slower than request mode.
 
 ### Online FP8 quantization
 
