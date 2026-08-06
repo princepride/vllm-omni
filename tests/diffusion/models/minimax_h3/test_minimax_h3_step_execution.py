@@ -9,6 +9,8 @@ checkpoint weights.
 
 from __future__ import annotations
 
+import queue
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -333,6 +335,57 @@ def test_batched_step_execution_matches_independent_requests():
     for state, (expected_video, expected_audio) in zip(states, alone):
         torch.testing.assert_close(state.latents, expected_video)
         torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], expected_audio)
+
+
+def test_abort_stops_h3_after_the_inflight_step():
+    """H3 relies on the generic step scheduler to stop aborted requests."""
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.sched import StepScheduler
+    from vllm_omni.diffusion.worker.utils import RunnerOutput
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=9)
+    state = _make_state("req-abort", branch, video_rows, audio_rows, _sigmas(6, 12.0), _sigmas(6, 3.0))
+    pipeline = _step_pipeline(_SegmentMeanModel())
+    scheduler = StepScheduler()
+    scheduler.initialize(SimpleNamespace())
+
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = scheduler
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    engine._closed = False
+    engine.abort_queue = queue.Queue()
+    calls = 0
+
+    def execute_h3_step(scheduler_output):
+        nonlocal calls
+        calls += 1
+        assert scheduler_output.scheduled_request_ids == ["req-abort"]
+        noise_pred = pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state])
+        pipeline.step_scheduler(state, noise_pred)
+        engine.abort("req-abort")
+        return RunnerOutput(
+            request_id=state.request_id,
+            step_index=state.step_index,
+            finished=False,
+            result=None,
+        )
+
+    engine.execute_fn = execute_h3_step
+    output = engine.add_req_and_wait_for_response(
+        OmniDiffusionRequest(
+            prompt="abort H3",
+            request_id="req-abort",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=state.total_steps),
+        )
+    )
+
+    assert calls == 1
+    assert state.step_index == 1
+    assert output == DiffusionOutput(aborted=True, abort_message="Request req-abort aborted.")
 
 
 def test_prepare_encode_seeds_runner_visible_state(monkeypatch):
