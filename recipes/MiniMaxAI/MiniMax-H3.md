@@ -697,7 +697,9 @@ reduction.
   both task-specific DiTs, and loads shared components once from `FL2VA`.
 - Request mode executes one generation request per diffusion batch. Use
   `--step-execution` with `--max-num-seqs N` to admit several requests at once
-  (see [Step execution](../../docs/user_guide/diffusion/step_execution.md)); step
+  (see
+  [Execution modes](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/execution_modes.md));
+  step
   mode does not support `cache_backend`.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.

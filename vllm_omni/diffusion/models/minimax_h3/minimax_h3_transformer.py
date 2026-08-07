@@ -45,6 +45,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Backends that attend by ``cu_seqlens`` and can therefore keep one document per
+# request in a co-batched packed sequence. Every other backend must run one
+# request per forward; the pipeline gates on this set before packing, and
+# ``_run_packed_attention`` enforces it.
+MINIMAX_H3_PACKED_BATCH_BACKENDS = frozenset({"FLASH_ATTN"})
+
 
 @dataclass
 class MiniMaxH3DiTArchConfig:
@@ -382,6 +388,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int,
+        num_requests: int = 1,
         video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
@@ -391,24 +398,30 @@ class MiniMaxH3Attention(nn.Module):
         narrow lets regional compile fuse projections, norms, RoPE, and the
         surrounding DiT block without repeated graph breaks.
         """
-        # max_seqlen is already the first (real) packed document length. Do
-        # not read the CUDA cu_seqlens scalars here: this function runs once
-        # per layer and .item() would serialize every attention launch.
+        # max_seqlen is already the longest packed document length. Do not read
+        # the CUDA cu_seqlens scalars here: this function runs once per layer
+        # and .item() would serialize every attention launch. ``num_requests``
+        # is carried as a Python int for the same reason.
         if not 0 < max_seqlen <= packed_total:
             raise ValueError(
                 f"max_seqlen must be within the packed sequence, got {max_seqlen} for length {packed_total}"
             )
-        # A step-mode batch packs one document per request (plus that request's
-        # padding tail), so its valid rows are block-diagonal rather than a
-        # prefix: neither a KV prefix length nor a 1-D key mask can describe
-        # them. Those layouts rely on cu_seqlens alone, which is why
-        # denoise_step() only packs several requests on a backend that consumes
-        # it. Reading the tensor's element count stays on the host, so this
-        # keeps the no-.item() contract above.
-        multi_request = cu_seqlens.numel() > 3
-        used = packed_total if multi_request else min(max_seqlen, packed_total)
         attn_mask = None
-        if not multi_request:
+        if num_requests > 1:
+            # A step-mode batch packs one document per request, so its valid
+            # rows are block-diagonal rather than a prefix: neither a KV prefix
+            # length nor a 1-D key mask can describe them. Such a layout is only
+            # correct on a backend that attends by cu_seqlens.
+            backend = self.attention.attn_backend.get_name()
+            if backend not in MINIMAX_H3_PACKED_BATCH_BACKENDS:
+                raise ValueError(
+                    f"MiniMax H3 packed a {num_requests}-request batch, which only "
+                    f"{sorted(MINIMAX_H3_PACKED_BATCH_BACKENDS)} can keep isolated, but this attention "
+                    f"resolved to {backend}. Run one request per forward on this backend."
+                )
+            used = packed_total
+        else:
+            used = min(max_seqlen, packed_total)
             # Ring attention can dispatch to a different implementation from the
             # configured backend, so this no-mask fast path is local-only.
             prefix_slice = (
@@ -443,6 +456,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int | None = None,
+        num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
@@ -471,9 +485,9 @@ class MiniMaxH3Attention(nn.Module):
             q = self._apply_rope(q, rope_freqs)
             k = self._apply_rope(k, rope_freqs)
 
-        # The packed layout uses a second document for alignment padding.
-        # Local/Ulysses backends unpad it, while Ring keeps aligned rows for
-        # fixed-size P2P buffers.
+        # Each request contributes a document for its rows plus one for its
+        # alignment padding. Local/Ulysses backends unpad it, while Ring keeps
+        # aligned rows for fixed-size P2P buffers.
         out = self._run_packed_attention(
             q,
             k,
@@ -484,6 +498,7 @@ class MiniMaxH3Attention(nn.Module):
             # backend receives the global sequence after all-to-all, so carry
             # its Python length explicitly instead of inferring it from q.
             packed_total=packed_total if packed_total is not None else q.shape[0],
+            num_requests=num_requests,
             video_layout=video_layout,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
@@ -611,12 +626,14 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        num_requests: int = 1,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
             rope_freqs=None,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            num_requests=num_requests,
         )
         x = x + self.mlp(self.norm2(x))
         return x
@@ -649,9 +666,10 @@ class MiniMaxH3TokenRefiner(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        num_requests: int = 1,
     ) -> torch.Tensor:
         for block in self.blocks:
-            x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, num_requests=num_requests)
         return self.final_norm(x)
 
 
@@ -697,6 +715,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int,
+        num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
@@ -725,6 +744,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             packed_total=packed_total,
+            num_requests=num_requests,
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
         )
@@ -1042,6 +1062,11 @@ class MiniMaxH3DiTModel(nn.Module):
             raise ValueError(f"{key}.{field} is required")
         return value
 
+    @staticmethod
+    def _psp_optional(psp: Any, field: str, default: Any) -> Any:
+        value = psp.get(field) if isinstance(psp, dict) else getattr(psp, field, None)
+        return default if value is None else value
+
     def _embed(
         self,
         *,
@@ -1054,6 +1079,7 @@ class MiniMaxH3DiTModel(nn.Module):
         text_pos: torch.Tensor,
         refiner_cu_seqlens: torch.Tensor,
         refiner_max_seqlen: int,
+        num_requests: int,
         seq_len: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1074,6 +1100,7 @@ class MiniMaxH3DiTModel(nn.Module):
             text_embed,
             cu_seqlens=refiner_cu_seqlens,
             max_seqlen=refiner_max_seqlen,
+            num_requests=num_requests,
         )
 
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=_BF16_DTYPE)
@@ -1126,6 +1153,10 @@ class MiniMaxH3DiTModel(nn.Module):
         psp = _required_kwarg(kwargs, "packed_seq_params")
         cu_seqlens = self._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(torch.int32)
         max_seqlen = int(self._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
+        # How many requests share this packed sequence. Carried as a host int so
+        # attention never reads cu_seqlens scalars off the device; a producer
+        # that omits it is packing a single request.
+        num_requests = int(self._psp_optional(psp, "num_requests", 1))
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1152,6 +1183,7 @@ class MiniMaxH3DiTModel(nn.Module):
             text_pos=text_pos.to(device),
             refiner_cu_seqlens=refiner_cu.to(device),
             refiner_max_seqlen=refiner_max,
+            num_requests=num_requests,
             seq_len=seq_len,
             device=device,
         )
@@ -1178,6 +1210,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 packed_total=seq_len,
+                num_requests=num_requests,
                 video_layout=video_layout,
             )
         hidden = self.sp_gather(hidden)

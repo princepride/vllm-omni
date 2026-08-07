@@ -7,9 +7,10 @@ concatenates their packed layouts into a single sequence and rebuilds
 ``cu_seqlens`` with one document per request plus that request's
 alignment-padding tail. Attention therefore never crosses a request boundary,
 while every request keeps its own RoPE coordinates, token tags, and timesteps.
+A batch of one is not rebuilt at all -- it delegates to the request-mode layout.
 
 Row order is the request order, so the concatenated video velocity returned by
-the DiT can be sliced back per request by row count alone -- which is exactly
+the DiT can be split back per request by row count alone -- which is exactly
 what the runner does with ``StepRequestState.latents``.
 """
 
@@ -27,12 +28,6 @@ from .denoise_loop import (
 )
 
 
-def _check_lengths(count: int, **named: Sequence[Any]) -> None:
-    mismatched = {name: len(value) for name, value in named.items() if len(value) != count}
-    if mismatched:
-        raise ValueError(f"MiniMax H3 batched forward expected {count} entries per request, got {mismatched}")
-
-
 def minimax_h3_batched_forward_kwargs(
     *,
     branches: Sequence[MiniMaxH3DenoiseBranch],
@@ -45,23 +40,20 @@ def minimax_h3_batched_forward_kwargs(
 ) -> dict[str, Any]:
     """Build one DiT forward kwargs dict covering every request in the batch.
 
-    With a single request the result matches
-    :meth:`MiniMaxH3DenoiseBranch.forward_kwargs` -- same layout, same
-    ``cu_seqlens``, same timestep vector -- so step mode and request mode stay
-    numerically aligned.
+    A single request delegates to :meth:`MiniMaxH3DenoiseBranch.forward_kwargs`,
+    so step mode and request mode are the same call rather than two layouts that
+    happen to agree -- which also keeps ``video_token_layout`` (the sparse-
+    attention hint) on the single-request step path.
     """
-    count = len(branches)
-    if count == 0:
-        raise ValueError("MiniMax H3 batched forward needs at least one request")
-    _check_lengths(
-        count,
-        video_rows=video_rows,
-        audio_rows=audio_rows,
-        t_video=t_video,
-        t_audio=t_audio,
-        imgvid_cond_timesteps=imgvid_cond_timesteps,
-        audio_ref_cond_timesteps=audio_ref_cond_timesteps,
-    )
+    if len(branches) == 1:
+        return branches[0].forward_kwargs(
+            video_rows=video_rows[0],
+            audio_rows=audio_rows[0],
+            t_video=t_video[0],
+            t_audio=t_audio[0],
+            imgvid_cond_timestep=imgvid_cond_timesteps[0],
+            audio_ref_cond_timestep=audio_ref_cond_timesteps[0],
+        )
 
     device = branches[0].device
     total_seq = sum(branch.seq_len for branch in branches)
@@ -85,9 +77,6 @@ def minimax_h3_batched_forward_kwargs(
     seq_offset = 0
     text_offset = 0
     for index, branch in enumerate(branches):
-        if branch.device != device:
-            raise ValueError("MiniMax H3 batched forward requires every request on the same device")
-
         img_pos = branch.img_pos_dev + seq_offset
         audio_pos = branch.audio_pos_dev + seq_offset
         img_pos_parts.append(img_pos)
@@ -104,11 +93,12 @@ def minimax_h3_batched_forward_kwargs(
         timesteps[audio_pos[branch.audio_update_mask_dev]] = float(t_audio[index])
         timesteps[audio_pos[~branch.audio_update_mask_dev]] = float(audio_ref_cond_timesteps[index])
 
-        # One document for the request's real rows, one more for its padding
-        # tail when the 64-row alignment left any.
+        # One document for the request's real rows and one for its padding tail,
+        # matching the single-request layout. The tail bound is emitted even when
+        # the 64-row alignment left it empty, so that a request always
+        # contributes exactly two bounds regardless of its length.
         cu_bounds.append(seq_offset + branch.used_len)
-        if branch.seq_len > branch.used_len:
-            cu_bounds.append(seq_offset + branch.seq_len)
+        cu_bounds.append(seq_offset + branch.seq_len)
         max_seqlen = max(max_seqlen, branch.used_len, branch.seq_len - branch.used_len)
 
         text_offset += branch.text_len
@@ -144,6 +134,12 @@ def minimax_h3_batched_forward_kwargs(
         "packed_seq_params": {
             "cu_seqlens_q": torch.tensor(cu_bounds, dtype=torch.int32, device=device),
             "max_seqlen_q": max_seqlen,
+            # Attention needs the request count on the host to know its valid
+            # rows are block-diagonal rather than a prefix. It describes the
+            # whole forward, so the DiT reads it once here and applies it to the
+            # token refiner too -- the refiner's text-only bounds cannot be told
+            # apart from a single padded request on their own.
+            "num_requests": len(branches),
         },
         "refiner_packed_seq_params": {
             "cu_seqlens_q": torch.tensor(refiner_bounds, dtype=torch.int32, device=device),
@@ -154,25 +150,6 @@ def minimax_h3_batched_forward_kwargs(
     }
 
 
-def minimax_h3_split_rows(
-    rows: torch.Tensor,
-    row_counts: Sequence[int],
-    *,
-    field_name: str,
-) -> list[torch.Tensor]:
-    """Split concatenated per-request rows back into one tensor per request."""
-    total = sum(row_counts)
-    if int(rows.shape[0]) != total:
-        raise ValueError(f"MiniMax H3 {field_name} has {int(rows.shape[0])} rows, expected {total}")
-    outputs: list[torch.Tensor] = []
-    offset = 0
-    for count in row_counts:
-        outputs.append(rows[offset : offset + count])
-        offset += count
-    return outputs
-
-
 __all__ = [
     "minimax_h3_batched_forward_kwargs",
-    "minimax_h3_split_rows",
 ]

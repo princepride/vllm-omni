@@ -62,9 +62,14 @@ from .denoise_loop import (
     MiniMaxH3DenoiseBranch,
     minimax_h3_denoise_loop,
     minimax_h3_prepare_denoise_rows,
+    minimax_h3_publish_denoise_progress,
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
-from .minimax_h3_transformer import MiniMaxH3DiTModel
+from .minimax_h3_transformer import (
+    MINIMAX_H3_PACKED_BATCH_BACKENDS,
+    MiniMaxH3Attention,
+    MiniMaxH3DiTModel,
+)
 from .packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
@@ -95,7 +100,7 @@ from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
 )
-from .step_batch import minimax_h3_batched_forward_kwargs, minimax_h3_split_rows
+from .step_batch import minimax_h3_batched_forward_kwargs
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_align_frame_count,
@@ -181,6 +186,7 @@ def _resolve_minimax_h3_model_root(
         )
     )
 
+
 # Keys of ``_prepare_request_inputs`` that feed ``diffuse`` / ``_build_denoise_inputs``.
 _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "task",
@@ -226,10 +232,6 @@ def _minimax_h3_step_schedule(state: StepRequestState) -> dict[str, float]:
     step = int(state.step_index)
     sigmas_video = state.extra[_STEP_SIGMAS_VIDEO]
     sigmas_audio = state.extra[_STEP_SIGMAS_AUDIO]
-    if step < 0 or step + 1 >= len(sigmas_video):
-        raise ValueError(
-            f"MiniMax H3 request {state.request_id} has no step {step} in a {len(sigmas_video) - 1}-step schedule"
-        )
     sigma_video = float(sigmas_video[step])
     sigma_audio = float(sigmas_audio[step])
     t_video = 1.0 - sigma_video
@@ -623,9 +625,6 @@ class MiniMaxH3Pipeline(
         "denoise_step",
         "post_decode",
     ]
-    # Attention backends that honor the packed ``cu_seqlens`` metadata, and can
-    # therefore keep one document per request in a step-mode batch.
-    _PACKED_BATCH_BACKENDS: ClassVar[frozenset[str]] = frozenset({"FLASH_ATTN"})
     dummy_run_num_frames: ClassVar[int] = 0
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
@@ -2008,27 +2007,19 @@ class MiniMaxH3Pipeline(
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _require_branch(state: StepRequestState) -> MiniMaxH3DenoiseBranch:
-        branch = state.extra.get(_STEP_BRANCH)
-        if branch is None:
-            raise ValueError(f"MiniMax H3 request {state.request_id} has no packed layout; prepare_encode did not run")
-        return branch
+    def _packed_batch_supported(transformer: MiniMaxH3DiTModel) -> bool:
+        """Whether every attention in this DiT honors multi-document cu_seqlens.
 
-    @staticmethod
-    def _require_latents(state: StepRequestState) -> torch.Tensor:
-        if state.latents is None:
-            raise ValueError(f"MiniMax H3 request {state.request_id} has no video rows")
-        return state.latents
-
-    def _packed_batch_supported(self) -> bool:
-        """Whether the resolved attention backend honors multi-document cu_seqlens."""
-        try:
-            attention = self.transformer.blocks[0].attn.attention
-        except (AttributeError, IndexError):
-            return False
-        backend = getattr(attention, "attn_backend", None)
-        get_name = getattr(backend, "get_name", None)
-        return callable(get_name) and get_name() in self._PACKED_BATCH_BACKENDS
+        A packed batch is only isolated if *all* of them do: the token refiner
+        runs under its own attention role and can resolve to a different backend
+        from the DiT blocks.
+        """
+        backends = {
+            module.attention.attn_backend.get_name()
+            for module in transformer.modules()
+            if isinstance(module, MiniMaxH3Attention)
+        }
+        return bool(backends) and backends <= MINIMAX_H3_PACKED_BATCH_BACKENDS
 
     def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
         """Run every request-level stage once and seed the per-request step state."""
@@ -2058,12 +2049,10 @@ class MiniMaxH3Pipeline(
 
         sigmas_video = inputs["sigmas_video"]
         sigmas_audio = inputs["sigmas_audio"]
-        if len(sigmas_video) != len(sigmas_audio):
-            raise ValueError("video/audio sigma schedules must have equal length")
         if len(sigmas_video) < 2:
-            raise ValueError(
-                f"MiniMax H3 step execution needs at least 2 sigma points, got {len(sigmas_video)}; "
-                "raise num_inference_steps."
+            raise OmniClientError(
+                f"MiniMax H3 step execution needs at least one denoise step, got num_inference_steps="
+                f"{len(sigmas_video) - 1}"
             )
 
         branch = inputs["branch"]
@@ -2093,7 +2082,7 @@ class MiniMaxH3Pipeline(
         state.extra.update(
             {
                 _STEP_BRANCH: branch,
-                _STEP_TRANSFORMER: self._transformer_for_task(context.get("task", "t2va")),
+                _STEP_TRANSFORMER: self._transformer_for_task(context["task"]),
                 _STEP_AUDIO_ROWS: audio_rows,
                 _STEP_COND_ANCHOR: cond_anchor,
                 _STEP_AUDIO_ANCHOR: audio_anchor,
@@ -2127,17 +2116,22 @@ class MiniMaxH3Pipeline(
         """
         del kwargs
         batch_states = list(states if states is not None else input_batch.states)
-        if not batch_states:
-            raise ValueError("MiniMax H3 denoise_step received an empty batch")
 
-        branches = [self._require_branch(state) for state in batch_states]
-        video_rows = [self._require_latents(state) for state in batch_states]
+        branches = [state.extra[_STEP_BRANCH] for state in batch_states]
+        video_rows = [state.latents for state in batch_states]
         audio_rows = [state.extra[_STEP_AUDIO_ROWS] for state in batch_states]
         schedules = [_minimax_h3_step_schedule(state) for state in batch_states]
-        transformers = [state.extra.get(_STEP_TRANSFORMER, self.transformer) for state in batch_states]
+        transformers = [state.extra[_STEP_TRANSFORMER] for state in batch_states]
         mixed_transformers = len({id(transformer) for transformer in transformers}) > 1
 
-        if len(batch_states) > 1 and (not self._packed_batch_supported() or mixed_transformers):
+        # Both execution modes must publish denoise progress for step-gated
+        # attention features. Requests can differ in both step index and sigma
+        # schedule, so a batch that is not at one single point has nothing to
+        # publish and those gates stay dense -- which is their safe default.
+        progress = {(state.step_index, schedule["sigma_video"]) for state, schedule in zip(batch_states, schedules)}
+        minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None)))
+
+        if len(batch_states) > 1 and (mixed_transformers or not self._packed_batch_supported(transformers[0])):
             if mixed_transformers:
                 logger.warning_once(
                     "MiniMax H3 step batch contains requests for different task-specific DiTs; "
@@ -2146,8 +2140,9 @@ class MiniMaxH3Pipeline(
                 )
             else:
                 logger.warning_once(
-                    "MiniMax H3 step batching needs a FlashAttention backend to isolate packed requests; "
-                    "running %d requests one forward at a time.",
+                    "MiniMax H3 step batching needs every attention on a %s backend to isolate packed "
+                    "requests; running %d requests one forward at a time.",
+                    "/".join(sorted(MINIMAX_H3_PACKED_BATCH_BACKENDS)),
                     len(batch_states),
                 )
             video_parts: list[torch.Tensor] = []
@@ -2186,32 +2181,23 @@ class MiniMaxH3Pipeline(
         # The shared contract carries one velocity tensor per step, and audio rows
         # are a different width than video rows, so hand the audio branch to
         # step_scheduler() through request-private state.
-        for state, request_audio in zip(
-            batch_states,
-            minimax_h3_split_rows(
-                audio_velocity,
-                [int(branch.audio_pos.shape[0]) for branch in branches],
-                field_name="audio velocity",
-            ),
-            strict=True,
-        ):
+        audio_parts_by_request = torch.split(audio_velocity, [int(branch.audio_pos.shape[0]) for branch in branches])
+        for state, request_audio in zip(batch_states, audio_parts_by_request, strict=True):
             state.extra[_STEP_AUDIO_NOISE_PRED] = request_audio
         return video_velocity
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
         """Apply one Euler-eta0 update to this request's video and audio rows."""
         del kwargs
-        if noise_pred is None:
-            raise ValueError(f"MiniMax H3 step_scheduler got no video velocity for request {state.request_id}")
-        audio_noise_pred = state.extra.pop(_STEP_AUDIO_NOISE_PRED, None)
-        if audio_noise_pred is None:
-            raise ValueError(f"MiniMax H3 step_scheduler got no audio velocity for request {state.request_id}")
+        # denoise_step() stages the audio half of this step's velocity; popping
+        # it keeps a second step_scheduler() call from reusing a stale one.
+        audio_noise_pred = state.extra.pop(_STEP_AUDIO_NOISE_PRED)
 
-        branch = self._require_branch(state)
+        branch = state.extra[_STEP_BRANCH]
         schedule = _minimax_h3_step_schedule(state)
         update = branch.update_mask_dev
         audio_update = branch.audio_update_mask_dev
-        video_rows = self._require_latents(state)
+        video_rows = state.latents
         audio_rows = state.extra[_STEP_AUDIO_ROWS]
         cond_anchor = state.extra[_STEP_COND_ANCHOR]
         audio_anchor = state.extra[_STEP_AUDIO_ANCHOR]
@@ -2256,11 +2242,10 @@ class MiniMaxH3Pipeline(
     def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
         """Unpack the denoised rows and run the joint video/audio VAE decode."""
         del kwargs
-        branch = self._require_branch(state)
         shape = state.extra[_STEP_SHAPE]
         video_latent, audio_latent = self._unpack_denoised_rows(
-            branch,
-            self._require_latents(state),
+            state.extra[_STEP_BRANCH],
+            state.latents,
             state.extra[_STEP_AUDIO_ROWS],
             latent_t=shape["latent_t"],
             latent_h=shape["latent_h"],

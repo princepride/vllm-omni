@@ -15,7 +15,10 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import (
+    set_forward_context_denoise_step_idx,
+    set_forward_context_denoise_timestep,
+)
 
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
@@ -29,6 +32,17 @@ MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 # (24 * 1 * 2 * 2 = 96); audio rows carry the 32-dim audio latent.
 MINIMAX_H3_VIDEO_ROW_WIDTH = 96
 MINIMAX_H3_AUDIO_ROW_WIDTH = 32
+
+
+def minimax_h3_publish_denoise_progress(step: int | None, sigma_video: float | None) -> None:
+    """Publish denoise progress for step-gated attention features.
+
+    Both execution modes must publish the same pair: the step index drives the
+    dense warmup of RAINFUSION_ATTN, and the normalized descending timestep
+    drives the TRTLLM_ATTN skip gate, which stays dense while it is unset.
+    """
+    set_forward_context_denoise_step_idx(step)
+    set_forward_context_denoise_timestep(sigma_video)
 
 
 class MiniMaxH3DenoiseBranch:
@@ -93,6 +107,10 @@ class MiniMaxH3DenoiseBranch:
             "packed_seq_params": {
                 "cu_seqlens_q": cu.to(device),
                 "max_seqlen_q": self.used_len,
+                # One request: valid rows are a prefix, so attention may use a
+                # KV prefix length or a 1-D pad mask. See step_batch for the
+                # co-batched layout, where neither can describe the valid rows.
+                "num_requests": 1,
             },
             "refiner_packed_seq_params": {
                 "cu_seqlens_q": torch.tensor([0, text_len, text_len], dtype=torch.int32, device=device),
@@ -238,14 +256,13 @@ def minimax_h3_denoise_loop(
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
-            # Publish the step index so step-gated attention features (e.g. the
-            # dense warmup of RAINFUSION_ATTN) can see where we are.
-            set_forward_context_denoise_step_idx(step)
             s_v, s_v_next = sigmas_video[step], sigmas_video[step + 1]
             s_a, s_a_next = sigmas_audio[step], sigmas_audio[step + 1]
-            if on_step_start is not None:
-                # Attention gates use the scheduler-style descending timestep.
-                on_step_start(step, s_v, s_a)
+            # Publish where we are so step-gated attention features (the dense
+            # warmup of RAINFUSION_ATTN, the timestep gate of TRTLLM_ATTN) can
+            # see it. Gates use the scheduler-style descending timestep, which
+            # for a rectified-flow schedule is the video sigma.
+            minimax_h3_publish_denoise_progress(step, s_v)
             t_v, t_a = 1.0 - s_v, 1.0 - s_a
             imgvid_cond_t = max(t_v, float(imgvid_cond_noise_aug_for_inference))
             audio_ref_cond_t = max(t_a, float(audio_cond_noise_aug_for_inference))
@@ -286,10 +303,10 @@ def minimax_h3_denoise_loop(
             audio_rows[audio_update] = new_audio
             if audio_anchor is not None:
                 audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
-            if on_step_end is not None:
-                on_step_end(step, video_rows, audio_rows)
+            if on_step is not None:
+                on_step(step, video_rows, audio_rows)
 
-    set_forward_context_denoise_step_idx(None)
+    minimax_h3_publish_denoise_progress(None, None)
     return video_rows, audio_rows
 
 
@@ -301,4 +318,5 @@ __all__ = [
     "MiniMaxH3DenoiseBranch",
     "minimax_h3_denoise_loop",
     "minimax_h3_prepare_denoise_rows",
+    "minimax_h3_publish_denoise_progress",
 ]
