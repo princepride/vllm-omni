@@ -826,6 +826,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             offset = offset + row_num
                         except Exception as per_req_exc:
                             offset = offset + row_num
+                            self.state_cache.pop(req.request_id, None)
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
                                 req.request_id,

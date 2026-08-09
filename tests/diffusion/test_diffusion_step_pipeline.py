@@ -121,6 +121,15 @@ class _PerRequestErrorStepPipeline(_StepPipeline):
             raise OmniClientError("invalid scheduler input")
         return super().step_scheduler(state, noise_pred, **kwargs)
 
+    def post_decode(self, state, **kwargs):
+        if state.prompt == "fail-decode":
+            raise OmniClientError(
+                "invalid decode input",
+                status_code=422,
+                error_type="UnprocessableEntityError",
+            )
+        return super().post_decode(state, **kwargs)
+
 
 class _ProfilingStepPipeline(_StepPipeline):
     enable_diffusion_pipeline_profiler = True
@@ -705,6 +714,151 @@ class TestRunner:
         assert output.result.error == "invalid scheduler input"
         assert output.result.error_status_code == 400
         assert output.result.error_type == "BadRequestError"
+
+    def test_prepare_error_does_not_interrupt_cached_request(self, monkeypatch):
+        runner = _make_runner()
+        runner.pipeline = _PerRequestErrorStepPipeline()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        good_req = _make_step_request(num_inference_steps=2)
+        good_req.request_id = "req-good"
+        first = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_scheduler_output(good_req, request_id="req-good"),
+        )
+        assert first.get_request_output("req-good").finished is False
+
+        bad_req = _make_step_request()
+        bad_req.request_id = "req-bad"
+        bad_req.prompt = "fail-prepare"
+        mixed_output = DiffusionSchedulerOutput(
+            step_id=1,
+            scheduled_new_reqs=[NewRequestData(request_id="req-bad", req=bad_req)],
+            scheduled_cached_reqs=CachedRequestData(request_ids=["req-good"]),
+            finished_req_ids=set(),
+            num_running_reqs=2,
+            num_waiting_reqs=0,
+        )
+
+        result = DiffusionModelRunner.execute_stepwise(runner, mixed_output)
+
+        assert result.request_ids == ["req-bad", "req-good"]
+        bad_output = result.get_request_output("req-bad")
+        assert bad_output.finished is True
+        assert bad_output.result.error_status_code == 422
+        good_output = result.get_request_output("req-good")
+        assert good_output.finished is True
+        assert torch.equal(good_output.result.output, torch.tensor([2.0]))
+        assert runner.state_cache == {}
+        assert runner.pipeline.denoise_calls == 2
+
+    def test_scheduler_error_isolated_from_healthy_sibling(self, monkeypatch):
+        runner = _make_runner()
+        runner.pipeline = _PerRequestErrorStepPipeline()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        bad_req = _make_step_request(num_inference_steps=2)
+        bad_req.request_id = "req-bad"
+        bad_req.prompt = "fail-scheduler"
+        good_req = _make_step_request(num_inference_steps=2)
+        good_req.request_id = "req-good"
+
+        first = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_batch_scheduler_output([bad_req, good_req]),
+        )
+
+        bad_output = first.get_request_output("req-bad")
+        assert bad_output.finished is True
+        assert bad_output.result.error == "invalid scheduler input"
+        good_output = first.get_request_output("req-good")
+        assert good_output.finished is False
+        assert good_output.step_index == 1
+        assert set(runner.state_cache) == {"req-good"}
+
+        second = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_cached_scheduler_output(request_id="req-good", step_id=1),
+        )
+        good_output = second.get_request_output("req-good")
+        assert good_output.finished is True
+        assert torch.equal(good_output.result.output, torch.tensor([2.0]))
+        assert runner.state_cache == {}
+        assert runner.pipeline.denoise_calls == 2
+        assert runner.pipeline.scheduler_calls == 2
+
+    def test_decode_error_isolated_from_healthy_sibling(self, monkeypatch):
+        runner = _make_runner()
+        runner.pipeline = _PerRequestErrorStepPipeline()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        bad_req = _make_step_request(num_inference_steps=1)
+        bad_req.request_id = "req-bad"
+        bad_req.prompt = "fail-decode"
+        good_req = _make_step_request(num_inference_steps=1)
+        good_req.request_id = "req-good"
+
+        first = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_batch_scheduler_output([bad_req, good_req]),
+        )
+        assert first.get_request_output("req-bad").finished is False
+        assert first.get_request_output("req-good").finished is False
+
+        second = DiffusionModelRunner.execute_stepwise(
+            runner,
+            DiffusionSchedulerOutput(
+                step_id=1,
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=CachedRequestData(request_ids=["req-bad", "req-good"]),
+                finished_req_ids=set(),
+                num_running_reqs=2,
+                num_waiting_reqs=0,
+            ),
+        )
+
+        bad_output = second.get_request_output("req-bad")
+        assert bad_output.finished is True
+        assert bad_output.result.error == "invalid decode input"
+        assert bad_output.result.error_status_code == 422
+        good_output = second.get_request_output("req-good")
+        assert good_output.finished is True
+        assert torch.equal(good_output.result.output, torch.tensor([2.0]))
+        assert runner.state_cache == {}
+        assert runner.pipeline.scheduler_calls == 4
+        assert runner.pipeline.decode_calls == 1
+
+    def test_failed_request_id_can_be_resubmitted(self, monkeypatch):
+        runner = _make_runner()
+        runner.pipeline = _PerRequestErrorStepPipeline()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        bad_req = _make_step_request(num_inference_steps=1)
+        bad_req.prompt = "fail-prepare"
+        failed = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_scheduler_output(bad_req),
+        )
+        assert failed.get_request_output("req-1").finished is True
+        assert runner.state_cache == {}
+
+        retry_req = _make_step_request(num_inference_steps=1)
+        retry_req.prompt = "valid"
+        first_retry = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_scheduler_output(retry_req, step_id=1),
+        )
+        assert first_retry.get_request_output("req-1").finished is False
+
+        retried = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_cached_scheduler_output(step_id=2),
+        )
+        retry_output = retried.get_request_output("req-1")
+        assert retry_output.finished is True
+        assert retry_output.result.error is None
+        assert torch.equal(retry_output.result.output, torch.tensor([2.0]))
+        assert runner.state_cache == {}
 
     def test_receives_kv_payload_before_prepare_encode(self, monkeypatch):
         runner = _make_runner()
