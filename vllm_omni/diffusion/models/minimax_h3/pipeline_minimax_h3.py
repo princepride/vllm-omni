@@ -2170,6 +2170,20 @@ class MiniMaxH3Pipeline(
                 "the resident-layer window spans a whole denoise loop, so per-step streaming would "
                 "reload the DiT every step. Drop --step-execution or --enable-distributed-layerwise-offload."
             )
+        # Request-scoped Cache-DiT (quality=high) mutates hook state on the
+        # shared transformer rather than on ``StepRequestState``. In step mode
+        # two requests can interleave denoise steps, or be co-batched into a
+        # single forward, and the second one would then re-enter the DiT with
+        # cache buffers shaped for the first. Reject the profile here rather
+        # than let it corrupt outputs at runtime; startup-configured Cache-DiT
+        # is already blocked in ``DiffusionModelRunner.execute_stepwise``.
+        if getattr(state.sampling, "quality", None) == "high":
+            raise OmniClientError(
+                "MiniMax H3 step execution does not support the high-quality Cache-DiT profile "
+                "(quality=high); its hooks live on the shared transformer, so interleaved or "
+                "co-batched requests would reuse incompatible cache state. Drop --step-execution "
+                "or omit quality=high."
+            )
         prompt, multi_modal_data = self._extract_prompt(state.prompt)
         context = self._prepare_request_inputs(
             prompt=prompt,

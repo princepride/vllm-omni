@@ -546,6 +546,21 @@ def test_prepare_encode_rejects_request_mode_only_features():
         dlo_pipeline.prepare_encode(single_output)
 
 
+def test_prepare_encode_rejects_high_quality_cache_dit():
+    """quality=high installs a transformer-scoped Cache-DiT profile that
+    would leak across interleaved or co-batched step-mode requests."""
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.errors import OmniClientError
+
+    state = StepRequestState(
+        request_id="req-hi",
+        sampling=SimpleNamespace(num_outputs_per_prompt=1, quality="high"),
+        prompt="a prompt",
+    )
+    with pytest.raises(OmniClientError, match="quality=high"):
+        _step_pipeline(_SegmentMeanModel()).prepare_encode(state)
+
+
 def _fake_attention_module(*, use_ring: bool, backend: str = "FLASH_ATTN"):
     """Build a bare MiniMaxH3Attention with the two attributes ``_packed_batch_supported`` reads."""
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
