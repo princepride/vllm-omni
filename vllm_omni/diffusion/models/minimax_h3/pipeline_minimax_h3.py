@@ -49,7 +49,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
 )
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.errors import OmniClientError
+from vllm_omni.errors import OmniClientError, client_error_from_metadata
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -497,6 +497,58 @@ def _dit_rank_world() -> tuple[Any, int, int]:
         return None, 0, 1
     group = get_dit_group()
     return group, dist.get_rank(group), dist.get_world_size(group)
+
+
+def _broadcast_rank0_exception(exc: Exception | None) -> None:
+    """Synchronize a rank-0-only exception across every DiT rank.
+
+    H3 reference-video preparation runs only on rank 0; the other DiT ranks
+    return ``None`` without touching disk. When rank 0 raises inside that
+    path it exits :meth:`prepare_encode` before reaching the downstream
+    ``dist.broadcast`` calls, and non-zero ranks then hang on those
+    collectives forever. Every rank calls this helper right after the
+    rank-0-only work, before any subsequent collective, so all ranks either
+    raise the same error together or all continue.
+    """
+    group, rank, world_size = _dit_rank_world()
+    if world_size == 1:
+        if exc is not None:
+            raise exc
+        return
+    if rank == 0:
+        if exc is None:
+            payload: list[Any] = [None]
+        else:
+            payload = [
+                {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "status_code": getattr(exc, "status_code", None),
+                    "error_type": getattr(exc, "error_type", None),
+                }
+            ]
+    else:
+        payload = [None]
+    dist.broadcast_object_list(payload, src=0, group=group)
+    info = payload[0]
+    if info is None:
+        return
+    if rank == 0:
+        assert exc is not None
+        raise exc
+    # Rebuild a matching client-facing error on non-zero ranks so the runner's
+    # per-request try/except records the same 4xx status as rank 0. The exact
+    # subclass need not survive the wire; the message and status suffice.
+    status_code = info.get("status_code")
+    error_type = info.get("error_type")
+    message = f"[rank 0] {info['type']}: {info['message']}"
+    if status_code is not None:
+        raise client_error_from_metadata(
+            message,
+            status_code=int(status_code),
+            error_type=error_type,
+        )
+    raise RuntimeError(message)
 
 
 def _broadcast_tensor(
@@ -1861,12 +1913,24 @@ class MiniMaxH3Pipeline(
             video_count = 0
             if raw_videos is not None:
                 video_count = len(raw_videos) if isinstance(raw_videos, (list, tuple)) else 1
-                prepared_videos = self._prepare_reference_videos(
-                    raw_videos,
-                    target_frame_count=num_frames,
-                    workdir=workdir,
-                    start_time_seconds=extra.get("start_time_seconds"),
-                )
+                # File-based reference-video prep runs only on rank 0; other
+                # ranks return None without touching disk. If rank 0 raises
+                # (e.g. invalid file, unsupported codec) it must not exit
+                # ``prepare_encode`` before the downstream broadcasts below --
+                # non-zero ranks would then deadlock on them forever. Capture
+                # the exception here and let every rank agree on the outcome
+                # before starting any subsequent collective.
+                prep_error: Exception | None = None
+                try:
+                    prepared_videos = self._prepare_reference_videos(
+                        raw_videos,
+                        target_frame_count=num_frames,
+                        workdir=workdir,
+                        start_time_seconds=extra.get("start_time_seconds"),
+                    )
+                except Exception as exc:
+                    prep_error = exc
+                _broadcast_rank0_exception(prep_error)
                 has_audio_tensor = torch.zeros(
                     video_count,
                     dtype=torch.long,

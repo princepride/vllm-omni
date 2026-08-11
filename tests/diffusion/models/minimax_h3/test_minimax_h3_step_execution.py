@@ -598,6 +598,65 @@ def test_packed_batch_supported_rejects_unsupported_backend():
     assert MiniMaxH3Pipeline._packed_batch_supported(unsupported) is False
 
 
+def test_broadcast_rank0_exception_single_rank_reraises():
+    """Single-rank execution has no group; the helper just reraises."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _broadcast_rank0_exception,
+    )
+    from vllm_omni.errors import OmniClientError
+
+    _broadcast_rank0_exception(None)
+    with pytest.raises(OmniClientError, match="bad ref"):
+        _broadcast_rank0_exception(OmniClientError("bad ref"))
+
+
+def test_broadcast_rank0_exception_propagates_to_non_zero_ranks(monkeypatch):
+    """A rank-0 error becomes a matching client error on every other DiT rank."""
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.errors import OmniClientError
+
+    def fake_rank_world(rank):
+        return lambda: (object(), rank, 4)
+
+    def make_broadcast(rank0_payload):
+        """Simulate ``dist.broadcast_object_list``: everyone gets rank-0's list."""
+
+        def fake_broadcast(payload_list, *, src, group):
+            payload_list[0] = rank0_payload
+
+        return fake_broadcast
+
+    # Rank 0 error path: helper reraises the exact exception locally.
+    monkeypatch.setattr(mod, "_dit_rank_world", fake_rank_world(0))
+    err = OmniClientError("invalid reference-video file", status_code=422, error_type="UnprocessableEntityError")
+    rank0_payload = {
+        "type": type(err).__name__,
+        "message": str(err),
+        "status_code": err.status_code,
+        "error_type": err.error_type,
+    }
+    monkeypatch.setattr(mod.dist, "broadcast_object_list", make_broadcast(rank0_payload))
+    with pytest.raises(OmniClientError) as rank0_info:
+        mod._broadcast_rank0_exception(err)
+    assert rank0_info.value is err
+
+    # Non-zero rank sees the rank-0 payload and raises a client error with the
+    # same 4xx status; this must happen BEFORE any downstream collective, so
+    # the runner's per-request try/except records a matching error.
+    monkeypatch.setattr(mod, "_dit_rank_world", fake_rank_world(2))
+    with pytest.raises(OmniClientError) as rank2_info:
+        mod._broadcast_rank0_exception(None)
+    assert rank2_info.value.status_code == 422
+    assert rank2_info.value.error_type == "UnprocessableEntityError"
+    assert "invalid reference-video file" in str(rank2_info.value)
+
+    # Success on rank 0 → all ranks return cleanly.
+    monkeypatch.setattr(mod.dist, "broadcast_object_list", make_broadcast(None))
+    for rank in (0, 1, 3):
+        monkeypatch.setattr(mod, "_dit_rank_world", fake_rank_world(rank))
+        mod._broadcast_rank0_exception(None)
+
+
 def _batched_kwargs(branches, videos, audios):
     from vllm_omni.diffusion.models.minimax_h3.step_batch import minimax_h3_batched_forward_kwargs
 

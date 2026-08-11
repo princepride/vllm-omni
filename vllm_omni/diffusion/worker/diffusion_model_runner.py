@@ -71,6 +71,31 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _dit_any_rank_failed(local_failed: bool) -> bool:
+    """All-reduce a per-request failure flag across the DiT process group.
+
+    Every DiT rank must reach this point in lockstep; the caller wraps
+    ``pipeline.prepare_encode`` so both the success and the exception paths
+    call the helper. In single-rank execution this collapses to the local
+    flag with no collectives issued.
+    """
+    if not torch.distributed.is_initialized():
+        return local_failed
+    try:
+        from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
+
+        group = get_dit_group()
+    except (AssertionError, ImportError):
+        group = None
+    if group is None:
+        return local_failed
+    signal = torch.tensor(1 if local_failed else 0, dtype=torch.int32)
+    if current_omni_platform.is_available():
+        signal = signal.to(device=current_omni_platform.device_type)
+    torch.distributed.all_reduce(signal, op=torch.distributed.ReduceOp.MAX, group=group)
+    return bool(signal.item())
+
+
 def _normalize_pipeline_outputs(
     outputs: object,
     *,
@@ -712,6 +737,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if state.request_id in new_request_ids:
                 self._initialize_generator(state.sampling)
                 clear_pipeline_stage_durations(self.pipeline)
+                per_req_exc: BaseException | None = None
                 try:
                     # encode
                     self.pipeline.prepare_encode(state)
@@ -719,13 +745,25 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         state,
                         consume_pipeline_stage_durations(self.pipeline),
                     )
-                except Exception as per_req_exc:
+                except Exception as exc:
+                    per_req_exc = exc
+                # Pipelines that do rank-0-only work (e.g. MiniMax H3
+                # reference-video prep) must broadcast per-request failures
+                # internally so downstream collectives stay in step; even so,
+                # cross-check that every DiT rank agrees so a rank-local error
+                # (or a future pipeline that omits the guard) does not leave
+                # the process group half-way through a new request.
+                if _dit_any_rank_failed(per_req_exc is not None):
                     self.state_cache.pop(state.request_id, None)
+                    if per_req_exc is None:
+                        per_req_exc = RuntimeError(
+                            f"Stepwise preparation failed on another DiT rank for {state.request_id}"
+                        )
                     logger.error(
                         "Stepwise request preparation failed for %s: %s",
                         state.request_id,
                         per_req_exc,
-                        exc_info=True,
+                        exc_info=isinstance(per_req_exc, Exception),
                     )
                     error_outputs.append(
                         RunnerOutput(

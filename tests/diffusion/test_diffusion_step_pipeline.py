@@ -860,6 +860,52 @@ class TestRunner:
         assert torch.equal(retry_output.result.output, torch.tensor([2.0]))
         assert runner.state_cache == {}
 
+    def test_prepare_error_on_other_rank_is_isolated_via_all_reduce(self, monkeypatch):
+        """P1-B: rank-0-only pipeline work (e.g. H3 reference-video prep)
+        can raise on rank 0 while non-zero ranks return cleanly and then hang
+        on a downstream ``dist.broadcast``. Beyond the pipeline-side guard,
+        the runner all-reduces a per-request failure flag across the DiT
+        group so a rank that ``prepare_encode`` returned cleanly on still
+        skips the request and does not enter the denoise step batch.
+        """
+        runner = _make_runner()
+        runner.pipeline = _StepPipeline()  # locally always succeeds
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        # Simulate a peer DiT rank having reported failure. We patch the
+        # helper directly (rather than ``torch.distributed`` broadly) because
+        # ``execute_stepwise`` also queries ``torch.distributed.get_rank``.
+        monkeypatch.setattr(
+            model_runner_module,
+            "_dit_any_rank_failed",
+            lambda local_failed: True,
+        )
+
+        req = _make_step_request(num_inference_steps=1)
+        result = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_scheduler_output(req),
+        )
+
+        output = result.get_request_output("req-1")
+        assert output.finished is True
+        assert output.result is not None
+        assert output.result.error is not None
+        assert "another DiT rank" in output.result.error
+        # A rank that skipped the request must not have driven a denoise step.
+        assert runner.pipeline.denoise_calls == 0
+        assert runner.state_cache == {}
+
+    def test_dit_any_rank_failed_short_circuits_without_group(self):
+        """When ``torch.distributed`` is not initialized, the helper returns
+        the local flag unchanged and issues no collectives."""
+
+        assert not torch.distributed.is_initialized(), (
+            "test env unexpectedly has an initialized process group; disable this test"
+        )
+        assert model_runner_module._dit_any_rank_failed(False) is False
+        assert model_runner_module._dit_any_rank_failed(True) is True
+
     def test_receives_kv_payload_before_prepare_encode(self, monkeypatch):
         runner = _make_runner()
         captured: dict[str, object] = {}
