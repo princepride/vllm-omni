@@ -546,6 +546,58 @@ def test_prepare_encode_rejects_request_mode_only_features():
         dlo_pipeline.prepare_encode(single_output)
 
 
+def _fake_attention_module(*, use_ring: bool, backend: str = "FLASH_ATTN"):
+    """Build a bare MiniMaxH3Attention with the two attributes ``_packed_batch_supported`` reads."""
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
+
+    attn = object.__new__(MiniMaxH3Attention)
+    attn.attention = SimpleNamespace(
+        attn_backend=SimpleNamespace(get_name=lambda: backend),
+        use_ring=use_ring,
+    )
+    return attn
+
+
+class _FakeTransformer:
+    """The minimal ``modules()`` protocol ``_packed_batch_supported`` walks."""
+
+    def __init__(self, attentions):
+        self._attentions = list(attentions)
+
+    def modules(self):
+        return iter([self, *self._attentions])
+
+
+def test_packed_batch_supported_rejects_ring_attention():
+    """Ring dispatch ignores packed cu_seqlens, so co-batching is unsafe.
+
+    ``ring_degree > 1`` sets ``Attention.use_ring`` on every layer regardless
+    of the resolved backend name; without this check, ``denoise_step()``
+    would still pack multiple requests and attention would cross request
+    boundaries because the ring kernel does not consume ``cu_seqlens``.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    ring_transformer = _FakeTransformer(
+        [
+            _fake_attention_module(use_ring=False, backend="FLASH_ATTN"),
+            _fake_attention_module(use_ring=True, backend="FLASH_ATTN"),
+        ]
+    )
+    non_ring_transformer = _FakeTransformer([_fake_attention_module(use_ring=False, backend="FLASH_ATTN")])
+
+    assert MiniMaxH3Pipeline._packed_batch_supported(ring_transformer) is False
+    assert MiniMaxH3Pipeline._packed_batch_supported(non_ring_transformer) is True
+
+
+def test_packed_batch_supported_rejects_unsupported_backend():
+    """A backend outside ``MINIMAX_H3_PACKED_BATCH_BACKENDS`` still disqualifies packing."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    unsupported = _FakeTransformer([_fake_attention_module(use_ring=False, backend="XFORMERS")])
+    assert MiniMaxH3Pipeline._packed_batch_supported(unsupported) is False
+
+
 def _batched_kwargs(branches, videos, audios):
     from vllm_omni.diffusion.models.minimax_h3.step_batch import minimax_h3_batched_forward_kwargs
 

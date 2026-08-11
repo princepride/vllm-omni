@@ -2074,14 +2074,19 @@ class MiniMaxH3Pipeline(
 
         A packed batch is only isolated if *all* of them do: the token refiner
         runs under its own attention role and can resolve to a different backend
-        from the DiT blocks.
+        from the DiT blocks. Ring sequence parallelism dispatches through
+        ``RingParallelAttention``, whose kernels ignore the packed
+        ``cu_seqlens`` metadata regardless of the configured backend; packing
+        multiple requests under ring would let attention cross document
+        boundaries, so any layer running ring disqualifies the batch.
         """
-        backends = {
-            module.attention.attn_backend.get_name()
-            for module in transformer.modules()
-            if isinstance(module, MiniMaxH3Attention)
-        }
-        return bool(backends) and backends <= MINIMAX_H3_PACKED_BATCH_BACKENDS
+        attentions = [module for module in transformer.modules() if isinstance(module, MiniMaxH3Attention)]
+        if not attentions:
+            return False
+        if any(getattr(module.attention, "use_ring", False) for module in attentions):
+            return False
+        backends = {module.attention.attn_backend.get_name() for module in attentions}
+        return backends <= MINIMAX_H3_PACKED_BATCH_BACKENDS
 
     def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
         """Run every request-level stage once and seed the per-request step state."""
@@ -2198,6 +2203,17 @@ class MiniMaxH3Pipeline(
                 logger.warning_once(
                     "MiniMax H3 step batch contains requests for different task-specific DiTs; "
                     "running %d requests one forward at a time.",
+                    len(batch_states),
+                )
+            elif any(
+                getattr(getattr(module, "attention", None), "use_ring", False)
+                for module in transformers[0].modules()
+                if isinstance(module, MiniMaxH3Attention)
+            ):
+                logger.warning_once(
+                    "MiniMax H3 step batching is disabled when ring attention is active: "
+                    "the ring kernels ignore packed cu_seqlens and would attend across request "
+                    "boundaries. Running %d requests one forward at a time.",
                     len(batch_states),
                 )
             else:
