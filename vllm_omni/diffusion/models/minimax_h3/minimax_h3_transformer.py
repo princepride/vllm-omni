@@ -45,11 +45,25 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Backends that attend by ``cu_seqlens`` and can therefore keep one document per
-# request in a co-batched packed sequence. Every other backend must run one
-# request per forward; the pipeline gates on this set before packing, and
-# ``_run_packed_attention`` enforces it.
-MINIMAX_H3_PACKED_BATCH_BACKENDS = frozenset({"FLASH_ATTN"})
+
+# Packed multi-request forwards require the attention backend to actually
+# consume cu_seqlens as a block-diagonal plan (not a padding-mask rebuild that
+# spans the full packed row). The pipeline gates on this capability before
+# packing, and ``_run_packed_attention`` re-checks it per forward; a name-only
+# gate would let FLASH_ATTN's NPU/XPU code paths through even though those
+# variants would silently attend across request boundaries.
+def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
+    """True if this attention layer keeps N-document packed boundaries.
+
+    Requires a backend advertising ``supports_multi_doc_packed_varlen`` *and*
+    that the layer is not running under ring sequence parallelism (the ring
+    kernel dispatches through its own attention that ignores the packed
+    cu_seqlens regardless of the configured backend).
+    """
+    backend = getattr(attention_layer, "attn_backend", None)
+    if backend is None or not backend.supports_multi_doc_packed_varlen():
+        return False
+    return not getattr(attention_layer, "use_ring", False)
 
 
 @dataclass
@@ -420,14 +434,19 @@ class MiniMaxH3Attention(nn.Module):
         if num_requests > 1:
             # A step-mode batch packs one document per request, so its valid
             # rows are block-diagonal rather than a prefix: neither a KV prefix
-            # length nor a 1-D key mask can describe them. Such a layout is only
-            # correct on a backend that attends by cu_seqlens.
-            backend = self.attention.attn_backend.get_name()
-            if backend not in MINIMAX_H3_PACKED_BATCH_BACKENDS:
+            # length nor a 1-D key mask can describe them. Such a layout is
+            # only correct on a backend that actually attends by cu_seqlens as
+            # a block-diagonal plan. Check the capability (not the backend
+            # name): FLASH_ATTN's NPU/XPU variants would otherwise silently
+            # fall back to a padding-mask rebuild that spans the whole packed
+            # row and attend across request boundaries.
+            if not _attention_isolates_packed_requests(self.attention):
+                backend_name = self.attention.attn_backend.get_name()
                 raise ValueError(
-                    f"MiniMax H3 packed a {num_requests}-request batch, which only "
-                    f"{sorted(MINIMAX_H3_PACKED_BATCH_BACKENDS)} can keep isolated, but this attention "
-                    f"resolved to {backend}. Run one request per forward on this backend."
+                    f"MiniMax H3 packed a {num_requests}-request batch, but the resolved "
+                    f"attention ({backend_name}, use_ring={getattr(self.attention, 'use_ring', False)}) "
+                    "does not isolate multi-document packed cu_seqlens. Run one request "
+                    "per forward on this backend."
                 )
             used = packed_total
         else:
@@ -1102,13 +1121,18 @@ class MiniMaxH3DiTModel(nn.Module):
         text_pos: torch.Tensor,
         refiner_cu_seqlens: torch.Tensor,
         refiner_max_seqlen: int,
-        num_requests: int,
         seq_len: int,
         device: torch.device,
+        num_requests: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build packed multimodal embeddings for the TP=1/SP=1 inference path.
 
         Returns (decoder_input [S, H] bf16, t_emb [M, t_dim] fp32).
+
+        ``num_requests`` defaults to a single packed request so callers that
+        pre-date the continuous-batching change (e.g. TeaCache's extractor
+        contract) do not silently miss the kwarg. ``forward()`` reads the real
+        value from ``packed_seq_params["num_requests"]``.
         """
         # Latent embedders stay fp32 in and out; their outputs are cast to the
         # bf16 sequence dtype only during indexed scattering.

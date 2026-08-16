@@ -561,13 +561,26 @@ def test_prepare_encode_rejects_high_quality_cache_dit():
         _step_pipeline(_SegmentMeanModel()).prepare_encode(state)
 
 
-def _fake_attention_module(*, use_ring: bool, backend: str = "FLASH_ATTN"):
-    """Build a bare MiniMaxH3Attention with the two attributes ``_packed_batch_supported`` reads."""
+def _fake_attention_module(
+    *,
+    use_ring: bool,
+    backend: str = "FLASH_ATTN",
+    supports_multi_doc: bool = True,
+):
+    """Build a bare MiniMaxH3Attention with the attributes ``_packed_batch_supported`` reads.
+
+    ``supports_multi_doc`` models the platform-dependent capability probe on
+    ``AttentionBackend`` (e.g. FLASH_ATTN returns True on CUDA/ROCm/MUSA and
+    False on NPU/XPU); ``backend`` remains only for logging/back-compat.
+    """
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
 
     attn = object.__new__(MiniMaxH3Attention)
     attn.attention = SimpleNamespace(
-        attn_backend=SimpleNamespace(get_name=lambda: backend),
+        attn_backend=SimpleNamespace(
+            get_name=lambda: backend,
+            supports_multi_doc_packed_varlen=lambda: supports_multi_doc,
+        ),
         use_ring=use_ring,
     )
     return attn
@@ -606,11 +619,24 @@ def test_packed_batch_supported_rejects_ring_attention():
 
 
 def test_packed_batch_supported_rejects_unsupported_backend():
-    """A backend outside ``MINIMAX_H3_PACKED_BATCH_BACKENDS`` still disqualifies packing."""
+    """A backend that does not advertise multi-doc packed varlen disqualifies packing.
+
+    Covers both a genuinely unsupported backend and the platform-dependent
+    case (e.g. FLASH_ATTN on NPU/XPU) where the name-only gate would let a
+    request through even though the resolved kernel does not isolate packed
+    cu_seqlens.
+    """
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
-    unsupported = _FakeTransformer([_fake_attention_module(use_ring=False, backend="XFORMERS")])
+    unsupported = _FakeTransformer(
+        [_fake_attention_module(use_ring=False, backend="XFORMERS", supports_multi_doc=False)]
+    )
     assert MiniMaxH3Pipeline._packed_batch_supported(unsupported) is False
+
+    flash_attn_without_isolation = _FakeTransformer(
+        [_fake_attention_module(use_ring=False, backend="FLASH_ATTN", supports_multi_doc=False)]
+    )
+    assert MiniMaxH3Pipeline._packed_batch_supported(flash_attn_without_isolation) is False
 
 
 def test_broadcast_rank0_exception_single_rank_reraises():

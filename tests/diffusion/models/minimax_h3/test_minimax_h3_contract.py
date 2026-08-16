@@ -791,7 +791,12 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
     )
 
 
-def _fake_packed_attention(backend_name: str, *, prefix_kv_slicing: bool = False):
+def _fake_packed_attention(
+    backend_name: str,
+    *,
+    prefix_kv_slicing: bool = False,
+    supports_multi_doc: bool = False,
+):
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3Attention,
     )
@@ -802,6 +807,10 @@ def _fake_packed_attention(backend_name: str, *, prefix_kv_slicing: bool = False
         @staticmethod
         def get_name() -> str:
             return backend_name
+
+        @classmethod
+        def supports_multi_doc_packed_varlen(cls) -> bool:
+            return supports_multi_doc
 
     class FakeAttention(torch.nn.Module):
         attn_backend = FakeBackend
@@ -822,7 +831,7 @@ def _fake_packed_attention(backend_name: str, *, prefix_kv_slicing: bool = False
 
 def test_packed_attention_drops_prefix_semantics_for_a_co_batched_layout():
     """A batch's valid rows are block-diagonal, so no prefix can describe them."""
-    attention = _fake_packed_attention("FLASH_ATTN")
+    attention = _fake_packed_attention("FLASH_ATTN", supports_multi_doc=True)
     q = torch.randn(12, 2, 4)
 
     attention._run_packed_attention(
@@ -842,10 +851,34 @@ def test_packed_attention_drops_prefix_semantics_for_a_co_batched_layout():
 
 def test_packed_attention_rejects_a_co_batched_layout_on_an_unpacked_backend():
     """A backend that ignores cu_seqlens would silently attend across requests."""
-    attention = _fake_packed_attention("TORCH_SDPA")
+    attention = _fake_packed_attention("TORCH_SDPA", supports_multi_doc=False)
     q = torch.randn(12, 2, 4)
 
     with pytest.raises(ValueError, match="TORCH_SDPA"):
+        attention._run_packed_attention(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 5, 6, 11, 12], dtype=torch.int32),
+            max_seqlen=5,
+            packed_total=12,
+            num_requests=2,
+        )
+
+
+def test_packed_attention_rejects_flash_attn_without_multi_doc_capability():
+    """FLASH_ATTN by name is not enough: NPU/XPU variants must also be rejected.
+
+    Model gets the FLASH_ATTN name but the backend advertises no support for
+    N-document packed cu_seqlens (matching the FlashAttentionBackend override
+    on NPU/XPU). ``_run_packed_attention`` must refuse to build the metadata
+    that would otherwise let the underlying kernel silently fall back to a
+    row-wide mask and attend across request boundaries.
+    """
+    attention = _fake_packed_attention("FLASH_ATTN", supports_multi_doc=False)
+    q = torch.randn(12, 2, 4)
+
+    with pytest.raises(ValueError, match="FLASH_ATTN"):
         attention._run_packed_attention(
             q,
             q,

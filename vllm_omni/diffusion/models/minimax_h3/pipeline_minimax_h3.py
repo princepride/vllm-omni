@@ -67,9 +67,9 @@ from .denoise_loop import (
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .minimax_h3_transformer import (
-    MINIMAX_H3_PACKED_BATCH_BACKENDS,
     MiniMaxH3Attention,
     MiniMaxH3DiTModel,
+    _attention_isolates_packed_requests,
 )
 from .packed_sequence import (
     minimax_h3_packed_sequence,
@@ -2143,14 +2143,18 @@ class MiniMaxH3Pipeline(
         ``cu_seqlens`` metadata regardless of the configured backend; packing
         multiple requests under ring would let attention cross document
         boundaries, so any layer running ring disqualifies the batch.
+
+        The gate probes a per-backend capability rather than a fixed backend
+        name: FLASH_ATTN, for example, only isolates arbitrary N-document
+        packed cu_seqlens on CUDA/ROCm/MUSA. Its NPU path only accepts a
+        ``[real, pad]`` two-document layout and its XPU path ignores
+        cu_seqlens outright — either would silently attend across request
+        boundaries.
         """
         attentions = [module for module in transformer.modules() if isinstance(module, MiniMaxH3Attention)]
         if not attentions:
             return False
-        if any(getattr(module.attention, "use_ring", False) for module in attentions):
-            return False
-        backends = {module.attention.attn_backend.get_name() for module in attentions}
-        return backends <= MINIMAX_H3_PACKED_BATCH_BACKENDS
+        return all(_attention_isolates_packed_requests(module.attention) for module in attentions)
 
     def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
         """Run every request-level stage once and seed the per-request step state."""
@@ -2296,9 +2300,9 @@ class MiniMaxH3Pipeline(
                 )
             else:
                 logger.warning_once(
-                    "MiniMax H3 step batching needs every attention on a %s backend to isolate packed "
-                    "requests; running %d requests one forward at a time.",
-                    "/".join(sorted(MINIMAX_H3_PACKED_BATCH_BACKENDS)),
+                    "MiniMax H3 step batching needs every attention on a backend that isolates "
+                    "packed multi-document cu_seqlens (see AttentionBackend."
+                    "supports_multi_doc_packed_varlen); running %d requests one forward at a time.",
                     len(batch_states),
                 )
             video_parts: list[torch.Tensor] = []
