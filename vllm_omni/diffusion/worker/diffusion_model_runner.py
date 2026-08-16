@@ -735,10 +735,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         error_outputs: list[RunnerOutput] = []
         for state in states:
             if state.request_id in new_request_ids:
-                self._initialize_generator(state.sampling)
-                clear_pipeline_stage_durations(self.pipeline)
+                # Everything that runs before ``_dit_any_rank_failed`` must be
+                # inside the try: an exception in ``_initialize_generator`` or
+                # ``clear_pipeline_stage_durations`` on one rank would skip the
+                # all-reduce here while every peer proceeds into it, and the
+                # peers then hang on the NCCL collective until timeout.
                 per_req_exc: BaseException | None = None
                 try:
+                    self._initialize_generator(state.sampling)
+                    clear_pipeline_stage_durations(self.pipeline)
                     # encode
                     self.pipeline.prepare_encode(state)
                     merge_stage_durations(
