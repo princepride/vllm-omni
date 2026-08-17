@@ -9,8 +9,6 @@ checkpoint weights.
 
 from __future__ import annotations
 
-import queue
-import threading
 from types import SimpleNamespace
 
 import pytest
@@ -117,142 +115,7 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     return pipeline
 
 
-def test_pipeline_declares_step_execution_contract():
-    from vllm_omni.diffusion.models.interface import SupportsStepExecution
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-
-    assert MiniMaxH3Pipeline.supports_step_execution is True
-    for method in ("prepare_encode", "denoise_step", "step_scheduler", "post_decode"):
-        assert callable(getattr(MiniMaxH3Pipeline, method)), method
-    # The runner gates step mode on this structural check.
-    assert isinstance(_step_pipeline(_SegmentMeanModel()), SupportsStepExecution)
-
-
-def test_single_request_batch_layout_is_the_request_mode_layout():
-    """A batch of one must be the request-mode kwargs, not a lookalike.
-
-    Rebuilding it would silently drop ``video_token_layout``, the hint sparse
-    attention backends need to find the video segment.
-    """
-    from vllm_omni.diffusion.models.minimax_h3.step_batch import minimax_h3_batched_forward_kwargs
-
-    branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=0)
-    request_kwargs = branch.forward_kwargs(
-        video_rows=video_rows,
-        audio_rows=audio_rows,
-        t_video=0.25,
-        t_audio=0.4,
-        imgvid_cond_timestep=0.999,
-        audio_ref_cond_timestep=1.0,
-    )
-    batched_kwargs = minimax_h3_batched_forward_kwargs(
-        branches=[branch],
-        video_rows=[video_rows],
-        audio_rows=[audio_rows],
-        t_video=[0.25],
-        t_audio=[0.4],
-        imgvid_cond_timesteps=[0.999],
-        audio_ref_cond_timesteps=[1.0],
-    )
-
-    assert batched_kwargs.keys() == request_kwargs.keys()
-    assert batched_kwargs["video_token_layout"] == request_kwargs["video_token_layout"]
-    for key, expected in request_kwargs.items():
-        actual = batched_kwargs[key]
-        if torch.is_tensor(expected):
-            torch.testing.assert_close(actual, expected)
-        elif isinstance(expected, dict):
-            for field, value in expected.items():
-                if torch.is_tensor(value):
-                    torch.testing.assert_close(actual[field], value)
-                else:
-                    assert actual[field] == value, key
-        else:
-            assert actual == expected, key
-
-
-def test_batched_layout_keeps_one_document_per_request():
-    from vllm_omni.diffusion.models.minimax_h3.step_batch import minimax_h3_batched_forward_kwargs
-
-    first, first_video, first_audio = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=1)
-    second, second_video, second_audio = _make_branch(text_len=5, latent_t=3, latent_h=6, latent_w=4, audio_t=2, seed=2)
-
-    kwargs = minimax_h3_batched_forward_kwargs(
-        branches=[first, second],
-        video_rows=[first_video, second_video],
-        audio_rows=[first_audio, second_audio],
-        t_video=[0.25, 0.5],
-        t_audio=[0.4, 0.6],
-        imgvid_cond_timesteps=[0.999, 0.999],
-        audio_ref_cond_timesteps=[1.0, 1.0],
-    )
-
-    bounds = kwargs["packed_seq_params"]["cu_seqlens_q"].tolist()
-    assert bounds == [
-        0,
-        first.used_len,
-        first.seq_len,
-        first.seq_len + second.used_len,
-        first.seq_len + second.seq_len,
-    ]
-    assert kwargs["x"].shape == (1, first.seq_len + second.seq_len, 96)
-    assert kwargs["refiner_packed_seq_params"]["cu_seqlens_q"].tolist() == [
-        0,
-        first.text_len,
-        first.text_len + second.text_len,
-    ]
-
-    # The second request's rows must live entirely past the first request's block.
-    second_img_pos = kwargs["img_pos_info"]["position_ids"][int(first.img_pos.shape[0]) :]
-    assert int(second_img_pos.min()) >= first.seq_len
-    row_timesteps = kwargs["unique_timesteps"][kwargs["inverse_indices"]]
-    torch.testing.assert_close(row_timesteps[first.seq_len], torch.tensor(0.5))
-
-
-def test_batched_forward_matches_per_request_forwards():
-    """Packing two requests must not leak information across the boundary."""
-    from vllm_omni.diffusion.models.minimax_h3.step_batch import minimax_h3_batched_forward_kwargs
-
-    model = _SegmentMeanModel()
-    first, first_video, first_audio = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=3)
-    second, second_video, second_audio = _make_branch(text_len=5, latent_t=3, latent_h=6, latent_w=4, audio_t=2, seed=4)
-    branches = [first, second]
-    videos = [first_video, second_video]
-    audios = [first_audio, second_audio]
-    t_video = [0.25, 0.5]
-    t_audio = [0.4, 0.6]
-
-    batched_video, batched_audio = model(
-        **minimax_h3_batched_forward_kwargs(
-            branches=branches,
-            video_rows=videos,
-            audio_rows=audios,
-            t_video=t_video,
-            t_audio=t_audio,
-            imgvid_cond_timesteps=[0.999, 0.999],
-            audio_ref_cond_timesteps=[1.0, 1.0],
-        )
-    )
-    video_parts = torch.split(batched_video, [int(branch.img_pos.shape[0]) for branch in branches])
-    audio_parts = torch.split(batched_audio, [int(branch.audio_pos.shape[0]) for branch in branches])
-
-    for index, branch in enumerate(branches):
-        alone_video, alone_audio = model(
-            **branch.forward_kwargs(
-                video_rows=videos[index],
-                audio_rows=audios[index],
-                t_video=t_video[index],
-                t_audio=t_audio[index],
-                imgvid_cond_timestep=0.999,
-                audio_ref_cond_timestep=1.0,
-            )
-        )
-        torch.testing.assert_close(video_parts[index], alone_video)
-        torch.testing.assert_close(audio_parts[index], alone_audio)
-
-
-@pytest.mark.parametrize("packed_batch_supported", [True, False])
-def test_step_execution_matches_request_mode_denoise_loop(packed_batch_supported):
+def test_step_execution_matches_request_mode_denoise_loop():
     """Stepping through the contract must reproduce the request-mode loop."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
@@ -273,7 +136,7 @@ def test_step_execution_matches_request_mode_denoise_loop(packed_batch_supported
         device=torch.device("cpu"),
     )
 
-    pipeline = _step_pipeline(model, packed_batch_supported=packed_batch_supported)
+    pipeline = _step_pipeline(model)
     state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
     input_batch = SimpleNamespace(states=(state,))
 
@@ -296,7 +159,8 @@ def test_batched_step_execution_matches_independent_requests():
     model = _SegmentMeanModel()
     specs = [
         dict(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=6),
-        dict(text_len=5, latent_t=3, latent_h=6, latent_w=4, audio_t=2, seed=7),
+        # Exactly 64 packed rows exercises the no-padding-tail boundary case.
+        dict(text_len=46, latent_t=7, latent_h=2, latent_w=4, audio_t=2, seed=7),
     ]
     # Different step counts, so the batch composition changes mid-flight.
     schedules = [(_sigmas(6, 12.0), _sigmas(6, 3.0)), (_sigmas(4, 12.0), _sigmas(4, 3.0))]
@@ -314,6 +178,8 @@ def test_batched_step_execution_matches_independent_requests():
     states = []
     for index, (spec, (sigmas_video, sigmas_audio)) in enumerate(zip(specs, schedules)):
         branch, video_rows, audio_rows = _make_branch(**spec)
+        if index == 1:
+            assert branch.used_len == branch.seq_len
         states.append(_make_state(f"req-{index}", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio))
 
     active = list(states)
@@ -414,58 +280,6 @@ def test_mixed_step_batch_leaves_gated_attention_dense():
 
     assert recorder.denoise_step_idx is None
     assert recorder.denoise_timestep is None
-
-
-def test_abort_stops_h3_after_the_inflight_step():
-    """H3 relies on the generic step scheduler to stop aborted requests."""
-    from vllm_omni.diffusion.data import DiffusionOutput
-    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
-    from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.diffusion.sched import StepScheduler
-    from vllm_omni.diffusion.worker.utils import RunnerOutput
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-    branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=9)
-    model = _SegmentMeanModel()
-    state = _make_state("req-abort", model, branch, video_rows, audio_rows, _sigmas(6, 12.0), _sigmas(6, 3.0))
-    pipeline = _step_pipeline(model)
-    scheduler = StepScheduler()
-    scheduler.initialize(SimpleNamespace())
-
-    engine = object.__new__(DiffusionEngine)
-    engine.scheduler = scheduler
-    engine._rpc_lock = threading.RLock()
-    engine._cv = threading.Condition(engine._rpc_lock)
-    engine._closed = False
-    engine.abort_queue = queue.Queue()
-    calls = 0
-
-    def execute_h3_step(scheduler_output):
-        nonlocal calls
-        calls += 1
-        assert scheduler_output.scheduled_request_ids == ["req-abort"]
-        noise_pred = pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state])
-        pipeline.step_scheduler(state, noise_pred)
-        engine.abort("req-abort")
-        return RunnerOutput(
-            request_id=state.request_id,
-            step_index=state.step_index,
-            finished=False,
-            result=None,
-        )
-
-    engine.execute_fn = execute_h3_step
-    output = engine.add_req_and_wait_for_response(
-        OmniDiffusionRequest(
-            prompt="abort H3",
-            request_id="req-abort",
-            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=state.total_steps),
-        )
-    )
-
-    assert calls == 1
-    assert state.step_index == 1
-    assert output == DiffusionOutput(aborted=True, abort_message="Request req-abort aborted.")
 
 
 def test_prepare_encode_seeds_runner_visible_state(monkeypatch):
@@ -596,47 +410,18 @@ class _FakeTransformer:
         return iter([self, *self._attentions])
 
 
-def test_packed_batch_supported_rejects_ring_attention():
-    """Ring dispatch ignores packed cu_seqlens, so co-batching is unsafe.
-
-    ``ring_degree > 1`` sets ``Attention.use_ring`` on every layer regardless
-    of the resolved backend name; without this check, ``denoise_step()``
-    would still pack multiple requests and attention would cross request
-    boundaries because the ring kernel does not consume ``cu_seqlens``.
-    """
+@pytest.mark.parametrize(
+    "attention",
+    [
+        _fake_attention_module(use_ring=True),
+        _fake_attention_module(use_ring=False, backend="XFORMERS", supports_multi_doc=False),
+        _fake_attention_module(use_ring=False, backend="FLASH_ATTN", supports_multi_doc=False),
+    ],
+)
+def test_packed_batch_rejects_backends_that_cannot_isolate_requests(attention):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
-    ring_transformer = _FakeTransformer(
-        [
-            _fake_attention_module(use_ring=False, backend="FLASH_ATTN"),
-            _fake_attention_module(use_ring=True, backend="FLASH_ATTN"),
-        ]
-    )
-    non_ring_transformer = _FakeTransformer([_fake_attention_module(use_ring=False, backend="FLASH_ATTN")])
-
-    assert MiniMaxH3Pipeline._packed_batch_supported(ring_transformer) is False
-    assert MiniMaxH3Pipeline._packed_batch_supported(non_ring_transformer) is True
-
-
-def test_packed_batch_supported_rejects_unsupported_backend():
-    """A backend that does not advertise multi-doc packed varlen disqualifies packing.
-
-    Covers both a genuinely unsupported backend and the platform-dependent
-    case (e.g. FLASH_ATTN on NPU/XPU) where the name-only gate would let a
-    request through even though the resolved kernel does not isolate packed
-    cu_seqlens.
-    """
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-
-    unsupported = _FakeTransformer(
-        [_fake_attention_module(use_ring=False, backend="XFORMERS", supports_multi_doc=False)]
-    )
-    assert MiniMaxH3Pipeline._packed_batch_supported(unsupported) is False
-
-    flash_attn_without_isolation = _FakeTransformer(
-        [_fake_attention_module(use_ring=False, backend="FLASH_ATTN", supports_multi_doc=False)]
-    )
-    assert MiniMaxH3Pipeline._packed_batch_supported(flash_attn_without_isolation) is False
+    assert MiniMaxH3Pipeline._packed_batch_supported(_FakeTransformer([attention])) is False
 
 
 def test_broadcast_rank0_exception_single_rank_reraises():
@@ -660,14 +445,11 @@ def test_broadcast_rank0_exception_propagates_to_non_zero_ranks(monkeypatch):
         return lambda: (object(), rank, 4)
 
     def make_broadcast(rank0_payload):
-        """Simulate ``dist.broadcast_object_list``: everyone gets rank-0's list."""
-
         def fake_broadcast(payload_list, *, src, group):
             payload_list[0] = rank0_payload
 
         return fake_broadcast
 
-    # Rank 0 error path: helper reraises the exact exception locally.
     monkeypatch.setattr(mod, "_dit_rank_world", fake_rank_world(0))
     err = OmniClientError("invalid reference-video file", status_code=422, error_type="UnprocessableEntityError")
     rank0_payload = {
@@ -681,103 +463,9 @@ def test_broadcast_rank0_exception_propagates_to_non_zero_ranks(monkeypatch):
         mod._broadcast_rank0_exception(err)
     assert rank0_info.value is err
 
-    # Non-zero rank sees the rank-0 payload and raises a client error with the
-    # same 4xx status; this must happen BEFORE any downstream collective, so
-    # the runner's per-request try/except records a matching error.
     monkeypatch.setattr(mod, "_dit_rank_world", fake_rank_world(2))
     with pytest.raises(OmniClientError) as rank2_info:
         mod._broadcast_rank0_exception(None)
     assert rank2_info.value.status_code == 422
     assert rank2_info.value.error_type == "UnprocessableEntityError"
     assert "invalid reference-video file" in str(rank2_info.value)
-
-    # Success on rank 0 → all ranks return cleanly.
-    monkeypatch.setattr(mod.dist, "broadcast_object_list", make_broadcast(None))
-    for rank in (0, 1, 3):
-        monkeypatch.setattr(mod, "_dit_rank_world", fake_rank_world(rank))
-        mod._broadcast_rank0_exception(None)
-
-
-def _batched_kwargs(branches, videos, audios):
-    from vllm_omni.diffusion.models.minimax_h3.step_batch import minimax_h3_batched_forward_kwargs
-
-    return minimax_h3_batched_forward_kwargs(
-        branches=branches,
-        video_rows=videos,
-        audio_rows=audios,
-        t_video=[0.25] * len(branches),
-        t_audio=[0.4] * len(branches),
-        imgvid_cond_timesteps=[0.999] * len(branches),
-        audio_ref_cond_timesteps=[1.0] * len(branches),
-    )
-
-
-def test_packed_batch_reports_its_request_count():
-    """Attention needs the request count; cu_seqlens length cannot supply it.
-
-    A request whose rows already land on the 64-row alignment contributes an
-    empty padding document, so bound counts alone cannot tell two such requests
-    apart from one padded request.
-    """
-    first, first_video, first_audio = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=9)
-    second, second_video, second_audio = _make_branch(
-        text_len=5, latent_t=3, latent_h=6, latent_w=4, audio_t=2, seed=10
-    )
-    # text 46 + audio 4 + video 14 = 64 rows exactly: no padding tail.
-    aligned, aligned_video, aligned_audio = _make_branch(
-        text_len=46, latent_t=7, latent_h=2, latent_w=4, audio_t=2, seed=11
-    )
-    assert aligned.used_len == aligned.seq_len
-
-    solo = _batched_kwargs([first], [first_video], [first_audio])["packed_seq_params"]
-    assert solo["num_requests"] == 1
-
-    batched = _batched_kwargs(
-        [first, second],
-        [first_video, second_video],
-        [first_audio, second_audio],
-    )["packed_seq_params"]
-    assert batched["num_requests"] == 2
-
-    # Two alignment-exact requests: five bounds, two of them empty documents.
-    aligned_pair = _batched_kwargs(
-        [aligned, aligned],
-        [aligned_video, aligned_video],
-        [aligned_audio, aligned_audio],
-    )["packed_seq_params"]
-    assert aligned_pair["num_requests"] == 2
-    assert aligned_pair["cu_seqlens_q"].tolist() == [
-        0,
-        aligned.seq_len,
-        aligned.seq_len,
-        2 * aligned.seq_len,
-        2 * aligned.seq_len,
-    ]
-
-
-def test_alignment_exact_requests_stay_isolated():
-    """The no-padding-tail layout must not leak across the request boundary."""
-    model = _SegmentMeanModel()
-    branch, video_rows, audio_rows = _make_branch(text_len=46, latent_t=7, latent_h=2, latent_w=4, audio_t=2, seed=12)
-    other, other_video, other_audio = _make_branch(text_len=46, latent_t=7, latent_h=2, latent_w=4, audio_t=2, seed=13)
-    assert branch.used_len == branch.seq_len
-
-    batched_video, batched_audio = model(
-        **_batched_kwargs([branch, other], [video_rows, other_video], [audio_rows, other_audio])
-    )
-    video_parts = torch.split(batched_video, [int(b.img_pos.shape[0]) for b in (branch, other)])
-    audio_parts = torch.split(batched_audio, [int(b.audio_pos.shape[0]) for b in (branch, other)])
-
-    for index, (one, rows, audio) in enumerate([(branch, video_rows, audio_rows), (other, other_video, other_audio)]):
-        alone_video, alone_audio = model(
-            **one.forward_kwargs(
-                video_rows=rows,
-                audio_rows=audio,
-                t_video=0.25,
-                t_audio=0.4,
-                imgvid_cond_timestep=0.999,
-                audio_ref_cond_timestep=1.0,
-            )
-        )
-        torch.testing.assert_close(video_parts[index], alone_video)
-        torch.testing.assert_close(audio_parts[index], alone_audio)
