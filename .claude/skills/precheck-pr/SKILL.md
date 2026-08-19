@@ -67,6 +67,8 @@ Ask: "Quick mode or full mode?" Then walk the checklist for the detected PR type
 
 **Also run the Examples-Policy check on every PR** using [references/examples-policy.md](references/examples-policy.md). Inspect only Python paths introduced by the diff. Treat a new model-, checkpoint-, vendor-, or family-specific Python example as blocking; do not report pre-existing example debt.
 
+**Also run the Simplification pass on every PR** using [find-simplifications](../find-simplifications/SKILL.md). Keep it diff-scoped: inspect added or modified public APIs, state, abstractions, fallback and compatibility paths, data movement, and only the adjacent ownership needed to prove a candidate. Do not expand the pass into a repository-wide audit. Zero candidates is a valid pass; report only evidence-backed opportunities. Mark a candidate as blocking only when it proves a correctness or merge-readiness problem, such as newly unreachable code. Otherwise report it as a warning.
+
 ### Step 5: Print Report
 
 ```
@@ -80,6 +82,7 @@ Pre-check report for <branch>
   PR title format    ✓
   Code quality       ⚠ 1 broad except, 2 Any hints
   Examples policy    ✗ new model-specific Python example
+  Simplification     ⚠ helper duplicates an existing owner
   PR desc integrity  ✓
   Registry/config    ✓
   Dead code          ⚠ 2 warnings
