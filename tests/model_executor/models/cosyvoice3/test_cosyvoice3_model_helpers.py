@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ class _DummyCode2Wav:
         self.outputs = list(outputs or [])
         self.forward_calls: list[dict[str, object]] = []
         self.forward_streaming_calls: list[dict[str, object]] = []
+        self.flow_step_batches: list[list[tuple[int, int]]] = []
 
     def forward(self, **kwargs):
         self.forward_calls.append(kwargs)
@@ -64,6 +65,27 @@ class _DummyCode2Wav:
                 "speech_offset": audio.shape[-1],
             }
         return audio, new_state
+
+    def prepare_flow_state(self, **kwargs):
+        return SimpleNamespace(
+            step_index=0,
+            num_steps=2,
+            generated_mel_len=int(kwargs["token"].shape[-1]),
+        )
+
+    def forward_flow_step(self, states):
+        self.flow_step_batches.append([(state.generated_mel_len, state.step_index) for state in states])
+        for state in states:
+            state.step_index += 1
+        return [state.step_index == state.num_steps for state in states]
+
+    @staticmethod
+    def flow_state_to_mel(state):
+        return torch.ones((1, 80, state.generated_mel_len), dtype=torch.float32)
+
+    @staticmethod
+    def decode_mel(feat):
+        return feat[:, :1]
 
 
 def _make_code2wav_model(
@@ -94,6 +116,8 @@ def _make_code2wav_model(
     model._stream_audio_cache_by_req = {}
     model._stream_audio_cache_lock = Lock()
     model._stream_vocoder_cache_by_req = {}
+    model._flow_state_by_req = {}
+    model._external_req_id_by_request = {}
     return model
 
 
@@ -276,6 +300,52 @@ def test_forward_uses_non_stream_talker_prefill_offset():
     assert model.code2wav.forward_calls[0]["token_offset_tokens"] == 3
 
 
+def test_flow_batches_staggered_requests_at_different_steps():
+    model = _make_code2wav_model()
+
+    def runtime_info():
+        return {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            }
+        }
+
+    first = model.forward(
+        input_ids=torch.tensor([0, 1], dtype=torch.long),
+        positions=torch.tensor([0, 1], dtype=torch.long),
+        model_intermediate_buffer=[runtime_info()],
+        seq_token_counts=[2],
+        request_ids=["req-a"],
+    )
+    assert not bool(first.multimodal_outputs["_generation_step_finished"][0])
+    assert first.multimodal_outputs["audio"][0].numel() == 0
+
+    second = model.forward(
+        input_ids=torch.tensor([1, 0, 1, 2], dtype=torch.long),
+        positions=torch.tensor([1, 0, 1, 2], dtype=torch.long),
+        model_intermediate_buffer=[{}, runtime_info()],
+        seq_token_counts=[1, 3],
+        request_ids=["req-a", "req-b"],
+    )
+    assert [bool(value) for value in second.multimodal_outputs["_generation_step_finished"]] == [True, False]
+    assert second.multimodal_outputs["audio"][0].numel() == 2
+    assert second.multimodal_outputs["audio"][1].numel() == 0
+    assert model.code2wav.flow_step_batches[-1] == [(2, 1), (3, 0)]
+
+    third = model.forward(
+        input_ids=torch.tensor([2], dtype=torch.long),
+        positions=torch.tensor([2], dtype=torch.long),
+        model_intermediate_buffer=[{}],
+        seq_token_counts=[1],
+        request_ids=["req-b"],
+    )
+    assert bool(third.multimodal_outputs["_generation_step_finished"][0])
+    assert third.multimodal_outputs["audio"][0].numel() == 3
+    assert model._flow_state_by_req == {}
+
+
 def test_forward_reuses_streaming_cache_state_between_chunks():
     model = _make_code2wav_model(
         outputs=[
@@ -423,9 +493,14 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
     _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+
+    def sample(logits, sampling_metadata):
+        calls.append(logits.clone())
+        return expected
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
-        sample=lambda logits, sampling_metadata: calls.append(logits.clone()) or expected,
+        sample=sample,
     )
     runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
 
@@ -459,12 +534,14 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
     _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+
+    def sample(logits, sampling_metadata):
+        seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
+        return SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
-        sample=lambda logits, sampling_metadata: (
-            seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
-            or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
-        ),
+        sample=sample,
     )
     runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
 
@@ -504,12 +581,14 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
     _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+
+    def sample(logits, sampling_metadata):
+        seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
+        return SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
-        sample=lambda logits, sampling_metadata: (
-            seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
-            or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
-        ),
+        sample=sample,
     )
     runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
 

@@ -1,13 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
 from vllm_omni.utils import mm_outputs as mm_outputs_mod
-from vllm_omni.utils.mm_outputs import build_mm_cpu
+from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_flat_payload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 TOTAL_TOKENS = 5
 NUM_TOKEN_ALIGNED_TENSORS = 3  # codes.audio, meta.ref_code_len, meta.codec_streaming
+
+
+def test_generation_step_marker_reaches_scheduler_channel():
+    marker = torch.tensor(False)
+
+    inter_stage, client_mm = partition_flat_payload({"_generation_step_finished": marker})
+
+    assert inter_stage == {}
+    assert client_mm == {"_generation_step_finished": marker}
 
 
 def make_talker_passthrough_payload(num_requests: int, device: str = "cpu") -> dict:

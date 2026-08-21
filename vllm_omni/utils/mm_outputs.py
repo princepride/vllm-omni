@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Utilities for handling multimodal outputs / building multimodal output
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
@@ -23,6 +26,9 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
         "videos",
         "trajectory_latents",
         "latents",
+        # Internal generation-stage control signal. The scheduler consumes and
+        # removes it before constructing the client response.
+        "_generation_step_finished",
     }
 )
 

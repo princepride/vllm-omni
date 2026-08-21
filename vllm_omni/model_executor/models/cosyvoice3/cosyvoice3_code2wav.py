@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 CosyVoice3 Code2Wav Stage - Converts speech tokens to audio waveforms.
 
@@ -10,6 +10,8 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -30,6 +32,22 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreL
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class CosyVoice3FlowState:
+    """Per-request state retained between Flow scheduling ticks."""
+
+    x: torch.Tensor
+    mu: torch.Tensor
+    mask: torch.Tensor
+    spks: torch.Tensor
+    cond: torch.Tensor
+    t_span: torch.Tensor
+    step_index: int
+    prompt_mel_len: int
+    generated_mel_len: int
+    trim_mel: int
 
 
 class CosyVoice3Code2Wav(nn.Module):
@@ -193,36 +211,132 @@ class CosyVoice3Code2Wav(nn.Module):
         return feat
 
     @torch.inference_mode()
-    def forward_streaming(
+    def prepare_flow_state(
         self,
         token: torch.Tensor,
         prompt_token: torch.Tensor,
         prompt_feat: torch.Tensor,
         embedding: torch.Tensor,
         *,
-        cache_state: dict[str, torch.Tensor] | None = None,
         n_timesteps: int = 10,
         token_offset_tokens: int = 0,
         finalize: bool = False,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Decode streaming audio using cumulative mel + emitted-speech offset.
+    ) -> CosyVoice3FlowState:
+        """Prepare one request for step-wise padded Flow execution."""
+        flow_weight = next(self.flow_model.parameters())
+        device = flow_weight.device
+        dtype = flow_weight.dtype
 
-        This mirrors upstream CosyVoice3 streaming semantics more closely than
-        waveform-domain overlap-add: keep a cumulative mel history per request,
-        re-run causal HiFT on the history, and emit only the newly grown speech
-        suffix. That preserves causal look-right handling without double
-        trimming or duplicated overlap at chunk boundaries.
-        """
-        feat = self._forward_mel(
+        token = token.to(device=device, dtype=torch.int32)
+        prompt_token = prompt_token.to(device=device, dtype=torch.int32)
+        prompt_feat = prompt_feat.to(device=device, dtype=dtype)
+        embedding = embedding.to(device=device, dtype=dtype)
+        token_len = torch.tensor([token.shape[1]], device=device, dtype=torch.int32)
+        prompt_token_len = torch.tensor([prompt_token.shape[1]], device=device, dtype=torch.int32)
+        prompt_feat_len = torch.tensor([prompt_feat.shape[1]], device=device, dtype=torch.int32)
+
+        decoder_inputs = self.flow_model.prepare_inference_inputs(
             token=token,
+            token_len=token_len,
             prompt_token=prompt_token,
+            prompt_token_len=prompt_token_len,
             prompt_feat=prompt_feat,
+            prompt_feat_len=prompt_feat_len,
             embedding=embedding,
-            n_timesteps=n_timesteps,
-            token_offset_tokens=token_offset_tokens,
-            streaming=True,
             finalize=finalize,
         )
+        mu = decoder_inputs["mu"]
+        assert isinstance(mu, torch.Tensor)
+        num_steps = max(1, int(n_timesteps))
+        t_span = torch.linspace(0, 1, num_steps + 1, device=mu.device, dtype=mu.dtype)
+        if self.decoder.t_scheduler == "cosine":
+            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+
+        mask = decoder_inputs["mask"]
+        spks = decoder_inputs["spks"]
+        cond = decoder_inputs["cond"]
+        assert isinstance(mask, torch.Tensor)
+        assert isinstance(spks, torch.Tensor)
+        assert isinstance(cond, torch.Tensor)
+        return CosyVoice3FlowState(
+            x=torch.randn_like(mu),
+            mu=mu,
+            mask=mask,
+            spks=spks,
+            cond=cond,
+            t_span=t_span,
+            step_index=0,
+            prompt_mel_len=int(decoder_inputs["prompt_mel_len"]),
+            generated_mel_len=int(decoder_inputs["generated_mel_len"]),
+            trim_mel=max(0, int(token_offset_tokens)) * int(self.token_mel_ratio),
+        )
+
+    @torch.inference_mode()
+    def forward_flow_step(self, states: list[CosyVoice3FlowState]) -> list[bool]:
+        """Advance each state once using one padded DiT batch."""
+        if not states:
+            return []
+
+        channels = states[0].x.shape[1]
+        max_len = max(state.x.shape[2] for state in states)
+        batch_size = len(states)
+        device = states[0].x.device
+        dtype = states[0].x.dtype
+
+        def padded(channels_: int) -> torch.Tensor:
+            return torch.zeros((batch_size, channels_, max_len), device=device, dtype=dtype)
+
+        x = padded(channels)
+        mu = padded(states[0].mu.shape[1])
+        cond = padded(states[0].cond.shape[1])
+        mask = torch.zeros((batch_size, 1, max_len), device=device, dtype=dtype)
+        for row, state in enumerate(states):
+            seq_len = state.x.shape[2]
+            x[row, :, :seq_len] = state.x[0]
+            mu[row, :, :seq_len] = state.mu[0]
+            cond[row, :, :seq_len] = state.cond[0]
+            mask[row, :, :seq_len] = state.mask[0]
+
+        spks = torch.cat([state.spks for state in states], dim=0)
+        t = torch.stack([state.t_span[state.step_index] for state in states])
+        next_t = torch.stack([state.t_span[state.step_index + 1] for state in states])
+        x = self.decoder.solve_euler_step(
+            x=x,
+            t=t,
+            dt=next_t - t,
+            mu=mu,
+            mask=mask,
+            spks=spks,
+            cond=cond,
+        )
+
+        completed: list[bool] = []
+        for row, state in enumerate(states):
+            seq_len = state.x.shape[2]
+            state.x = x[row : row + 1, :, :seq_len].contiguous()
+            state.step_index += 1
+            completed.append(state.step_index == len(state.t_span) - 1)
+        return completed
+
+    @staticmethod
+    def flow_state_to_mel(state: CosyVoice3FlowState) -> torch.Tensor:
+        """Extract the generated (non-prompt) mel from a completed state."""
+        start = state.prompt_mel_len
+        end = start + state.generated_mel_len
+        feat = state.x.float()[:, :, start:end]
+        if state.trim_mel > 0:
+            feat = feat[:, :, state.trim_mel :]
+        return feat
+
+    @torch.inference_mode()
+    def decode_streaming_mel(
+        self,
+        feat: torch.Tensor,
+        *,
+        cache_state: dict[str, torch.Tensor] | None = None,
+        finalize: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Decode a completed streaming Flow mel and update HiFT state."""
         hift_weight = self.hift.m_source.l_linear.weight
         chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
 
@@ -258,6 +372,53 @@ class CosyVoice3Code2Wav(nn.Module):
         return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
 
     @torch.inference_mode()
+    def decode_mel(self, feat: torch.Tensor) -> torch.Tensor:
+        """Decode a completed non-streaming Flow mel."""
+        hift_weight = self.hift.m_source.l_linear.weight
+        tts_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
+        if tts_mel.shape[-1] == 0:
+            return torch.zeros(
+                (tts_mel.shape[0], 1, 0),
+                device=tts_mel.device,
+                dtype=tts_mel.dtype,
+            )
+        tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=True)
+        return tts_speech
+
+    @torch.inference_mode()
+    def forward_streaming(
+        self,
+        token: torch.Tensor,
+        prompt_token: torch.Tensor,
+        prompt_feat: torch.Tensor,
+        embedding: torch.Tensor,
+        *,
+        cache_state: dict[str, torch.Tensor] | None = None,
+        n_timesteps: int = 10,
+        token_offset_tokens: int = 0,
+        finalize: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Decode streaming audio using cumulative mel + emitted-speech offset.
+
+        This mirrors upstream CosyVoice3 streaming semantics more closely than
+        waveform-domain overlap-add: keep a cumulative mel history per request,
+        re-run causal HiFT on the history, and emit only the newly grown speech
+        suffix. That preserves causal look-right handling without double
+        trimming or duplicated overlap at chunk boundaries.
+        """
+        feat = self._forward_mel(
+            token=token,
+            prompt_token=prompt_token,
+            prompt_feat=prompt_feat,
+            embedding=embedding,
+            n_timesteps=n_timesteps,
+            token_offset_tokens=token_offset_tokens,
+            streaming=True,
+            finalize=finalize,
+        )
+        return self.decode_streaming_mel(feat, cache_state=cache_state, finalize=finalize)
+
+    @torch.inference_mode()
     def forward(
         self,
         token: torch.Tensor,
@@ -279,20 +440,7 @@ class CosyVoice3Code2Wav(nn.Module):
             finalize=True,
         )
 
-        # Run vocoder
-        hift_weight = self.hift.m_source.l_linear.weight
-        tts_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
-
-        if tts_mel.shape[-1] == 0:
-            tts_speech = torch.zeros(
-                (tts_mel.shape[0], 1, 0),
-                device=tts_mel.device,
-                dtype=tts_mel.dtype,
-            )
-        else:
-            tts_speech, _ = self.hift.inference(speech_feat=tts_mel, finalize=True)
-
-        return tts_speech
+        return self.decode_mel(feat)
 
     def load_weights(self, model_dir: str, device: torch.device) -> None:
         """Load flow.pt and hift.pt weights.

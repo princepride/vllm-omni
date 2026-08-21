@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for CosyVoice3 components."""
 
 from types import SimpleNamespace
@@ -94,6 +94,20 @@ class TestDiTAttention:
         assert out.shape == x.shape
         # Masked positions should be zero
         assert torch.allclose(out[:, -3:], torch.zeros_like(out[:, -3:]))
+
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_padding_does_not_change_valid_prefix(self, attention):
+        """Valid queries must not attend padded K/V positions."""
+        valid_len, padded_len, dim = 9, 16, 512
+        valid = torch.randn(1, valid_len, dim)
+        padded = torch.cat([valid, torch.randn(1, padded_len - valid_len, dim)], dim=1)
+        mask = torch.arange(padded_len).unsqueeze(0) < valid_len
+
+        expected = attention(valid)
+        actual = attention(padded, mask=mask)
+
+        torch.testing.assert_close(actual[:, :valid_len], expected, rtol=1e-4, atol=1e-4)
 
     @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -313,3 +327,70 @@ def test_code2wav_forward_finalizes_hift_tail():
     assert out.shape == (1, 1, 8)
     assert model.hift.finalize_calls == [True]
     assert forward_mel_calls[0]["token_offset_tokens"] == 0
+
+
+def test_code2wav_flow_step_pads_variable_lengths_and_timesteps():
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import (
+        CosyVoice3Code2Wav,
+        CosyVoice3FlowState,
+    )
+
+    class DummyDecoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.batch_shapes: list[tuple[int, ...]] = []
+
+        def solve_euler_step(self, *, x, t, dt, mu, mask, spks, cond):
+            self.batch_shapes.append(tuple(x.shape))
+            velocity = (mu + cond + spks[:, :1, None] + t[:, None, None]) * mask
+            return x + dt[:, None, None] * velocity
+
+    class DummyFlow(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = DummyDecoder()
+
+    model = object.__new__(CosyVoice3Code2Wav)
+    nn.Module.__init__(model)
+    model.flow_model = DummyFlow()
+
+    def make_state(seq_len: int, t_span: torch.Tensor, step_index: int, scale: float):
+        return CosyVoice3FlowState(
+            x=torch.full((1, 2, seq_len), scale),
+            mu=torch.full((1, 2, seq_len), 2 * scale),
+            mask=torch.ones((1, 1, seq_len)),
+            spks=torch.full((1, 2), 3 * scale),
+            cond=torch.full((1, 2, seq_len), 4 * scale),
+            t_span=t_span,
+            step_index=step_index,
+            prompt_mel_len=0,
+            generated_mel_len=seq_len,
+            trim_mel=0,
+        )
+
+    states = [
+        make_state(7, torch.tensor([0.0, 0.25, 1.0]), 0, 1.0),
+        make_state(4, torch.tensor([0.0, 0.1, 0.6, 1.0]), 1, 2.0),
+    ]
+    expected = []
+    for state in states:
+        expected.append(
+            model.decoder.solve_euler_step(
+                x=state.x,
+                t=state.t_span[state.step_index].reshape(1),
+                dt=(state.t_span[state.step_index + 1] - state.t_span[state.step_index]).reshape(1),
+                mu=state.mu,
+                mask=state.mask,
+                spks=state.spks,
+                cond=state.cond,
+            )
+        )
+
+    completed = model.forward_flow_step(states)
+
+    assert model.decoder.batch_shapes[-1] == (2, 2, 7)
+    assert completed == [False, False]
+    assert states[0].step_index == 1
+    assert states[1].step_index == 2
+    torch.testing.assert_close(states[0].x, expected[0])
+    torch.testing.assert_close(states[1].x, expected[1])
