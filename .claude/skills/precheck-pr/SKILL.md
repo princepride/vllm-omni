@@ -69,6 +69,8 @@ Ask: "Quick mode or full mode?" Then walk the checklist for the detected PR type
 
 **Also run the Simplification pass on every PR** using [find-simplifications](../find-simplifications/SKILL.md). Keep it diff-scoped: inspect added or modified public APIs, state, abstractions, fallback and compatibility paths, data movement, and only the adjacent ownership needed to prove a candidate. Do not expand the pass into a repository-wide audit. Zero candidates is a valid pass; report only evidence-backed opportunities. Mark a candidate as blocking only when it proves a correctness or merge-readiness problem, such as newly unreachable code. Otherwise report it as a warning.
 
+**Also confirm local pre-commit gates** from [docs/contributing/README.md](../../../docs/contributing/README.md#linting). GitHub Actions `SKIP` does not prove they passed. Full new-hook list: Omni SPDX (`vLLM-Omni project`); forbidden imports (stdlib `re`/`base64`, pickle, Hugging Face Hub API, Triton/TileLang); no new `torch.cuda` call sites; shellcheck (macOS/Windows must install the binary); mypy-3.10; test files have CI level + hardware marks; TTS `_tts_model_type` branches in `serving_speech.py` must not increase; markdownlint on `docs/`; Buildkite YAML schema. ✗ for growing `allowed_files` / `ALLOWED_FILES` or raising `MAX_MODEL_TYPE_BRANCHES` without review.
+
 ### Step 5: Print Report
 
 ```
