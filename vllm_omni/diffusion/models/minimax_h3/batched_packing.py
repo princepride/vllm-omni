@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Multi-request packing for MiniMax H3 step-wise execution.
+"""Batched multi-request packing for MiniMax H3 step-wise execution.
 
 Request mode forwards exactly one packed sequence per denoise step. Step mode
 (continuous batching) may hold several requests at once, so this module

@@ -108,7 +108,7 @@ class MiniMaxH3DenoiseBranch:
                 "cu_seqlens_q": cu.to(device),
                 "max_seqlen_q": self.used_len,
                 # One request: valid rows are a prefix, so attention may use a
-                # KV prefix length or a 1-D pad mask. See step_batch for the
+                # KV prefix length or a 1-D pad mask. See batched_packing for the
                 # co-batched layout, where neither can describe the valid rows.
                 "num_requests": 1,
             },

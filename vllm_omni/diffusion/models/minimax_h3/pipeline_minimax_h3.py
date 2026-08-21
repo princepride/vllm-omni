@@ -62,6 +62,7 @@ from vllm_omni.quantization.component_config import (
     resolve_encoder_quant_config as _resolve_encoder_quant_config,
 )
 
+from .batched_packing import minimax_h3_batched_forward_kwargs
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
     minimax_h3_imgvid_cond_noise_aug_rows,
@@ -108,7 +109,6 @@ from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
 )
-from .step_batch import minimax_h3_batched_forward_kwargs
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_align_frame_count,
