@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage initialization helpers for vLLM-Omni multi-stage runtime.
 
@@ -892,6 +895,7 @@ def _project_omni_stage_engine_args(
         "engine_output_type": stage_config.engine_output_type,
         "custom_process_next_stage_input_func": stage_config.custom_process_next_stage_input_func,
         "retains_state_across_chunks": topology.retains_state_across_chunks,
+        "stepwise_generation": topology.stepwise_generation,
     }
     engine_args.update(
         {name: copy.deepcopy(value) for name, value in topology_engine_args.items() if value is not None}

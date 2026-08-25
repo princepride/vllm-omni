@@ -1050,12 +1050,13 @@ class CosyVoice3Model(
 
             return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
         elif self.model_stage == "cosyvoice3_code2wav":
+            runner_request_ids = kwargs.get("request_ids")
             # Lazily swap the flow-decoder estimator to a TensorRT engine on the
             # first code2wav step (after weights are loaded), gated by the same
             # COSYVOICE3_TRT env toggle as the talker speaker embedding. The
             # existing ONNX/TRT engine has a fixed CFG batch of 2, so retain the
             # torch estimator for request-ID-driven continuous batching.
-            if kwargs.get("request_ids") is None:
+            if runner_request_ids is None:
                 self._maybe_enable_code2wav_trt()
 
             runtime_info = kwargs.get("model_intermediate_buffer")
@@ -1069,7 +1070,6 @@ class CosyVoice3Model(
             request_ids_list = self._split_request_ids(flat_ids, seq_token_counts)
 
             num_reqs = max(1, len(request_ids_list))
-            runner_request_ids = kwargs.get("request_ids")
             step_execution = isinstance(runner_request_ids, Sequence) and len(runner_request_ids) == num_reqs
             if step_execution:
                 state_ids = [str(request_id) for request_id in runner_request_ids]
@@ -1262,7 +1262,7 @@ class CosyVoice3Model(
                 multimodal_outputs={
                     "audio": audios,
                     "sr": srs,
-                    "_generation_step_finished": [torch.tensor(done, dtype=torch.bool) for done in flow_step_finished],
+                    "_generation_step_finished": flow_step_finished,
                 },
             )
         else:

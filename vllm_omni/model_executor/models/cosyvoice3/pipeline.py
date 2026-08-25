@@ -44,6 +44,7 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             model_stage="cosyvoice3_code2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
             retains_state_across_chunks=True,
+            stepwise_generation=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",

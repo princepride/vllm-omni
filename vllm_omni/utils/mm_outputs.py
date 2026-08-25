@@ -12,6 +12,8 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+_GENERATION_STEP_FINISHED_KEY = "_generation_step_finished"
+
 # Flat payload keys partitioned at worker output into inter-stage connector
 # payloads vs client-facing multimodal outputs.  Only final output roots are
 # listed here; everything else remains available for stage-to-stage transport.
@@ -26,9 +28,6 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
         "videos",
         "trajectory_latents",
         "latents",
-        # Internal generation-stage control signal. The scheduler consumes and
-        # removes it before constructing the client response.
-        "_generation_step_finished",
     }
 )
 
@@ -43,6 +42,21 @@ _CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
         "turn_end",
     }
 )
+
+
+def extract_generation_step_finished(
+    payload: object,
+    num_requests: int,
+) -> tuple[object, list[bool] | None]:
+    """Separate a generation control signal from model media outputs."""
+    if not isinstance(payload, Mapping) or _GENERATION_STEP_FINISHED_KEY not in payload:
+        return payload, None
+
+    media_payload = dict(payload)
+    flags = media_payload.pop(_GENERATION_STEP_FINISHED_KEY)
+    if not isinstance(flags, list) or len(flags) != num_requests or not all(isinstance(flag, bool) for flag in flags):
+        raise ValueError(f"{_GENERATION_STEP_FINISHED_KEY} must be a list of {num_requests} booleans")
+    return media_payload, flags
 
 
 def partition_flat_payload(

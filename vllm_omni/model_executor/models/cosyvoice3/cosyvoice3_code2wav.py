@@ -391,6 +391,8 @@ class CosyVoice3Code2Wav(nn.Module):
                         device=tts_speech.device,
                         dtype=tts_speech.dtype,
                     )
+                # Preserve HiFT's returned waveform because only the overlap
+                # prefix belongs to this cache-aware cross-fade.
                 tts_speech = tts_speech.clone()
                 tts_speech[:, :overlap] = (
                     tts_speech[:, :overlap] * window[:overlap] + cached_speech[:, -overlap:] * window[overlap:]

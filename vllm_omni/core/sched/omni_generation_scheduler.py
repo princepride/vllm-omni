@@ -38,33 +38,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         model_config = self.vllm_config.model_config
         self._init_omni_io_scheduling_state()
         self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
+        self._stepwise_generation = bool(getattr(model_config, "stepwise_generation", False))
         self._pending_finish_reqs: list[Request] = []
         self._step_continuation_req_ids: set[str] = set()
-
-    def _set_chunk_payload_in_use(self, request_id: str, in_use: bool) -> None:
-        """Keep the async-chunk adapter from replacing an in-use payload."""
-        adapter = self.chunk_transfer_adapter
-        ready_ids = getattr(adapter, "requests_with_ready_chunks", None)
-        if ready_ids is None:
-            return
-        if in_use:
-            ready_ids.add(request_id)
-        else:
-            ready_ids.discard(request_id)
-
-    @staticmethod
-    def _pop_generation_step_finished(mm_output: dict[str, Any] | None) -> bool | None:
-        """Consume the private model-to-scheduler step completion marker."""
-        if not mm_output or "_generation_step_finished" not in mm_output:
-            return None
-        value = mm_output.pop("_generation_step_finished")
-        if hasattr(value, "numel") and hasattr(value, "item"):
-            if value.numel() != 1:
-                raise ValueError("_generation_step_finished must contain exactly one boolean")
-            return bool(value.item())
-        if isinstance(value, bool):
-            return value
-        raise TypeError(f"Unsupported _generation_step_finished type: {type(value).__name__}")
 
     @staticmethod
     def _record_prefill_stats(request: Request) -> None:
@@ -352,12 +328,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         finally:
             self._restore_omni_wait_queues()
 
-        if self._retains_state_across_chunks:
+        if self._stepwise_generation and self.chunk_transfer_adapter is not None:
             # postprocess_scheduler_output clears the ordinary chunk-ready
             # marker after admission. Step-wise models retain it until their
             # current payload has completed, preventing premature prefetch.
             for request_id in num_scheduled_tokens:
-                self._set_chunk_payload_in_use(request_id, True)
+                self.chunk_transfer_adapter.set_payload_in_use(request_id, True)
 
         return self._wrap_omni_scheduler_output(scheduler_output)
 
@@ -365,7 +341,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         getattr(self, "_step_continuation_req_ids", set()).discard(request.request_id)
-        self._set_chunk_payload_in_use(request.request_id, False)
+        if self._stepwise_generation and self.chunk_transfer_adapter is not None:
+            self.chunk_transfer_adapter.set_payload_in_use(request.request_id, False)
         if self.input_coordinator is None:
             return super()._free_request(request, delay_free_blocks)
 
@@ -386,6 +363,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
+        generation_step_finished_flags = getattr(model_runner_output, "generation_step_finished", None)
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
 
@@ -415,7 +393,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             request = self.requests.get(req_id)
             # The scheduled model call has returned. A step-wise model marks
             # the payload in use again below if it needs another Flow step.
-            self._set_chunk_payload_in_use(req_id, False)
+            if self._stepwise_generation and self.chunk_transfer_adapter is not None:
+                self.chunk_transfer_adapter.set_payload_in_use(req_id, False)
             if request is not None:
                 # vLLM 0.26: settle the in-flight tokens counted in schedule().
                 # Must happen before the skips below — failed-KV-load and
@@ -487,7 +466,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             kv_transfer_params = None
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
-            generation_step_finished = self._pop_generation_step_finished(mm_output)
+            generation_step_finished = (
+                generation_step_finished_flags[req_index] if generation_step_finished_flags is not None else None
+            )
             if generation_step_finished is False:
                 # Generation stages normally consume a request in one call.
                 # A step-wise model keeps one input token logically pending so
@@ -495,7 +476,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # newly arrived requests. The model keys its retained state by
                 # request ID and ignores this replayed token.
                 self._step_continuation_req_ids.add(req_id)
-                self._set_chunk_payload_in_use(req_id, True)
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.set_payload_in_use(req_id, True)
                 if request.num_computed_tokens > 0:
                     request.num_computed_tokens -= 1
                 continuing_generation_reqs.add(request)

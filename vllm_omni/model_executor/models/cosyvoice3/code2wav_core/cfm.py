@@ -174,13 +174,12 @@ class ConditionalCFM(BASECFM):
                 spks_e = spks.to(io_dtype).contiguous()
                 cond_e = cond.to(io_dtype).contiguous()
                 out_e = torch.empty_like(x_e)
-                cfg_batch = x_e.size(0)
-                estimator.set_input_shape("x", (cfg_batch, 80, x_e.size(2)))
-                estimator.set_input_shape("mask", (cfg_batch, 1, x_e.size(2)))
-                estimator.set_input_shape("mu", (cfg_batch, 80, x_e.size(2)))
-                estimator.set_input_shape("t", (cfg_batch,))
-                estimator.set_input_shape("spks", (cfg_batch, 80))
-                estimator.set_input_shape("cond", (cfg_batch, 80, x_e.size(2)))
+                estimator.set_input_shape("x", (2, 80, x_e.size(2)))
+                estimator.set_input_shape("mask", (2, 1, x_e.size(2)))
+                estimator.set_input_shape("mu", (2, 80, x_e.size(2)))
+                estimator.set_input_shape("t", (2,))
+                estimator.set_input_shape("spks", (2, 80))
+                estimator.set_input_shape("cond", (2, 80, x_e.size(2)))
                 data_ptrs = [
                     x_e.data_ptr(),
                     mask_e.data_ptr(),
