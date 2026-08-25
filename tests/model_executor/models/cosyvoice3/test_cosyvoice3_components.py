@@ -329,6 +329,85 @@ def test_code2wav_forward_finalizes_hift_tail():
     assert forward_mel_calls[0]["token_offset_tokens"] == 0
 
 
+def test_code2wav_streaming_hift_cache_is_bounded_and_device_resident():
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+
+    class DummyHiFT(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.m_source = SimpleNamespace(l_linear=SimpleNamespace(weight=torch.ones(1, dtype=torch.float32)))
+            self.calls: list[tuple[int, int, bool]] = []
+
+        def inference(self, speech_feat, finalize=True, cache_source=None):
+            cached = 0 if cache_source is None else int(cache_source.shape[-1])
+            self.calls.append((int(speech_feat.shape[-1]), cached, bool(finalize)))
+            samples = int(speech_feat.shape[-1]) * 2
+            speech = torch.ones((speech_feat.shape[0], 1, samples), device=speech_feat.device)
+            source = torch.ones_like(speech)
+            return speech, source
+
+    model = object.__new__(CosyVoice3Code2Wav)
+    nn.Module.__init__(model)
+    model.hift = DummyHiFT()
+    model.mel_cache_len = 2
+    model.source_cache_len = 4
+    model.speech_cache_len = 4
+    model.speech_window = torch.hamming_window(8, periodic=False)
+
+    chunk = torch.ones((1, 80, 4), dtype=torch.float32)
+    first_audio, first_state = model.decode_streaming_mel(chunk, finalize=False)
+    assert first_state is not None
+    assert first_audio.shape[-1] == 4
+    assert first_state["mel"].shape[-1] == 2
+    assert first_state["source"].shape[-1] == 4
+    assert first_state["speech"].shape[-1] == 4
+    assert all(value.device == chunk.device for value in first_state.values())
+
+    second_audio, second_state = model.decode_streaming_mel(chunk, cache_state=first_state, finalize=False)
+    assert second_state is not None
+    assert second_audio.shape[-1] == 8
+    assert second_state["mel"].shape[-1] == 2
+    assert model.hift.calls[:2] == [(4, 0, False), (6, 4, False)]
+
+    final_audio, final_state = model.decode_streaming_mel(chunk, cache_state=second_state, finalize=True)
+    assert final_audio.shape[-1] == 12
+    assert final_state is None
+    assert model.hift.calls[-1] == (6, 4, True)
+
+
+def test_causal_hift_f0_predictor_stays_on_hift_device():
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import CausalHiFTGenerator
+
+    class DummyF0Predictor(nn.Module):
+        def to(self, *args, **kwargs):
+            raise AssertionError("F0 predictor must not move devices during inference")
+
+        def forward(self, speech_feat, finalize=True):
+            return torch.ones(
+                (speech_feat.shape[0], speech_feat.shape[-1]),
+                device=speech_feat.device,
+                dtype=speech_feat.dtype,
+            )
+
+    class DummySource(nn.Module):
+        def forward(self, source):
+            return source, None, None
+
+    hift = object.__new__(CausalHiFTGenerator)
+    nn.Module.__init__(hift)
+    hift.f0_predictor = DummyF0Predictor()
+    hift.f0_upsamp = nn.Identity()
+    hift.m_source = DummySource()
+    hift.decode = lambda x, s, finalize: s
+
+    speech_feat = torch.ones((1, 80, 5), dtype=torch.float32)
+    cached_source = torch.full((1, 1, 2), 9.0, dtype=torch.float32)
+    speech, source = hift.inference(speech_feat, finalize=True, cache_source=cached_source)
+
+    assert speech.device == speech_feat.device
+    torch.testing.assert_close(source[:, :, :2], cached_source)
+
+
 def test_code2wav_flow_step_pads_variable_lengths_and_timesteps():
     from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import (
         CosyVoice3Code2Wav,
