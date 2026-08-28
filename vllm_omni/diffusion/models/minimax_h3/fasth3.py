@@ -283,6 +283,12 @@ def load_minimax_h3_fasth3_lora(
             len(gate_tensors),
         )
 
+    # Full-weight modules would be dropped by the LoRA path rather than
+    # applied, so an adapter that ships them is refused instead of half-loaded.
+    modules_to_save = config.get("modules_to_save")
+    if modules_to_save:
+        raise ValueError(f"MiniMax-H3 LoRA carries unsupported modules_to_save: {sorted(modules_to_save)[:5]}")
+
     rank = int(config.get("r") or _infer_rank(tensors))
     alpha = float(config.get("lora_alpha", rank))
     peft_helper = PEFTHelper.from_dict(
@@ -290,6 +296,9 @@ def load_minimax_h3_fasth3_lora(
             "r": rank,
             "lora_alpha": alpha,
             "target_modules": _TARGET_PATTERN,
+            # rsLoRA scales by alpha/sqrt(r) rather than alpha/r, so it has to
+            # be carried across or the adapter is applied at the wrong strength.
+            "use_rslora": bool(config.get("use_rslora", False)),
         }
     )
     lora_model = LoRAModel.from_lora_tensors(

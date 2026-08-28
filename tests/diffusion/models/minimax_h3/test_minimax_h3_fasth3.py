@@ -354,3 +354,20 @@ def test_binding_validation_names_the_incomplete_release():
             lora_model=lora_model,
             bound_lora_names=frozenset({"to_q"}),
         )
+
+
+def test_fasth3_carries_rslora_scaling_and_refuses_full_weight_modules(tmp_path):
+    plain = tmp_path / "fasth3-plain"
+    _write_adapter(plain, config={"r": _RANK, "lora_alpha": 8})
+    rslora = tmp_path / "fasth3-rslora"
+    _write_adapter(rslora, config={"r": _RANK, "lora_alpha": 8, "use_rslora": True})
+
+    # rsLoRA scales by alpha/sqrt(r) instead of alpha/r, so the flag has to
+    # survive the load or the adapter is applied at the wrong strength.
+    assert _load(plain)[0].loras["blocks.0.attn.to_q"].scaling == pytest.approx(8 / _RANK)
+    assert _load(rslora)[0].loras["blocks.0.attn.to_q"].scaling == pytest.approx(8 / _RANK**0.5)
+
+    saved = tmp_path / "fasth3-modules-to-save"
+    _write_adapter(saved, config={"r": _RANK, "modules_to_save": ["proj_out"]})
+    with pytest.raises(ValueError, match="unsupported modules_to_save"):
+        _load(saved)
