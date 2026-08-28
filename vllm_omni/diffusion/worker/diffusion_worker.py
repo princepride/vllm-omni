@@ -481,7 +481,16 @@ class DiffusionWorker:
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
-        if self.model_runner.pipeline is None:
+        pipeline = self.model_runner.pipeline
+        if pipeline is None:
+            return
+
+        # A release whose weights cannot be expressed as switchable LoRA layers
+        # is fused into the checkpoint while the pipeline loads. There is then
+        # no adapter left to register, and handing the same path to the manager
+        # would only fail on a format it does not accept.
+        if getattr(pipeline, "lora_is_fused", False):
+            logger.info("LoRA was fused into the checkpoint at load time; skipping the dynamic LoRA manager.")
             return
 
         lora_path = self.od_config.lora_path

@@ -118,10 +118,10 @@ from .denoise_loop import (
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .fasth3 import (
+    FASTH3_FLOW_SHIFT,
     FASTH3_SIGMA_POINTS,
     FASTH3_SUPPORTED_TASKS,
-    FastH3Adapter,
-    load_minimax_h3_fasth3_lora,
+    FastH3WeightFusion,
 )
 from .lora import load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
@@ -321,6 +321,25 @@ def _minimax_h3_step_schedule(state: StepRequestState) -> dict[str, float]:
         "imgvid_cond_timestep": max(t_video, MINIMAX_H3_IMGVID_COND_TIMESTEP),
         "audio_ref_cond_timestep": max(t_audio, MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
     }
+
+
+def _resolve_fasth3_fusion(od_config: Any, transformer: Any) -> FastH3WeightFusion | None:
+    """Claim ``--lora-path`` when it points at a FastH3 adapter.
+
+    FastH3 rewrites RMSNorm weights and biases, so it cannot be expressed as a
+    request-switchable LoRA and is fused into the checkpoint instead. Any other
+    artifact returns None here and stays on the dynamic LoRA route.
+    """
+    lora_path = getattr(od_config, "lora_path", None)
+    if isinstance(lora_path, (list, tuple)):
+        if len(lora_path) != 1:
+            return None
+        lora_path = lora_path[0]
+    if not lora_path:
+        return None
+    # Placing a delta into the fused QKV parameter needs the head size, so this
+    # is read only once an adapter is actually configured.
+    return FastH3WeightFusion.from_path(lora_path, head_dim=transformer.arch.attention_head_dim)
 
 
 def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
@@ -667,6 +686,8 @@ class MiniMaxH3Pipeline(
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+    # Set from --lora-path during construction; absent means no FastH3 adapter.
+    _fasth3: ClassVar[FastH3WeightFusion | None] = None
 
     def _load_diffusion_lora_adapter(
         self,
@@ -678,38 +699,22 @@ class MiniMaxH3Pipeline(
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
         self._turbo_lora_adapter_ids.discard(lora_request.lora_int_id)
-        self._fasth3_lora_adapters.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
         if getattr(od_config, "enable_cpu_offload", False):
             offload_modes.append("model-level CPU offload (--enable-cpu-offload)")
         if getattr(od_config, "enable_layerwise_offload", False):
             offload_modes.append("layerwise offload (--enable-layerwise-offload)")
-        unsupported_offload_mode = " or ".join(offload_modes) or None
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
             lora_path=lora_path,
             dtype=dtype,
-            unsupported_offload_mode=unsupported_offload_mode,
+            unsupported_offload_mode=" or ".join(offload_modes) or None,
         )
         if loaded is not None:
             self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
-            return loaded
-
-        fasth3_loaded = load_minimax_h3_fasth3_lora(
-            partition=self.partition,
-            lora_request=lora_request,
-            lora_path=lora_path,
-            dtype=dtype,
-            unsupported_offload_mode=unsupported_offload_mode,
-        )
-        if fasth3_loaded is None:
-            return None
-        lora_model, peft_helper, fasth3_adapter = fasth3_loaded
-        if fasth3_adapter is not None:
-            self._fasth3_lora_adapters[lora_request.lora_int_id] = fasth3_adapter
-        return lora_model, peft_helper
+        return loaded
 
     def _validate_diffusion_lora_binding(
         self,
@@ -717,16 +722,12 @@ class MiniMaxH3Pipeline(
         lora_model: LoRAModel,
         bound_lora_names: frozenset[str],
     ) -> None:
-        if lora_model.id in self._turbo_lora_adapter_ids:
-            release = "Turbo"
-        elif lora_model.id in self._fasth3_lora_adapters:
-            release = "FastH3"
-        else:
+        if lora_model.id not in self._turbo_lora_adapter_ids:
             return
         missing = sorted(set(lora_model.loras) - bound_lora_names)
         if missing:
             raise ValueError(
-                f"MiniMax-H3 {release} LoRA binding is incomplete: "
+                "MiniMax-H3 Turbo LoRA binding is incomplete: "
                 f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
             )
 
@@ -737,23 +738,6 @@ class MiniMaxH3Pipeline(
             and not math.isclose(0.0, float(sampling.lora_scale))
             and lora_request.lora_int_id in self._turbo_lora_adapter_ids
         )
-
-    def _active_fasth3_adapter(self, sampling: Any) -> FastH3Adapter | None:
-        lora_request = sampling.lora_request
-        if lora_request is None or math.isclose(0.0, float(sampling.lora_scale)):
-            return None
-        return self._fasth3_lora_adapters.get(lora_request.lora_int_id)
-
-    def _validate_fasth3_sampling(self, sampling: Any, adapter: FastH3Adapter) -> None:
-        # A release that pins its own rectified-flow positions is checked
-        # against them where the schedule is resolved, in interval terms.
-        if adapter.base_schedule is not None:
-            return
-        if sampling.num_inference_steps != FASTH3_SIGMA_POINTS:
-            raise OmniClientError(
-                f"FastH3 is a four-step student and requires num_inference_steps={FASTH3_SIGMA_POINTS} "
-                f"({FASTH3_SIGMA_POINTS} sigma points produce {FASTH3_SIGMA_POINTS - 1} denoiser evaluations)"
-            )
 
     def _validate_turbo_sampling(self, sampling: Any) -> None:
         extra = sampling.extra_args or {}
@@ -809,7 +793,6 @@ class MiniMaxH3Pipeline(
             str(od_config.model),
         )
         self._turbo_lora_adapter_ids: set[int] = set()
-        self._fasth3_lora_adapters: dict[int, FastH3Adapter] = {}
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
@@ -884,6 +867,31 @@ class MiniMaxH3Pipeline(
             self.transformers_ref = MiniMaxH3DiTModel(
                 od_config,
                 quant_config=transformer_quant_config,
+            )
+
+        self._fasth3 = _resolve_fasth3_fusion(od_config, self.transformer)
+        if self._fasth3 is not None:
+            if self.partition == "ref2va":
+                raise ValueError("FastH3 preview v1 distills T2VA only, so it cannot serve a Ref2VA partition")
+            if self._fasth3.requires_vsa:
+                raise ValueError(
+                    f"{self._fasth3.source} is a Video Sparse Attention variant of FastH3, and its "
+                    "compression gates have no counterpart in vLLM-Omni's dense H3 attention. Use the "
+                    "release's Dense variant until VSA lands for H3's packed sequence."
+                )
+            # The student's four-jump ladder is uniform, so the five-point
+            # schedule H3 already derives from num_inference_steps reproduces it
+            # once the rectified-flow shift is neutralised. Base H3 shifts video
+            # by 12 and audio by 3; leaving either in place would move every
+            # sampling point off the rungs the student was trained on.
+            self.default_video_shift = FASTH3_FLOW_SHIFT
+            self.default_audio_shift = FASTH3_FLOW_SHIFT
+            logger.info(
+                "FastH3 adapter active: %d sigma points for %d transformer forwards, flow_shift=%g, tasks=%s",
+                FASTH3_SIGMA_POINTS,
+                FASTH3_SIGMA_POINTS - 1,
+                FASTH3_FLOW_SHIFT,
+                sorted(FASTH3_SUPPORTED_TASKS),
             )
 
         if self.load_text_encoder:
@@ -994,7 +1002,12 @@ class MiniMaxH3Pipeline(
                 raise ValueError(f"MiniMax-H3 weight source {prefix!r} is not contiguous")
             loaded_prefixes.add(prefix)
             component = getattr(self, prefix.removesuffix("."))
-            loaded = component.load_weights((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
+            stream = ((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
+            if prefix == "transformer." and self._fasth3 is not None:
+                # Fuse before the model shards anything, which is also the only
+                # point where the checkpoint's fused QKV/MLP layouts are intact.
+                stream = self._fasth3.apply(stream)
+            loaded = component.load_weights(stream)
             if prefix != "text_encoder.":
                 component.post_load_weights()
             loaded_with_prefix.update(prefix + name for name in loaded)
@@ -1007,7 +1020,14 @@ class MiniMaxH3Pipeline(
             if component is None:
                 continue
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
+        if self._fasth3 is not None:
+            self._fasth3.validate_fully_applied()
         return loaded_with_prefix
+
+    @property
+    def lora_is_fused(self) -> bool:
+        """True when --lora-path was consumed as a load-time weight fusion."""
+        return self._fasth3 is not None
 
     def _transformer_for_task(self, task: str) -> MiniMaxH3DiTModel:
         if task == "ref2va" and hasattr(self, "transformers_ref"):
@@ -1025,7 +1045,6 @@ class MiniMaxH3Pipeline(
         multi_modal_data: dict[str, Any],
         *,
         has_turbo_lora: bool = False,
-        has_fasth3_lora: bool = False,
     ) -> str:
         if requested is None:
             # A Ref2VA-only startup has no FL2VA transformer; preserve its
@@ -1045,11 +1064,18 @@ class MiniMaxH3Pipeline(
             )
         if task == "ref2va" and has_turbo_lora:
             raise OmniClientError("MiniMax-H3 Turbo LoRA supports T2VA/FL2VA requests only")
-        if has_fasth3_lora and task not in FASTH3_SUPPORTED_TASKS:
+        if self._fasth3 is not None and task not in FASTH3_SUPPORTED_TASKS:
             raise OmniClientError(
                 f"FastH3 preview v1 distills {sorted(FASTH3_SUPPORTED_TASKS)} only, got task={task!r}"
             )
         return task
+
+    def _validate_fasth3_sampling(self, sampling: Any) -> None:
+        if sampling.num_inference_steps != FASTH3_SIGMA_POINTS:
+            raise OmniClientError(
+                f"FastH3 is a four-step student and requires num_inference_steps={FASTH3_SIGMA_POINTS} "
+                f"({FASTH3_SIGMA_POINTS} sigma points produce {FASTH3_SIGMA_POINTS - 1} transformer forwards)"
+            )
 
     def _resolve_shape(
         self,
@@ -2050,17 +2076,15 @@ class MiniMaxH3Pipeline(
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
         has_turbo_lora = self._has_active_turbo_lora(sampling)
-        fasth3_adapter = self._active_fasth3_adapter(sampling)
         task = self._resolve_task(
             extra.get("task"),
             multi_modal_data,
             has_turbo_lora=has_turbo_lora,
-            has_fasth3_lora=fasth3_adapter is not None,
         )
         if has_turbo_lora:
             self._validate_turbo_sampling(sampling)
-        if fasth3_adapter is not None:
-            self._validate_fasth3_sampling(sampling, fasth3_adapter)
+        if self._fasth3 is not None:
+            self._validate_fasth3_sampling(sampling)
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")
@@ -2277,10 +2301,7 @@ class MiniMaxH3Pipeline(
                     ref_audio_t = audio_lengths[0]
 
         seed = int(sampling.seed if sampling.seed is not None else 42)
-        # A distilled LoRA carries its own few-step positions; the checkpoint
-        # underneath it is the many-step teacher, whose schedule does not apply.
-        adapter_schedule = fasth3_adapter.base_schedule if fasth3_adapter is not None else None
-        sigma_schedule = adapter_schedule or self._base_schedule_for_task(task)
+        sigma_schedule = self._base_schedule_for_task(task)
         if sigma_schedule is None:
             base_schedule = None
             num_steps = int(sampling.num_inference_steps or 50)

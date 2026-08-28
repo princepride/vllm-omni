@@ -860,58 +860,69 @@ fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
 The five requested sigma points produce the four denoiser evaluations expected
 by the Turbo artifact.
 
-### FastH3 LoRA
+### FastH3 adapter
 
 [FastH3](https://haoailab.com/blogs/fasth3-preview/) is FastVideo's four-step
-DMD2 student of H3-Base. Like Turbo it ships as a LoRA over the base checkpoint
-and reuses H3's text encoder, VAEs, tokenizers, and schedulers unchanged, so it
-replaces the 49 denoiser evaluations with four without a second base download.
+DMD2 student of H3-Base. It reuses H3's text encoder, VAEs, tokenizers, and
+schedulers unchanged, replacing 49 denoiser evaluations with four.
 
-The preview line publishes several variants under one repository, so download
-the one you want into its own directory:
+Unlike Turbo it is not a request-switchable LoRA. Its own metadata states the
+reconstruction as `W = W_base + lora_B @ lora_A; then .diff/.diff_b added and
+.set_weight assigned`, so besides rank-64 factors it carries full-rank deltas
+for RMSNorm weights, biases, patch projections and the final layer, which no
+LoRA layer can express. vLLM-Omni therefore fuses it into the checkpoint while
+weights stream in, before any sharding, which is what the release requires and
+what FastVideo's own loader does.
+
+The bundle publishes four variants, so download one and point `--lora-path` at
+it; the repository root is refused rather than guessed at:
 
 ```bash
 export FASTH3_DIR=/path/to/fasth3
-export FASTH3_VARIANT=<variant subfolder from the model card>
 hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
-  --include "${FASTH3_VARIANT}/*" --local-dir "${FASTH3_DIR}"
-export FASTH3_LORA="${FASTH3_DIR}/${FASTH3_VARIANT}"
+  dense-datafree/adapter_model.safetensors --local-dir "${FASTH3_DIR}"
+export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
 ```
 
-`--lora-path` must name a single adapter, that is a directory holding one
-`.safetensors` (optionally with `adapter_config.json`) or the file itself; a
-repository snapshot holding several variants is rejected rather than guessed at.
-Start from a non-offloaded or DLO FL2VA server command and add `--task-type
-fl2va --lora-backend peft --lora-path "${FASTH3_LORA}"`. T2VA is served by the
-FL2VA partition, so `--task-type fl2va` is correct even though FastH3 preview v1
-distills T2VA only.
+Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a non-offloaded server
+command. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
+correct even though FastH3 preview v1 distills T2VA only. The dynamic LoRA
+manager is skipped for a fused adapter, so `--lora-backend` and per-request
+`lora=` fields do not apply.
 
 ```bash
 -F 'num_inference_steps=5' \
--F 'extra_params={"task":"t2va","duration":4.4}' \
--F "lora={\"name\":\"fasth3-preview-v1\",\"path\":\"${FASTH3_LORA}\",\"scale\":1.0}"
+-F 'extra_params={"task":"t2va","duration":4.4}'
 ```
 
-Requests carrying an active FastH3 adapter must ask for `num_inference_steps=5`,
-the five sigma points that bound the student's four denoiser evaluations, and
-must use `task=t2va`; `fl2va` and `ref2va` are rejected because preview v1 does
-not distill them. Unlike Turbo, FastH3 does not pin the sigma shifts, so
-`flow_shift` and `audio_flow_shift` keep the checkpoint defaults unless you set
-them. Rank and alpha are read from `adapter_config.json`, and inferred from the
-tensors when the adapter ships without one.
+Requests must ask for `num_inference_steps=5`, the five sigma points that bound
+the student's four transformer forwards, and must use `task=t2va`. The shifts
+are pinned for you: the student's four-jump ladder `[999, 749, 500, 250]` is
+uniform, so the server neutralises H3's rectified-flow shift (video 12, audio 3)
+to 1.0. Leaving either in place would move every sampling point off the rungs
+the student was trained on.
 
 > [!NOTE]
-> The VSA variants of this release were trained with Video Sparse Attention and
-> carry a `to_gate_compress` compression gate. vLLM-Omni does not yet apply VSA
-> to H3's packed `[text | cond | audio | video]` sequence, so that payload is
-> skipped and the adapter runs dense - FastVideo's `--no-vsa` mode. You get the
-> 49 -> 4 step speedup but not the sparse-attention speedup on top of it, and
-> the Dense variant of the release is the one trained for dense inference.
+> Only the **Dense / Data-Free** variant is supported today. The three VSA
+> variants carry `.set_weight` compression gates for modules that do not exist
+> in vLLM-Omni's dense H3 attention, and the release states dense attention is
+> not a supported substitute for them, so they are refused at startup rather
+> than silently run wrong. Video Sparse Attention for H3's packed
+> `[text | cond | audio | video]` sequence is follow-up work.
 
-The offload rules match Turbo: DLO is supported, while model-level
-(`--enable-cpu-offload`) and standard layerwise (`--enable-layerwise-offload`)
-offload are not. The integration is dynamic-only and does not support prefusion
-or LoRA composition.
+Measured on 8x NVIDIA B300 with USP8, VAE patch-parallel 8, `TRTLLM_ATTN`, at
+1344x768, 4.4 s, seed 1101, one warmup excluded and two runs recorded:
+
+| Adapter | Steps | End-to-end | Diffusion engine |
+| --- | ---: | ---: | ---: |
+| none (base H3) | 50 | 25.8 / 26.4 s | 16.22 / 16.28 s |
+| FastH3 Dense | 5 (4 forwards) | 11.7 / 11.8 s | 2.37 / 2.36 s |
+
+The denoising speedup is 6.9x. End-to-end is 2.2x because text encoding, VAE
+decoding and muxing are a fixed cost that dominates a clip this short; longer
+generations move the end-to-end figure toward the denoising one. Fusing the
+adapter does not measurably change startup: weight loading took 77.3 s with it
+against 85.8 s without.
 
 ## Key parameters
 

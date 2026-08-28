@@ -133,7 +133,7 @@ def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
     return tensors
 
 
-def pack_minimax_h3_fc1(lora_model: LoRAModel) -> None:
+def _pack_h3_turbo_fc1(lora_model: LoRAModel) -> None:
     """Represent H3's fused gate/up projection without generic layout guesses."""
 
     for module_name, weights in tuple(lora_model.loras.items()):
@@ -201,5 +201,5 @@ def load_minimax_h3_turbo_lora(
         dtype=dtype,
         weights_mapper=_TURBO_WEIGHTS_MAPPER,
     )
-    pack_minimax_h3_fc1(lora_model)
+    _pack_h3_turbo_fc1(lora_model)
     return lora_model, peft_helper

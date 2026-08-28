@@ -1,337 +1,411 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""FastVideo FastH3: a four-step DMD2-distilled LoRA over MiniMax-H3.
+"""FastVideo FastH3: a four-step DMD2 student of MiniMax-H3.
 
-FastH3 is a student of the 33B H3 transformer trained with Distribution
-Matching Distillation (DMD2). It replaces H3's 49 denoiser evaluations with
-four, and ships as a LoRA over the base checkpoint rather than as a full
-release, so it reuses H3's text encoder, video VAE, audio VAE, tokenizers and
-schedulers unchanged.
+FastH3 replaces H3's 49 denoiser evaluations with four. It ships as an adapter
+over the base checkpoint rather than as a full release, so it reuses H3's text
+encoder, video VAE, audio VAE, tokenizers and schedulers unchanged.
 
-Two things separate it from the LightX2V Turbo artifact handled in
-:mod:`vllm_omni.diffusion.models.minimax_h3.lora`:
+The artifact is *not* a PEFT LoRA, and it is not request-switchable. Its own
+metadata states the reconstruction as::
 
-* Turbo is a single published file with a pinned contract (one filename, one
-  rank, one exhaustive target set), so its loader validates that contract
-  exactly. FastH3 is a preview line with several checkpoint variants, so this
-  loader reads the layout from ``adapter_config.json`` and accepts any subset
-  of the supported targets.
-* Some FastH3 variants are trained with Video Sparse Attention and carry a
-  ``to_gate_compress`` compression-gate payload alongside the LoRA tensors.
-  vLLM-Omni does not yet run VSA over H3's packed ``[text | cond | audio |
-  video]`` sequence, so that payload is reported and skipped: the adapter runs
-  dense, which is the mode FastVideo exposes as ``--no-vsa``.
+    W = W_base + lora_B @ lora_A; then .diff/.diff_b added and .set_weight assigned
+
+so besides rank-64 factors it carries full-rank ``.diff``/``.diff_b`` deltas for
+RMSNorm weights, biases, patch projections and the final layer - none of which a
+LoRA layer can express - and the VSA variants add ``.set_weight`` tensors for
+compression gates that do not exist in the base transformer at all. The adapter
+is therefore fused into the checkpoint stream at load time, before the weights
+are sharded, which is also what the release's model card requires.
+
+The low-rank factors carry no alpha: the reconstruction adds ``lora_B @ lora_A``
+directly, i.e. a scale of exactly 1.
+
+Two checkpoint spellings meet here. The adapter is written in the diffusers
+namespace (``transformer_blocks.0.attn.to_q``) while vLLM-Omni loads H3's native
+one (``blocks.0.attn.qkv_proj``), whose attention and MLP projections are fused.
+Every mapping and layout convention below was verified tensor by tensor against
+the released full checkpoint (``FastVideo-FastH3-4-step-Preview-v1-Dense-DataFree``):
+``W_base + delta`` reproduces it to bf16 rounding.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
-import regex as re
 import torch
 from safetensors import safe_open
 from vllm.logger import init_logger
-from vllm.lora.lora_model import LoRAModel
-from vllm.lora.peft_helper import PEFTHelper
-
-from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
-from vllm_omni.lora.request import LoRARequest
-
-from .lora import pack_minimax_h3_fc1
 
 logger = init_logger(__name__)
 
-# Five sigma boundaries bound four intervals, i.e. the four DiT calls the
-# student was distilled for.
+FASTH3_FORMAT = "fastvideo-lora-v2"
+FASTH3_MANIFEST = "adapter_manifest.json"
+
+# Five scheduler points bound the four transformer forwards the student was
+# trained for. The ladder is the release's `dmd_denoising_steps` divided by
+# 1000; it starts at 0.999 rather than 1.0 because training capped the noise
+# level there (`max_timestep_ratio`), and it is uniform, so no rectified-flow
+# time shift is applied on top of it.
 FASTH3_SIGMA_POINTS = 5
-# Preview v1 distills the text-to-video-and-audio path only; FL2VA and Ref2VA
-# students are announced but not released.
+FASTH3_BASE_SCHEDULE = (0.999, 0.749, 0.500, 0.250, 0.0)
+FASTH3_FLOW_SHIFT = 1.0
+FASTH3_GUIDANCE_SCALE = 1.0
+# Preview v1 distills the text-to-video-and-audio path only.
 FASTH3_SUPPORTED_TASKS = frozenset({"t2va"})
 
-_CONFIG_FILENAME = "adapter_config.json"
-_GATE_MARKER = "to_gate_compress"
-_LORA_A_MARKER = ".lora_A"
-_LORA_B_MARKER = ".lora_B"
+_LORA_A = ".lora_A.weight"
+_LORA_B = ".lora_B.weight"
+_DIFF = ".diff"
+_DIFF_B = ".diff_b"
+_SET_WEIGHT = ".set_weight"
 
-# Prefixes PEFT and the diffusers/FastVideo exporters put in front of the
-# transformer path. Stripped left to right until none applies.
-_STRIPPED_PREFIXES = (
-    "base_model.model.",
-    "diffusion_model.",
-    "transformer.",
-)
+# Adapter module prefix -> the native parameter it edits, minus the
+# ``.weight``/``.bias`` suffix.
+_MODEL_LEVEL_TARGETS = {
+    "proj_in": "video_patch_proj",
+    "proj_out": "final_layer.video_out",
+    "audio_proj_in": "audio_patch_proj",
+    "audio_proj_out": "final_layer.audio_out",
+    "context_embedder": "condition_proj",
+    "time_embedder.linear_1": "time_embedder.proj_in",
+    "time_embedder.linear_2": "time_embedder.proj_out",
+    "norm_out.linear": "final_layer.adaln_proj.linear",
+    "norm_out.norm": "final_layer.norm",
+}
 
-# Checkpoint spelling -> vLLM-Omni MiniMaxH3DiTModel spelling. Ordered: the
-# refiner rewrite has to run before the generic ``transformer_blocks.`` one.
-_NAME_REWRITES = (
+# Per-block adapter suffix -> (native suffix, how a delta enters the native
+# parameter). H3 stores attention as one grouped QKV matrix and the MLP as one
+# fused gate/up matrix, so those deltas need placing rather than adding.
+_PLAIN, _QKV_Q, _QKV_K, _QKV_V, _SWAP_HALVES = "plain", "q", "k", "v", "swap_halves"
+_BLOCK_TARGETS = {
+    "attn.to_q": ("attn.qkv_proj", _QKV_Q),
+    "attn.to_k": ("attn.qkv_proj", _QKV_K),
+    "attn.to_v": ("attn.qkv_proj", _QKV_V),
+    "attn.to_out.0": ("attn.out_proj", _PLAIN),
+    "ff.net.0.proj": ("mlp.fc1", _SWAP_HALVES),
+    "ff.net.2": ("mlp.fc2", _PLAIN),
+    "adaln_proj.linear": ("adaln_proj.linear", _PLAIN),
+    "norm1": ("norm1", _PLAIN),
+    "norm2": ("norm2", _PLAIN),
+}
+
+# Adapter block prefix -> native block prefix.
+_BLOCK_PREFIXES = (
     ("token_refiner.refiner_blocks.", "token_refiner.blocks."),
     ("transformer_blocks.", "blocks."),
-    (".attn.to_out.0.", ".attn.out_proj."),
-    (".attn.to_out.", ".attn.out_proj."),
-    (".ff.net.0.proj.", ".mlp.fc1."),
-    (".ff.net.2.", ".mlp.fc2."),
-)
-
-# Suffixes that name a linear vLLM-Omni exposes to LoRA on the H3 DiT. ``to_q``
-# / ``to_k`` / ``to_v`` bind into the fused ``qkv_proj`` and ``fc1`` into the
-# fused gate/up projection; the manager resolves both from the model's
-# stacked_params_mapping.
-_SUPPORTED_TARGETS = frozenset({"to_q", "to_k", "to_v", "out_proj", "fc1", "fc2"})
-
-# Matched against full module names, which carry the component prefix.
-_TARGET_PATTERN = (
-    r"^transformer\.(?:token_refiner\.blocks|blocks)\.\d+\."
-    r"(?:attn\.(?:to_q|to_k|to_v|out_proj)|mlp\.(?:fc1|fc2))$"
-)
-_MAPPED_TARGET_RE = re.compile(
-    r"^(?:token_refiner\.blocks|blocks)\.\d+\.(?:attn\.(?:to_q|to_k|to_v|out_proj)|mlp\.(?:fc1|fc2))$"
 )
 
 
-@dataclass(frozen=True)
-class FastH3Adapter:
-    """What a loaded FastH3 adapter pins for the requests that use it."""
-
-    # Present only when the release ships explicit rectified-flow positions.
-    # Without one the four steps come from the uniform five-point schedule,
-    # which is what the published preview configs use.
-    base_schedule: DMD2SigmaSchedule | None
-    # A VSA-trained variant whose compression gate was skipped, so it is
-    # running dense. Kept so the pipeline can say so once per request cycle.
-    vsa_gate_skipped: bool
+class FastH3AdapterError(ValueError):
+    """The artifact is a FastH3 adapter, but it cannot be applied as one."""
 
 
-def _resolve_adapter_files(lora_path: str | Path) -> tuple[Path, Path | None] | None:
-    """Return ``(weights, config)`` for a PEFT-style adapter, or None."""
-    path = Path(lora_path)
-    if path.is_file():
-        return (path, None) if path.suffix == ".safetensors" else None
-    if not path.is_dir():
-        return None
+@dataclass
+class _ParamPatch:
+    """Everything the adapter contributes to one native parameter."""
 
-    config = path / _CONFIG_FILENAME
-    named = path / "adapter_model.safetensors"
-    if named.is_file():
-        return named, config if config.is_file() else None
-
-    candidates = sorted(path.glob("*.safetensors"))
-    if len(candidates) != 1:
-        # Zero candidates is not an adapter; several is a repository snapshot
-        # holding more than one variant, and picking one of them here would be
-        # a guess about which checkpoint the user meant.
-        return None
-    return candidates[0], config if config.is_file() else None
+    # layout -> (lora_A, lora_B). A grouped QKV parameter collects three.
+    low_rank: dict[str, tuple[torch.Tensor | None, torch.Tensor | None]] = field(default_factory=dict)
+    diff: torch.Tensor | None = None
+    layout: str = _PLAIN
 
 
-def _read_config(config_path: Path | None) -> dict[str, Any]:
-    if config_path is None:
-        return {}
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"MiniMax-H3 LoRA has an unreadable {_CONFIG_FILENAME}: {exc}") from exc
-    if not isinstance(config, dict):
-        raise ValueError(f"MiniMax-H3 LoRA {_CONFIG_FILENAME} must hold an object")
-    return config
+def _swap_halves(tensor: torch.Tensor) -> torch.Tensor:
+    """Exchange the two halves of a fused gate/up matrix.
+
+    The diffusers export stores the feed-forward projection value-first while
+    H3's native ``mlp.fc1`` is gate-first, so a delta computed in the diffusers
+    layout has to be swapped before it can be added to the native parameter.
+    """
+    if tensor.shape[0] % 2:
+        raise FastH3AdapterError(f"fused gate/up delta must split evenly, got {tuple(tensor.shape)}")
+    first, second = tensor.chunk(2, dim=0)
+    return torch.cat((second, first), dim=0)
 
 
-def _map_module_name(raw_target: str) -> str | None:
-    """Rewrite a checkpoint target path to its DiT module name, or None."""
-    name = raw_target
-    for prefix in _STRIPPED_PREFIXES:
-        if name.startswith(prefix):
-            name = name[len(prefix) :]
-    # The rewrites are written with dots on both sides so they cannot match a
-    # partial identifier; pad the ends so a leading or trailing match still hits.
-    padded = f".{name}."
-    for old, new in _NAME_REWRITES:
-        padded = padded.replace(old, new)
-    name = padded[1:-1]
-    if name.rsplit(".", 1)[-1] not in _SUPPORTED_TARGETS:
-        return None
-    return name if _MAPPED_TARGET_RE.match(name) else None
+def _place_in_grouped_qkv(
+    deltas: Mapping[str, torch.Tensor],
+    *,
+    head_dim: int,
+    rows: int,
+) -> torch.Tensor:
+    """Interleave per-projection deltas into H3's grouped QKV layout.
+
+    The checkpoint stores one head group at a time as ``[q, k, v]``, which is
+    what :func:`_reorder_grouped_qkv_to_qkv` unpacks on the way in. A delta
+    built from the separate diffusers projections has to be folded back into
+    that order.
+    """
+    missing = sorted({_QKV_Q, _QKV_K, _QKV_V} - set(deltas))
+    if missing:
+        raise FastH3AdapterError(f"grouped QKV delta is missing its {missing} projections")
+    parts = []
+    for slot in (_QKV_Q, _QKV_K, _QKV_V):
+        delta = deltas[slot]
+        if delta.shape[0] % head_dim:
+            raise FastH3AdapterError(
+                f"QKV {slot} delta rows {delta.shape[0]} are not a multiple of head_dim {head_dim}"
+            )
+        parts.append(delta.reshape(delta.shape[0] // head_dim, head_dim, *delta.shape[1:]))
+    groups = parts[0].shape[0]
+    if any(part.shape[0] != groups for part in parts):
+        raise FastH3AdapterError("QKV projections disagree on the number of head groups")
+    grouped = torch.cat(parts, dim=1).reshape(groups * 3 * head_dim, *parts[0].shape[2:])
+    if grouped.shape[0] != rows:
+        raise FastH3AdapterError(f"grouped QKV delta has {grouped.shape[0]} rows, parameter expects {rows}")
+    return grouped
 
 
-def _split_side(name: str) -> tuple[str, str] | None:
-    """Split a tensor name into ``(raw_target, "a" | "b")``."""
-    for marker, side in ((_LORA_A_MARKER, "a"), (_LORA_B_MARKER, "b")):
-        index = name.find(marker)
-        if index != -1:
-            return name[:index], side
+def _resolve_native_target(module: str) -> tuple[str, str] | None:
+    """Map an adapter module path to ``(native module path, layout)``."""
+    native = _MODEL_LEVEL_TARGETS.get(module)
+    if native is not None:
+        return native, _PLAIN
+    for adapter_prefix, native_prefix in _BLOCK_PREFIXES:
+        if not module.startswith(adapter_prefix):
+            continue
+        remainder = module[len(adapter_prefix) :]
+        index, _, suffix = remainder.partition(".")
+        if not index.isdigit():
+            return None
+        target = _BLOCK_TARGETS.get(suffix)
+        if target is None:
+            return None
+        native_suffix, layout = target
+        return f"{native_prefix}{index}.{native_suffix}", layout
     return None
 
 
-def _is_fasth3_release(weights_path: Path, config: Mapping[str, Any], has_gate: bool) -> bool:
-    """Decide whether this adapter is a FastH3 four-step student.
-
-    The step count is a hard contract - applying it to an adapter that was not
-    distilled would silently truncate its schedule - so it is only applied to
-    an adapter that identifies itself. A VSA compression gate is the release's
-    own marker: FastVideo's runner reads the same payload to choose its
-    attention backend. Otherwise the release line has to be named, which is how
-    the published repositories and checkpoint files are spelled.
-    """
-    if has_gate:
-        return True
-    if config.get("_fasth3") is not None:
-        return True
-    haystack = "/".join(part.lower() for part in (*weights_path.parts[-3:], weights_path.stem))
-    return "fasth3" in haystack.replace("-", "").replace("_", "")
+def _split_adapter_key(name: str) -> tuple[str, str] | None:
+    """Split an adapter tensor name into ``(module path, role)``."""
+    for marker, role in (
+        (_LORA_A, "lora_a"),
+        (_LORA_B, "lora_b"),
+        (_DIFF_B, "diff_b"),
+        (_DIFF, "diff"),
+        (_SET_WEIGHT, "set_weight"),
+    ):
+        if name.endswith(marker):
+            return name[: -len(marker)], role
+    return None
 
 
-def _read_base_schedule(config: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
-    marker = config.get("_fasth3")
-    if isinstance(marker, Mapping):
-        schedule = DMD2SigmaSchedule.from_metadata(marker)
-        if schedule is not None:
-            return schedule
-    return DMD2SigmaSchedule.from_metadata(config)
+class FastH3WeightFusion:
+    """Fuse a FastH3 adapter into the H3 checkpoint stream as it is loaded."""
 
+    def __init__(
+        self,
+        *,
+        source: Path,
+        metadata: Mapping[str, str],
+        patches: Mapping[str, _ParamPatch],
+        head_dim: int,
+        requires_vsa: bool,
+    ) -> None:
+        self._source = source
+        self._metadata = dict(metadata)
+        self._patches = dict(patches)
+        self._head_dim = head_dim
+        self.requires_vsa = requires_vsa
+        self._applied: set[str] = set()
+        self._device: torch.device | None = None
 
-def _infer_rank(tensors: Mapping[str, torch.Tensor]) -> int:
-    """Rank is the shared inner dimension of every A/B pair."""
-    ranks = {int(tensor.shape[0]) for name, tensor in tensors.items() if _LORA_A_MARKER in name}
-    if len(ranks) != 1:
-        raise ValueError(f"MiniMax-H3 LoRA mixes ranks across targets: {sorted(ranks)}")
-    return ranks.pop()
+    @property
+    def source(self) -> Path:
+        return self._source
 
+    @property
+    def rank(self) -> int:
+        return int(self._metadata.get("rank", 0))
 
-def load_minimax_h3_fasth3_lora(
-    *,
-    partition: str,
-    lora_request: LoRARequest,
-    lora_path: str | Path,
-    dtype: torch.dtype,
-    unsupported_offload_mode: str | None = None,
-) -> tuple[LoRAModel, PEFTHelper, FastH3Adapter | None] | None:
-    """Load a PEFT-style LoRA over the MiniMax-H3 DiT.
+    @classmethod
+    def from_path(cls, path: str | Path, *, head_dim: int) -> FastH3WeightFusion | None:
+        """Build a fusion from an adapter file or directory, else ``None``.
 
-    Returns ``None`` when the path is not such an adapter, which lets the
-    caller fall through to the generic checkpoint loader. The third element is
-    the FastH3 contract, present only for an adapter that identifies itself as
-    a four-step student.
-    """
-    resolved = _resolve_adapter_files(lora_path)
-    if resolved is None:
-        return None
-    weights_path, config_path = resolved
-    config = _read_config(config_path)
+        Returning ``None`` keeps every other ``--lora-path`` artifact on the
+        dynamic LoRA route; only a ``fastvideo-lora-v2`` file is claimed here.
+        """
+        weights_path = _resolve_adapter_file(path)
+        if weights_path is None:
+            return None
 
-    tensors: dict[str, torch.Tensor] = {}
-    unmapped: list[str] = []
-    gate_tensors: list[str] = []
-    with safe_open(weights_path, framework="pt", device="cpu") as checkpoint:
-        names = list(checkpoint.keys())
-        for name in names:
-            if _GATE_MARKER in name:
-                gate_tensors.append(name)
-                continue
-            split = _split_side(name)
-            if split is None:
-                unmapped.append(name)
-                continue
-            raw_target, side = split
-            module_name = _map_module_name(raw_target)
-            if module_name is None:
-                unmapped.append(name)
-                continue
-            tensor = checkpoint.get_tensor(name)
-            if tensor.ndim != 2:
-                raise ValueError(f"MiniMax-H3 LoRA tensors must be matrices, got {name}={tuple(tensor.shape)}")
-            if side == "b" and module_name.endswith(".mlp.fc1"):
-                # H3 stores the fused MLP projection gate-first; diffusers-style
-                # exports carry it value-first.
-                value, gate = tensor.chunk(2, dim=0)
-                tensor = torch.cat((gate, value), dim=0).contiguous()
-            tensors[f"{module_name}.lora_{side.upper()}.weight"] = tensor
+        patches: dict[str, _ParamPatch] = {}
+        gate_tensors: list[str] = []
+        unmapped: list[str] = []
+        with safe_open(weights_path, framework="pt", device="cpu") as checkpoint:
+            metadata = checkpoint.metadata() or {}
+            if metadata.get("format") != FASTH3_FORMAT:
+                return None
+            for name in checkpoint.keys():
+                split = _split_adapter_key(name)
+                if split is None:
+                    unmapped.append(name)
+                    continue
+                module, role = split
+                if role == "set_weight":
+                    # A VSA compression gate: a module the base transformer does
+                    # not have, so there is nothing to fuse it into.
+                    gate_tensors.append(name)
+                    continue
+                target = _resolve_native_target(module)
+                if target is None:
+                    unmapped.append(name)
+                    continue
+                native_module, layout = target
+                native_param = f"{native_module}.{'bias' if role == 'diff_b' else 'weight'}"
+                patch = patches.setdefault(native_param, _ParamPatch(layout=layout))
+                tensor = checkpoint.get_tensor(name)
+                if role in ("diff", "diff_b"):
+                    if patch.diff is not None:
+                        raise FastH3AdapterError(f"duplicate {role} for {native_param}")
+                    patch.diff = tensor
+                else:
+                    slot = layout if layout in (_QKV_Q, _QKV_K, _QKV_V) else _PLAIN
+                    a, b = patch.low_rank.get(slot, (None, None))
+                    patch.low_rank[slot] = (tensor, b) if role == "lora_a" else (a, tensor)
 
-    if not tensors:
-        # Nothing here targets the H3 DiT, so this is somebody else's adapter.
-        return None
-    if unmapped:
-        raise ValueError(
-            f"MiniMax-H3 LoRA at {weights_path} has {len(unmapped)} tensors that do not name a "
-            f"supported target: {sorted(unmapped)[:5]}"
+        if unmapped:
+            raise FastH3AdapterError(
+                f"FastH3 adapter at {weights_path} has {len(unmapped)} tensors that name no known "
+                f"H3 parameter: {sorted(unmapped)[:5]}"
+            )
+        for native_param, patch in patches.items():
+            for slot, (a, b) in patch.low_rank.items():
+                if a is None or b is None:
+                    raise FastH3AdapterError(f"FastH3 adapter has an unpaired factor for {native_param} slot {slot!r}")
+
+        fusion = cls(
+            source=weights_path,
+            metadata=metadata,
+            patches=patches,
+            head_dim=head_dim,
+            requires_vsa=bool(gate_tensors),
         )
-
-    incomplete = sorted(
-        module_name
-        for module_name in {name.rsplit(".lora_", 1)[0] for name in tensors}
-        if f"{module_name}.lora_A.weight" not in tensors or f"{module_name}.lora_B.weight" not in tensors
-    )
-    if incomplete:
-        raise ValueError(f"MiniMax-H3 LoRA has unpaired A/B tensors: {incomplete[:5]}")
-
-    is_fasth3 = _is_fasth3_release(weights_path, config, bool(gate_tensors))
-    if is_fasth3:
-        if partition == "ref2va":
-            raise ValueError("FastH3 preview v1 distills T2VA only, so it cannot run on a Ref2VA partition")
-        if unsupported_offload_mode is not None:
-            raise ValueError(f"FastH3 dynamic LoRA does not support {unsupported_offload_mode}")
-    if gate_tensors:
-        logger.warning(
-            "FastH3 adapter at %s carries %d Video Sparse Attention gate tensors, which vLLM-Omni cannot "
-            "yet apply to H3's packed [text | cond | audio | video] sequence. They are skipped and the "
-            "adapter runs dense, matching FastVideo's --no-vsa mode. For dense serving prefer the Dense "
-            "variant of the release.",
+        logger.info(
+            "FastH3 adapter %s: rank=%s, parameters patched=%d, low-rank=%s, diff=%s, set_weight=%d",
             weights_path,
+            metadata.get("rank", "?"),
+            len(patches),
+            metadata.get("low_rank_tensors", "?"),
+            metadata.get("diff_tensors", "?"),
             len(gate_tensors),
         )
+        return fusion
 
-    # Full-weight modules would be dropped by the LoRA path rather than
-    # applied, so an adapter that ships them is refused instead of half-loaded.
-    modules_to_save = config.get("modules_to_save")
-    if modules_to_save:
-        raise ValueError(f"MiniMax-H3 LoRA carries unsupported modules_to_save: {sorted(modules_to_save)[:5]}")
+    def _compute_device(self, weight: torch.Tensor) -> torch.device:
+        """Where to reconstruct a delta.
 
-    rank = int(config.get("r") or _infer_rank(tensors))
-    alpha = float(config.get("lora_alpha", rank))
-    peft_helper = PEFTHelper.from_dict(
-        {
-            "r": rank,
-            "lora_alpha": alpha,
-            "target_modules": _TARGET_PATTERN,
-            # rsLoRA scales by alpha/sqrt(r) rather than alpha/r, so it has to
-            # be carried across or the adapter is applied at the wrong strength.
-            "use_rslora": bool(config.get("use_rslora", False)),
-        }
-    )
-    lora_model = LoRAModel.from_lora_tensors(
-        lora_model_id=lora_request.lora_int_id,
-        tensors=tensors,
-        peft_helper=peft_helper,
-        device="cpu",
-        dtype=dtype,
-    )
-    pack_minimax_h3_fc1(lora_model)
+        H3's per-block modulation projection is 96768x2688, so rebuilding all
+        343 patched parameters is a few TFLOP of rank-64 products. On CPU that
+        adds minutes to a load that already has a startup deadline, so the
+        accelerator does the arithmetic whenever there is one.
+        """
+        if weight.device.type != "cpu":
+            return weight.device
+        if self._device is None:
+            self._device = torch.device(torch.accelerator.current_accelerator() or "cpu")
+        return self._device
 
-    adapter = (
-        FastH3Adapter(
-            base_schedule=_read_base_schedule(config),
-            vsa_gate_skipped=bool(gate_tensors),
+    def fuse(self, name: str, weight: torch.Tensor) -> torch.Tensor:
+        """Return ``weight`` with this adapter's contribution added."""
+        patch = self._patches.get(name)
+        if patch is None:
+            return weight
+        self._applied.add(name)
+
+        device = self._compute_device(weight)
+        product = lambda a, b: b.to(device, torch.float32) @ a.to(device, torch.float32)  # noqa: E731
+
+        delta: torch.Tensor | None = None
+        if patch.low_rank:
+            if patch.layout in (_QKV_Q, _QKV_K, _QKV_V):
+                per_slot = {slot: product(a, b) for slot, (a, b) in patch.low_rank.items()}
+                delta = _place_in_grouped_qkv(per_slot, head_dim=self._head_dim, rows=weight.shape[0])
+            else:
+                a, b = patch.low_rank[_PLAIN]
+                delta = product(a, b)
+                if patch.layout == _SWAP_HALVES:
+                    delta = _swap_halves(delta)
+        if patch.diff is not None:
+            diff = patch.diff.to(device, torch.float32)
+            delta = diff if delta is None else delta + diff
+        if delta is None:
+            return weight
+        if delta.shape != weight.shape:
+            raise FastH3AdapterError(
+                f"FastH3 delta for {name} has shape {tuple(delta.shape)}, parameter is {tuple(weight.shape)}"
+            )
+        # Leave the result on the compute device. These weights are bound for
+        # the accelerator anyway, so returning them to host memory would pay a
+        # device-to-host copy of the whole checkpoint only for the loader to
+        # send it straight back: measured at 152s against 15s for 60 GiB of
+        # patched projections, against 17s for the unavoidable upload alone.
+        fused = weight.to(device, non_blocking=True).to(torch.float32) + delta
+        return fused.to(weight.dtype)
+
+    def apply(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
+        """Fuse every streamed checkpoint tensor on its way into the model."""
+        for name, weight in weights:
+            yield name, self.fuse(name, weight)
+
+    def validate_fully_applied(self) -> None:
+        """Fail if the checkpoint never offered a parameter the adapter edits.
+
+        A silently unapplied delta is the failure mode that matters here: the
+        model would load and generate, just not as the distilled student.
+        """
+        missing = sorted(set(self._patches) - self._applied)
+        if missing:
+            raise FastH3AdapterError(
+                f"FastH3 adapter edits {len(missing)} parameters the checkpoint never provided: {missing[:5]}"
+            )
+
+
+def _resolve_adapter_file(path: str | Path) -> Path | None:
+    """Find the single adapter file at ``path``, or ``None``."""
+    candidate = Path(path)
+    if candidate.is_file():
+        return candidate if candidate.suffix == ".safetensors" else None
+    if not candidate.is_dir():
+        return None
+    named = candidate / "adapter_model.safetensors"
+    if named.is_file():
+        return named
+    files = sorted(candidate.glob("*.safetensors"))
+    if len(files) == 1:
+        return files[0]
+    # The published repository bundles four variants under one root, so a
+    # directory holding several adapters is ambiguous rather than loadable.
+    if len(files) > 1 or (candidate / FASTH3_MANIFEST).is_file():
+        raise FastH3AdapterError(
+            f"{candidate} holds {len(files)} adapters; point --lora-path at one variant "
+            "(for example dense-datafree/adapter_model.safetensors)"
         )
-        if is_fasth3
-        else None
-    )
-    logger.info(
-        "Loaded MiniMax-H3 LoRA from %s: rank=%d, alpha=%g, targets=%d, fasth3=%s",
-        weights_path,
-        rank,
-        alpha,
-        len(lora_model.loras),
-        is_fasth3,
-    )
-    return lora_model, peft_helper, adapter
+    return None
+
+
+def read_fasth3_manifest(path: str | Path) -> dict[str, object] | None:
+    """Read the bundle manifest next to a variant, when one is published."""
+    for directory in (Path(path), Path(path).parent, Path(path).parent.parent):
+        manifest = directory / FASTH3_MANIFEST
+        if manifest.is_file():
+            return json.loads(manifest.read_text(encoding="utf-8"))
+    return None
 
 
 __all__ = [
+    "FASTH3_BASE_SCHEDULE",
+    "FASTH3_FLOW_SHIFT",
+    "FASTH3_FORMAT",
+    "FASTH3_GUIDANCE_SCALE",
     "FASTH3_SIGMA_POINTS",
     "FASTH3_SUPPORTED_TASKS",
-    "FastH3Adapter",
-    "load_minimax_h3_fasth3_lora",
+    "FastH3AdapterError",
+    "FastH3WeightFusion",
+    "read_fasth3_manifest",
 ]
