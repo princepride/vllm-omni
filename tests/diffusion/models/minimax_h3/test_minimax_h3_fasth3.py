@@ -65,9 +65,8 @@ def _write_adapter(
                 if target != drop_lora_b:
                     # A distinguishable ramp so the fused-MLP halves stay
                     # identifiable after packing.
-                    tensors[f"{target}.lora_B.weight"] = (
-                        torch.arange(output_dim, dtype=torch.float32)[:, None].repeat(1, _RANK)
-                    )
+                    ramp = torch.arange(output_dim, dtype=torch.float32)
+                    tensors[f"{target}.lora_B.weight"] = ramp[:, None].repeat(1, _RANK)
     if gate_tensors:
         tensors["transformer_blocks.0.attn.to_gate_compress.weight"] = torch.ones((_HIDDEN, _HIDDEN))
     tensors.update(extra_tensors or {})
