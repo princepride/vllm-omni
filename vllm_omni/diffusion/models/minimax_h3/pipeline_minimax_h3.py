@@ -117,6 +117,12 @@ from .denoise_loop import (
     minimax_h3_publish_denoise_progress,
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
+from .fasth3 import (
+    FASTH3_SIGMA_POINTS,
+    FASTH3_SUPPORTED_TASKS,
+    FastH3Adapter,
+    load_minimax_h3_fasth3_lora,
+)
 from .lora import load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
@@ -672,22 +678,38 @@ class MiniMaxH3Pipeline(
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
         self._turbo_lora_adapter_ids.discard(lora_request.lora_int_id)
+        self._fasth3_lora_adapters.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
         if getattr(od_config, "enable_cpu_offload", False):
             offload_modes.append("model-level CPU offload (--enable-cpu-offload)")
         if getattr(od_config, "enable_layerwise_offload", False):
             offload_modes.append("layerwise offload (--enable-layerwise-offload)")
+        unsupported_offload_mode = " or ".join(offload_modes) or None
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
             lora_path=lora_path,
             dtype=dtype,
-            unsupported_offload_mode=" or ".join(offload_modes) or None,
+            unsupported_offload_mode=unsupported_offload_mode,
         )
         if loaded is not None:
             self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
-        return loaded
+            return loaded
+
+        fasth3_loaded = load_minimax_h3_fasth3_lora(
+            partition=self.partition,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=unsupported_offload_mode,
+        )
+        if fasth3_loaded is None:
+            return None
+        lora_model, peft_helper, fasth3_adapter = fasth3_loaded
+        if fasth3_adapter is not None:
+            self._fasth3_lora_adapters[lora_request.lora_int_id] = fasth3_adapter
+        return lora_model, peft_helper
 
     def _validate_diffusion_lora_binding(
         self,
@@ -695,12 +717,16 @@ class MiniMaxH3Pipeline(
         lora_model: LoRAModel,
         bound_lora_names: frozenset[str],
     ) -> None:
-        if lora_model.id not in self._turbo_lora_adapter_ids:
+        if lora_model.id in self._turbo_lora_adapter_ids:
+            release = "Turbo"
+        elif lora_model.id in self._fasth3_lora_adapters:
+            release = "FastH3"
+        else:
             return
         missing = sorted(set(lora_model.loras) - bound_lora_names)
         if missing:
             raise ValueError(
-                "MiniMax-H3 Turbo LoRA binding is incomplete: "
+                f"MiniMax-H3 {release} LoRA binding is incomplete: "
                 f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
             )
 
@@ -711,6 +737,23 @@ class MiniMaxH3Pipeline(
             and not math.isclose(0.0, float(sampling.lora_scale))
             and lora_request.lora_int_id in self._turbo_lora_adapter_ids
         )
+
+    def _active_fasth3_adapter(self, sampling: Any) -> FastH3Adapter | None:
+        lora_request = sampling.lora_request
+        if lora_request is None or math.isclose(0.0, float(sampling.lora_scale)):
+            return None
+        return self._fasth3_lora_adapters.get(lora_request.lora_int_id)
+
+    def _validate_fasth3_sampling(self, sampling: Any, adapter: FastH3Adapter) -> None:
+        # A release that pins its own rectified-flow positions is checked
+        # against them where the schedule is resolved, in interval terms.
+        if adapter.base_schedule is not None:
+            return
+        if sampling.num_inference_steps != FASTH3_SIGMA_POINTS:
+            raise OmniClientError(
+                f"FastH3 is a four-step student and requires num_inference_steps={FASTH3_SIGMA_POINTS} "
+                f"({FASTH3_SIGMA_POINTS} sigma points produce {FASTH3_SIGMA_POINTS - 1} denoiser evaluations)"
+            )
 
     def _validate_turbo_sampling(self, sampling: Any) -> None:
         extra = sampling.extra_args or {}
@@ -766,6 +809,7 @@ class MiniMaxH3Pipeline(
             str(od_config.model),
         )
         self._turbo_lora_adapter_ids: set[int] = set()
+        self._fasth3_lora_adapters: dict[int, FastH3Adapter] = {}
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
@@ -981,6 +1025,7 @@ class MiniMaxH3Pipeline(
         multi_modal_data: dict[str, Any],
         *,
         has_turbo_lora: bool = False,
+        has_fasth3_lora: bool = False,
     ) -> str:
         if requested is None:
             # A Ref2VA-only startup has no FL2VA transformer; preserve its
@@ -1000,6 +1045,10 @@ class MiniMaxH3Pipeline(
             )
         if task == "ref2va" and has_turbo_lora:
             raise OmniClientError("MiniMax-H3 Turbo LoRA supports T2VA/FL2VA requests only")
+        if has_fasth3_lora and task not in FASTH3_SUPPORTED_TASKS:
+            raise OmniClientError(
+                f"FastH3 preview v1 distills {sorted(FASTH3_SUPPORTED_TASKS)} only, got task={task!r}"
+            )
         return task
 
     def _resolve_shape(
@@ -2001,13 +2050,17 @@ class MiniMaxH3Pipeline(
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
         has_turbo_lora = self._has_active_turbo_lora(sampling)
+        fasth3_adapter = self._active_fasth3_adapter(sampling)
         task = self._resolve_task(
             extra.get("task"),
             multi_modal_data,
             has_turbo_lora=has_turbo_lora,
+            has_fasth3_lora=fasth3_adapter is not None,
         )
         if has_turbo_lora:
             self._validate_turbo_sampling(sampling)
+        if fasth3_adapter is not None:
+            self._validate_fasth3_sampling(sampling, fasth3_adapter)
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")
@@ -2224,7 +2277,10 @@ class MiniMaxH3Pipeline(
                     ref_audio_t = audio_lengths[0]
 
         seed = int(sampling.seed if sampling.seed is not None else 42)
-        sigma_schedule = self._base_schedule_for_task(task)
+        # A distilled LoRA carries its own few-step positions; the checkpoint
+        # underneath it is the many-step teacher, whose schedule does not apply.
+        adapter_schedule = fasth3_adapter.base_schedule if fasth3_adapter is not None else None
+        sigma_schedule = adapter_schedule or self._base_schedule_for_task(task)
         if sigma_schedule is None:
             base_schedule = None
             num_steps = int(sampling.num_inference_steps or 50)
