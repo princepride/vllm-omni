@@ -30,34 +30,32 @@ _INNER = _HEAD_DIM * _HEADS  # attention inner size
 _FFN = 5
 
 
-def _factors(out_dim: int, in_dim: int, scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+def _factors(out_dim: int, in_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
     """A rank-2 pair whose product is reproducible and non-symmetric."""
-    a = torch.arange(_RANK * in_dim, dtype=torch.float32).reshape(_RANK, in_dim) * scale / (in_dim * _RANK)
-    b = torch.arange(out_dim * _RANK, dtype=torch.float32).reshape(out_dim, _RANK) * scale / (out_dim * _RANK)
+    a = torch.arange(_RANK * in_dim, dtype=torch.float32).reshape(_RANK, in_dim) / (in_dim * _RANK)
+    b = torch.arange(out_dim * _RANK, dtype=torch.float32).reshape(out_dim, _RANK) / (out_dim * _RANK)
     return a, b
 
 
-def _write_adapter(path, *, tensors=None, metadata=None, blocks: int = 1, drop: str | None = None) -> None:
-    """Write an artifact in the published ``fastvideo-lora-v2`` shape."""
+def _write_adapter(path, *, tensors=None, drop: str | None = None) -> None:
+    """Write a single-block artifact in the published ``fastvideo-lora-v2`` shape."""
     payload: dict[str, torch.Tensor] = {}
-    for index in range(blocks):
-        prefix = f"transformer_blocks.{index}"
-        for suffix, (out_dim, in_dim) in {
-            "attn.to_q": (_INNER, _HIDDEN),
-            "attn.to_k": (_INNER, _HIDDEN),
-            "attn.to_v": (_INNER, _HIDDEN),
-            "attn.to_out.0": (_HIDDEN, _INNER),
-            "ff.net.0.proj": (2 * _FFN, _HIDDEN),
-            "ff.net.2": (_HIDDEN, _FFN),
-        }.items():
-            a, b = _factors(out_dim, in_dim, scale=index + 1)
-            payload[f"{prefix}.{suffix}.lora_A.weight"] = a
-            payload[f"{prefix}.{suffix}.lora_B.weight"] = b
+    for suffix, (out_dim, in_dim) in {
+        "attn.to_q": (_INNER, _HIDDEN),
+        "attn.to_k": (_INNER, _HIDDEN),
+        "attn.to_v": (_INNER, _HIDDEN),
+        "attn.to_out.0": (_HIDDEN, _INNER),
+        "ff.net.0.proj": (2 * _FFN, _HIDDEN),
+        "ff.net.2": (_HIDDEN, _FFN),
+    }.items():
+        a, b = _factors(out_dim, in_dim)
+        payload[f"transformer_blocks.0.{suffix}.lora_A.weight"] = a
+        payload[f"transformer_blocks.0.{suffix}.lora_B.weight"] = b
     payload.update(tensors or {})
     if drop is not None:
         payload.pop(drop, None)
     path.parent.mkdir(parents=True, exist_ok=True)
-    save_file(payload, str(path), metadata={"format": FASTH3_FORMAT, "rank": str(_RANK), **(metadata or {})})
+    save_file(payload, str(path), metadata={"format": FASTH3_FORMAT, "rank": str(_RANK)})
 
 
 def _claim(path, **kwargs) -> FastH3WeightFusion | None:
@@ -111,7 +109,7 @@ def test_low_rank_factors_reach_the_fused_projections(tmp_path):
         _reorder_grouped_qkv_to_qkv(fused, num_query_groups=_HEADS, heads_per_group=1, head_dim=_HEAD_DIM),
         [_INNER, _INNER, _INNER],
     )
-    a, b = _factors(_INNER, _HIDDEN, scale=1)
+    a, b = _factors(_INNER, _HIDDEN)
     expected = b @ a
     for got in (q, k, v):
         assert torch.allclose(got, expected, atol=1e-5)
@@ -123,7 +121,7 @@ def test_the_fused_mlp_delta_is_swapped_into_gate_first_order(tmp_path):
     fusion = _load(path.parent)
 
     fused = fusion.fuse("blocks.0.mlp.fc1.weight", torch.zeros((2 * _FFN, _HIDDEN))).cpu()
-    a, b = _factors(2 * _FFN, _HIDDEN, scale=1)
+    a, b = _factors(2 * _FFN, _HIDDEN)
     value, gate = (b @ a).chunk(2, dim=0)
     # The diffusers export is value-first; H3's fc1 is gate-first.
     assert torch.allclose(fused, torch.cat((gate, value), dim=0), atol=1e-5)
@@ -271,11 +269,44 @@ def test_fasth3_requires_five_sigma_points_for_four_forwards(num_inference_steps
     pipeline._validate_fasth3_sampling(SimpleNamespace(num_inference_steps=FASTH3_SIGMA_POINTS))
 
 
-def test_the_student_ladder_neutralises_the_rectified_flow_shift():
-    # Base H3 shifts video by 12 and audio by 3. The student's four-jump ladder
-    # is uniform, so leaving either in place would move every sampling point off
-    # the rungs it was trained on.
-    assert FASTH3_FLOW_SHIFT == 1.0
+def test_adopting_the_contract_neutralises_the_rectified_flow_shift(tmp_path):
+    path = tmp_path / "fasth3" / "adapter_model.safetensors"
+    _write_adapter(path)
+    pipeline = _pipeline_stub(_load(path.parent))
+    pipeline.partition = "fl2va"
+    pipeline.default_video_shift, pipeline.default_audio_shift = 12.0, 3.0
+
+    pipeline._adopt_fasth3_contract()
+
+    # The student's four-jump ladder is uniform, so base H3's shifts would move
+    # every sampling point off the rungs it was trained on.
+    assert pipeline.default_video_shift == FASTH3_FLOW_SHIFT
+    assert pipeline.default_audio_shift == FASTH3_FLOW_SHIFT
+
+
+def test_adopting_the_contract_refuses_a_vsa_variant_and_ref2va(tmp_path):
+    sparse = tmp_path / "vsa" / "adapter_model.safetensors"
+    _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
+    pipeline = _pipeline_stub(_load(sparse.parent))
+    pipeline.partition = "fl2va"
+    with pytest.raises(ValueError, match="Video Sparse Attention variant"):
+        pipeline._adopt_fasth3_contract()
+
+    dense = tmp_path / "dense" / "adapter_model.safetensors"
+    _write_adapter(dense)
+    pipeline = _pipeline_stub(_load(dense.parent))
+    pipeline.partition = "ref2va"
+    with pytest.raises(ValueError, match="cannot serve a Ref2VA partition"):
+        pipeline._adopt_fasth3_contract()
+
+
+def test_a_full_rank_delta_on_a_fused_parameter_is_refused(tmp_path):
+    # Only low-rank factors are placed into H3's fused QKV and gate/up layouts,
+    # so a .diff aimed at one would otherwise be added transposed.
+    path = tmp_path / "fasth3" / "adapter_model.safetensors"
+    _write_adapter(path, tensors={"transformer_blocks.0.attn.to_q.diff": torch.ones((_INNER, _HIDDEN))})
+    with pytest.raises(FastH3AdapterError, match="fused layout"):
+        _claim(path.parent)
 
 
 def test_a_pipeline_that_fused_its_adapter_needs_no_lora_manager(tmp_path):

@@ -687,7 +687,7 @@ class MiniMaxH3Pipeline(
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
     # Set from --lora-path during construction; absent means no FastH3 adapter.
-    _fasth3: ClassVar[FastH3WeightFusion | None] = None
+    _fasth3: FastH3WeightFusion | None = None
 
     def _load_diffusion_lora_adapter(
         self,
@@ -871,28 +871,7 @@ class MiniMaxH3Pipeline(
 
         self._fasth3 = _resolve_fasth3_fusion(od_config, self.transformer)
         if self._fasth3 is not None:
-            if self.partition == "ref2va":
-                raise ValueError("FastH3 preview v1 distills T2VA only, so it cannot serve a Ref2VA partition")
-            if self._fasth3.requires_vsa:
-                raise ValueError(
-                    f"{self._fasth3.source} is a Video Sparse Attention variant of FastH3, and its "
-                    "compression gates have no counterpart in vLLM-Omni's dense H3 attention. Use the "
-                    "release's Dense variant until VSA lands for H3's packed sequence."
-                )
-            # The student's four-jump ladder is uniform, so the five-point
-            # schedule H3 already derives from num_inference_steps reproduces it
-            # once the rectified-flow shift is neutralised. Base H3 shifts video
-            # by 12 and audio by 3; leaving either in place would move every
-            # sampling point off the rungs the student was trained on.
-            self.default_video_shift = FASTH3_FLOW_SHIFT
-            self.default_audio_shift = FASTH3_FLOW_SHIFT
-            logger.info(
-                "FastH3 adapter active: %d sigma points for %d transformer forwards, flow_shift=%g, tasks=%s",
-                FASTH3_SIGMA_POINTS,
-                FASTH3_SIGMA_POINTS - 1,
-                FASTH3_FLOW_SHIFT,
-                sorted(FASTH3_SUPPORTED_TASKS),
-            )
+            self._adopt_fasth3_contract()
 
         if self.load_text_encoder:
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
@@ -1023,6 +1002,31 @@ class MiniMaxH3Pipeline(
         if self._fasth3 is not None:
             self._fasth3.validate_fully_applied()
         return loaded_with_prefix
+
+    def _adopt_fasth3_contract(self) -> None:
+        """Hold this pipeline to the ladder the FastH3 student was trained on."""
+        if self.partition == "ref2va":
+            raise ValueError("FastH3 preview v1 distills T2VA only, so it cannot serve a Ref2VA partition")
+        if self._fasth3.requires_vsa:
+            raise ValueError(
+                f"{self._fasth3.source} is a Video Sparse Attention variant of FastH3, and its "
+                "compression gates have no counterpart in vLLM-Omni's dense H3 attention. Use the "
+                "release's Dense variant until VSA lands for H3's packed sequence."
+            )
+        # The student's four-jump ladder is uniform, so the five-point schedule
+        # H3 already derives from num_inference_steps reproduces it once the
+        # rectified-flow shift is neutralised. Base H3 shifts video by 12 and
+        # audio by 3; leaving either in place would move every sampling point
+        # off the rungs the student was trained on.
+        self.default_video_shift = FASTH3_FLOW_SHIFT
+        self.default_audio_shift = FASTH3_FLOW_SHIFT
+        logger.info(
+            "FastH3 adapter active: %d sigma points for %d transformer forwards, flow_shift=%g, tasks=%s",
+            FASTH3_SIGMA_POINTS,
+            FASTH3_SIGMA_POINTS - 1,
+            FASTH3_FLOW_SHIFT,
+            sorted(FASTH3_SUPPORTED_TASKS),
+        )
 
     @property
     def lora_is_fused(self) -> bool:

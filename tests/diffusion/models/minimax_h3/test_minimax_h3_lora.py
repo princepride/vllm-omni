@@ -223,7 +223,6 @@ def test_h3_turbo_allows_distributed_layerwise_offload(monkeypatch):
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline._turbo_lora_adapter_ids = set()
-    pipeline._fasth3_lora_adapters = {}
     pipeline.od_config = SimpleNamespace(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -322,7 +321,6 @@ def test_only_an_active_recognized_turbo_adapter_restricts_ref2va(monkeypatch):
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     pipeline._turbo_lora_adapter_ids = set()
-    pipeline._fasth3_lora_adapters = {}
     request = _request("generic-peft")
 
     def load():

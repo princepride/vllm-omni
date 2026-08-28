@@ -32,7 +32,6 @@ the released full checkpoint (``FastVideo-FastH3-4-step-Preview-v1-Dense-DataFre
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,9 +51,7 @@ FASTH3_MANIFEST = "adapter_manifest.json"
 # level there (`max_timestep_ratio`), and it is uniform, so no rectified-flow
 # time shift is applied on top of it.
 FASTH3_SIGMA_POINTS = 5
-FASTH3_BASE_SCHEDULE = (0.999, 0.749, 0.500, 0.250, 0.0)
 FASTH3_FLOW_SHIFT = 1.0
-FASTH3_GUIDANCE_SCALE = 1.0
 # Preview v1 distills the text-to-video-and-audio path only.
 FASTH3_SUPPORTED_TASKS = frozenset({"t2va"})
 
@@ -82,6 +79,7 @@ _MODEL_LEVEL_TARGETS = {
 # parameter). H3 stores attention as one grouped QKV matrix and the MLP as one
 # fused gate/up matrix, so those deltas need placing rather than adding.
 _PLAIN, _QKV_Q, _QKV_K, _QKV_V, _SWAP_HALVES = "plain", "q", "k", "v", "swap_halves"
+_QKV_SLOTS = (_QKV_Q, _QKV_K, _QKV_V)
 _BLOCK_TARGETS = {
     "attn.to_q": ("attn.qkv_proj", _QKV_Q),
     "attn.to_k": ("attn.qkv_proj", _QKV_K),
@@ -128,12 +126,7 @@ def _swap_halves(tensor: torch.Tensor) -> torch.Tensor:
     return torch.cat((second, first), dim=0)
 
 
-def _place_in_grouped_qkv(
-    deltas: Mapping[str, torch.Tensor],
-    *,
-    head_dim: int,
-    rows: int,
-) -> torch.Tensor:
+def _place_in_grouped_qkv(deltas: Mapping[str, torch.Tensor], *, head_dim: int) -> torch.Tensor:
     """Interleave per-projection deltas into H3's grouped QKV layout.
 
     The checkpoint stores one head group at a time as ``[q, k, v]``, which is
@@ -141,11 +134,11 @@ def _place_in_grouped_qkv(
     built from the separate diffusers projections has to be folded back into
     that order.
     """
-    missing = sorted({_QKV_Q, _QKV_K, _QKV_V} - set(deltas))
+    missing = sorted(set(_QKV_SLOTS) - set(deltas))
     if missing:
         raise FastH3AdapterError(f"grouped QKV delta is missing its {missing} projections")
     parts = []
-    for slot in (_QKV_Q, _QKV_K, _QKV_V):
+    for slot in _QKV_SLOTS:
         delta = deltas[slot]
         if delta.shape[0] % head_dim:
             raise FastH3AdapterError(
@@ -155,10 +148,7 @@ def _place_in_grouped_qkv(
     groups = parts[0].shape[0]
     if any(part.shape[0] != groups for part in parts):
         raise FastH3AdapterError("QKV projections disagree on the number of head groups")
-    grouped = torch.cat(parts, dim=1).reshape(groups * 3 * head_dim, *parts[0].shape[2:])
-    if grouped.shape[0] != rows:
-        raise FastH3AdapterError(f"grouped QKV delta has {grouped.shape[0]} rows, parameter expects {rows}")
-    return grouped
+    return torch.cat(parts, dim=1).reshape(groups * 3 * head_dim, *parts[0].shape[2:])
 
 
 def _resolve_native_target(module: str) -> tuple[str, str] | None:
@@ -202,13 +192,11 @@ class FastH3WeightFusion:
         self,
         *,
         source: Path,
-        metadata: Mapping[str, str],
         patches: Mapping[str, _ParamPatch],
         head_dim: int,
         requires_vsa: bool,
     ) -> None:
         self._source = source
-        self._metadata = dict(metadata)
         self._patches = dict(patches)
         self._head_dim = head_dim
         self.requires_vsa = requires_vsa
@@ -218,10 +206,6 @@ class FastH3WeightFusion:
     @property
     def source(self) -> Path:
         return self._source
-
-    @property
-    def rank(self) -> int:
-        return int(self._metadata.get("rank", 0))
 
     @classmethod
     def from_path(cls, path: str | Path, *, head_dim: int) -> FastH3WeightFusion | None:
@@ -265,9 +249,8 @@ class FastH3WeightFusion:
                         raise FastH3AdapterError(f"duplicate {role} for {native_param}")
                     patch.diff = tensor
                 else:
-                    slot = layout if layout in (_QKV_Q, _QKV_K, _QKV_V) else _PLAIN
-                    a, b = patch.low_rank.get(slot, (None, None))
-                    patch.low_rank[slot] = (tensor, b) if role == "lora_a" else (a, tensor)
+                    a, b = patch.low_rank.get(layout, (None, None))
+                    patch.low_rank[layout] = (tensor, b) if role == "lora_a" else (a, tensor)
 
         if unmapped:
             raise FastH3AdapterError(
@@ -278,10 +261,17 @@ class FastH3WeightFusion:
             for slot, (a, b) in patch.low_rank.items():
                 if a is None or b is None:
                     raise FastH3AdapterError(f"FastH3 adapter has an unpaired factor for {native_param} slot {slot!r}")
+            # Only the low-rank factors are placed into H3's fused QKV and
+            # gate/up layouts; a full-rank delta is added as it comes, so one
+            # aimed at a fused parameter would silently land transposed.
+            if patch.diff is not None and patch.layout != _PLAIN:
+                raise FastH3AdapterError(
+                    f"FastH3 adapter carries a full-rank delta for {native_param}, which H3 stores in the "
+                    f"{patch.layout!r} fused layout; this loader can only place low-rank factors there"
+                )
 
         fusion = cls(
             source=weights_path,
-            metadata=metadata,
             patches=patches,
             head_dim=head_dim,
             requires_vsa=bool(gate_tensors),
@@ -311,6 +301,16 @@ class FastH3WeightFusion:
             self._device = torch.device(torch.accelerator.current_accelerator() or "cpu")
         return self._device
 
+    @staticmethod
+    def _widen(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Move to ``device``, then widen to float32.
+
+        Asking ``Tensor.to`` for a device and a dtype at once converts on the
+        host and ships twice the bytes; splitting it moves bfloat16 and widens
+        on the accelerator.
+        """
+        return tensor.to(device, non_blocking=True).to(torch.float32)
+
     def fuse(self, name: str, weight: torch.Tensor) -> torch.Tensor:
         """Return ``weight`` with this adapter's contribution added."""
         patch = self._patches.get(name)
@@ -319,20 +319,23 @@ class FastH3WeightFusion:
         self._applied.add(name)
 
         device = self._compute_device(weight)
-        product = lambda a, b: b.to(device, torch.float32) @ a.to(device, torch.float32)  # noqa: E731
 
         delta: torch.Tensor | None = None
         if patch.low_rank:
-            if patch.layout in (_QKV_Q, _QKV_K, _QKV_V):
-                per_slot = {slot: product(a, b) for slot, (a, b) in patch.low_rank.items()}
-                delta = _place_in_grouped_qkv(per_slot, head_dim=self._head_dim, rows=weight.shape[0])
+            if patch.layout in _QKV_SLOTS:
+                per_slot = {
+                    slot: self._widen(b, device) @ self._widen(a, device) for slot, (a, b) in patch.low_rank.items()
+                }
+                delta = _place_in_grouped_qkv(per_slot, head_dim=self._head_dim)
             else:
-                a, b = patch.low_rank[_PLAIN]
-                delta = product(a, b)
+                a, b = patch.low_rank[patch.layout]
                 if patch.layout == _SWAP_HALVES:
-                    delta = _swap_halves(delta)
+                    # Permuting the rows of B permutes the rows of the product,
+                    # so swap the rank-64 factor instead of the full delta.
+                    b = _swap_halves(b)
+                delta = self._widen(b, device) @ self._widen(a, device)
         if patch.diff is not None:
-            diff = patch.diff.to(device, torch.float32)
+            diff = self._widen(patch.diff, device)
             delta = diff if delta is None else delta + diff
         if delta is None:
             return weight
@@ -345,8 +348,10 @@ class FastH3WeightFusion:
         # device-to-host copy of the whole checkpoint only for the loader to
         # send it straight back: measured at 152s against 15s for 60 GiB of
         # patched projections, against 17s for the unavoidable upload alone.
-        fused = weight.to(device, non_blocking=True).to(torch.float32) + delta
-        return fused.to(weight.dtype)
+        # Fold the base weight into the freshly built delta in place. Promoting
+        # the weight to float32 on its own would allocate two more buffers the
+        # size of the parameter, and H3's largest patched projection is 0.5 GiB.
+        return delta.add_(weight.to(device, non_blocking=True)).to(weight.dtype)
 
     def apply(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
         """Fuse every streamed checkpoint tensor on its way into the model."""
@@ -354,16 +359,21 @@ class FastH3WeightFusion:
             yield name, self.fuse(name, weight)
 
     def validate_fully_applied(self) -> None:
-        """Fail if the checkpoint never offered a parameter the adapter edits.
+        """Close the fusion: every edit must have met its parameter.
 
         A silently unapplied delta is the failure mode that matters here: the
-        model would load and generate, just not as the distilled student.
+        model would load and generate, just not as the distilled student. The
+        weights are loaded once, so the mapped payloads are dropped afterwards
+        rather than held for the life of the process.
         """
         missing = sorted(set(self._patches) - self._applied)
         if missing:
             raise FastH3AdapterError(
                 f"FastH3 adapter edits {len(missing)} parameters the checkpoint never provided: {missing[:5]}"
             )
+        for patch in self._patches.values():
+            patch.low_rank.clear()
+            patch.diff = None
 
 
 def _resolve_adapter_file(path: str | Path) -> Path | None:
@@ -389,23 +399,11 @@ def _resolve_adapter_file(path: str | Path) -> Path | None:
     return None
 
 
-def read_fasth3_manifest(path: str | Path) -> dict[str, object] | None:
-    """Read the bundle manifest next to a variant, when one is published."""
-    for directory in (Path(path), Path(path).parent, Path(path).parent.parent):
-        manifest = directory / FASTH3_MANIFEST
-        if manifest.is_file():
-            return json.loads(manifest.read_text(encoding="utf-8"))
-    return None
-
-
 __all__ = [
-    "FASTH3_BASE_SCHEDULE",
     "FASTH3_FLOW_SHIFT",
     "FASTH3_FORMAT",
-    "FASTH3_GUIDANCE_SCALE",
     "FASTH3_SIGMA_POINTS",
     "FASTH3_SUPPORTED_TASKS",
     "FastH3AdapterError",
     "FastH3WeightFusion",
-    "read_fasth3_manifest",
 ]
