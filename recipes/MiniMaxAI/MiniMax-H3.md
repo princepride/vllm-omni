@@ -896,11 +896,19 @@ manager is skipped for a fused adapter, so `--lora-backend` and per-request
 ```
 
 Requests must ask for `num_inference_steps=5`, the five sigma points that bound
-the student's four transformer forwards, and must use `task=t2va`. The shifts
-are pinned for you: the student's four-jump ladder `[999, 749, 500, 250]` is
-uniform, so the server neutralises H3's rectified-flow shift (video 12, audio 3)
-to 1.0. Leaving either in place would move every sampling point off the rungs
-the student was trained on.
+the student's four transformer forwards, and must use `task=t2va`. The release's
+`dmd_denoising_steps` `[999, 749, 500, 250]` are timestep indices out of 1000,
+that is the pre-shift positions of that uniform five-point ladder, so H3's own
+per-modality shifts still apply and the server keeps them at the checkpoint
+values (video 12, audio 3). A request that overrides `flow_shift` or
+`audio_flow_shift` is rejected: it would sample the student at noise levels it
+was never distilled at.
+
+Offload is refused with this adapter. A host-weight plan installs the
+transformer without going through the pipeline's `load_weights()`, which is
+where the fusion happens, so `--enable-cpu-offload`,
+`--enable-layerwise-offload` and `--enable-distributed-layerwise-offload` all
+fail fast rather than serving unfused base H3 weights on a four-step schedule.
 
 > [!NOTE]
 > Only the **Dense / Data-Free** variant is supported today. The three VSA

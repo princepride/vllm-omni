@@ -40,6 +40,8 @@ import torch
 from safetensors import safe_open
 from vllm.logger import init_logger
 
+from vllm_omni.platforms import current_omni_platform
+
 logger = init_logger(__name__)
 
 FASTH3_FORMAT = "fastvideo-lora-v2"
@@ -50,8 +52,12 @@ FASTH3_MANIFEST = "adapter_manifest.json"
 # 1000; it starts at 0.999 rather than 1.0 because training capped the noise
 # level there (`max_timestep_ratio`), and it is uniform, so no rectified-flow
 # time shift is applied on top of it.
+# ``dmd_denoising_steps`` in the release contract is [999, 749, 500, 250]:
+# timestep indices out of 1000, i.e. the pre-shift positions of the uniform
+# five-point ladder, not final sigmas. H3's schedulers then apply their own
+# per-modality shift on top (12 for video, 3 for audio), which reproduces the
+# levels the student was distilled at. Nothing here overrides those shifts.
 FASTH3_SIGMA_POINTS = 5
-FASTH3_FLOW_SHIFT = 1.0
 # Preview v1 distills the text-to-video-and-audio path only.
 FASTH3_SUPPORTED_TASKS = frozenset({"t2va"})
 
@@ -298,7 +304,9 @@ class FastH3WeightFusion:
         if weight.device.type != "cpu":
             return weight.device
         if self._device is None:
-            self._device = torch.device(torch.accelerator.current_accelerator() or "cpu")
+            # Ask the platform rather than PyTorch's global accelerator
+            # registry, so an out-of-tree backend controls its own placement.
+            self._device = current_omni_platform.get_torch_device()
         return self._device
 
     @staticmethod
@@ -400,7 +408,6 @@ def _resolve_adapter_file(path: str | Path) -> Path | None:
 
 
 __all__ = [
-    "FASTH3_FLOW_SHIFT",
     "FASTH3_FORMAT",
     "FASTH3_SIGMA_POINTS",
     "FASTH3_SUPPORTED_TASKS",

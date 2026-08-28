@@ -11,7 +11,6 @@ import torch
 from safetensors.torch import save_file
 
 from vllm_omni.diffusion.models.minimax_h3.fasth3 import (
-    FASTH3_FLOW_SHIFT,
     FASTH3_FORMAT,
     FASTH3_SIGMA_POINTS,
     FastH3AdapterError,
@@ -243,6 +242,7 @@ def _pipeline_stub(fusion=None):
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     pipeline._turbo_lora_adapter_ids = set()
     pipeline._fasth3 = fusion
+    pipeline.od_config = SimpleNamespace()
     return pipeline
 
 
@@ -263,13 +263,14 @@ def test_fasth3_requires_five_sigma_points_for_four_forwards(num_inference_steps
     path = tmp_path / "fasth3" / "adapter_model.safetensors"
     _write_adapter(path)
     pipeline = _pipeline_stub(_load(path.parent))
+    pipeline.default_video_shift, pipeline.default_audio_shift = 12.0, 3.0
 
     with pytest.raises(OmniClientError, match=f"num_inference_steps={FASTH3_SIGMA_POINTS}"):
-        pipeline._validate_fasth3_sampling(SimpleNamespace(num_inference_steps=num_inference_steps))
-    pipeline._validate_fasth3_sampling(SimpleNamespace(num_inference_steps=FASTH3_SIGMA_POINTS))
+        pipeline._validate_fasth3_sampling(SimpleNamespace(num_inference_steps=num_inference_steps, extra_args={}))
+    pipeline._validate_fasth3_sampling(SimpleNamespace(num_inference_steps=FASTH3_SIGMA_POINTS, extra_args={}))
 
 
-def test_adopting_the_contract_neutralises_the_rectified_flow_shift(tmp_path):
+def test_the_contract_leaves_the_checkpoint_shifts_alone(tmp_path):
     path = tmp_path / "fasth3" / "adapter_model.safetensors"
     _write_adapter(path)
     pipeline = _pipeline_stub(_load(path.parent))
@@ -278,10 +279,46 @@ def test_adopting_the_contract_neutralises_the_rectified_flow_shift(tmp_path):
 
     pipeline._adopt_fasth3_contract()
 
-    # The student's four-jump ladder is uniform, so base H3's shifts would move
-    # every sampling point off the rungs it was trained on.
-    assert pipeline.default_video_shift == FASTH3_FLOW_SHIFT
-    assert pipeline.default_audio_shift == FASTH3_FLOW_SHIFT
+    # dmd_denoising_steps [999, 749, 500, 250] are pre-shift timestep indices;
+    # H3's own 12/3 shifts turn the uniform five points into the levels the
+    # student was distilled at, so the contract must not touch them.
+    assert pipeline.default_video_shift == 12.0
+    assert pipeline.default_audio_shift == 3.0
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"flow_shift": 1.0}, {"audio_flow_shift": 1.0}, {"flow_shift": "bad"}],
+)
+def test_a_request_may_not_move_the_student_off_its_rungs(extra, tmp_path):
+    path = tmp_path / "fasth3" / "adapter_model.safetensors"
+    _write_adapter(path)
+    pipeline = _pipeline_stub(_load(path.parent))
+    pipeline.default_video_shift, pipeline.default_audio_shift = 12.0, 3.0
+    sampling = SimpleNamespace(num_inference_steps=FASTH3_SIGMA_POINTS, extra_args=extra)
+
+    with pytest.raises(OmniClientError, match="FastH3 requires"):
+        pipeline._validate_fasth3_sampling(sampling)
+
+    pipeline._validate_fasth3_sampling(
+        SimpleNamespace(
+            num_inference_steps=FASTH3_SIGMA_POINTS,
+            extra_args={"flow_shift": 12.0, "audio_flow_shift": 3.0},
+        )
+    )
+
+
+def test_offload_is_refused_because_it_bypasses_the_fusion(tmp_path):
+    path = tmp_path / "fasth3" / "adapter_model.safetensors"
+    _write_adapter(path)
+    for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload"):
+        pipeline = _pipeline_stub(_load(path.parent))
+        pipeline.partition = "fl2va"
+        pipeline.od_config = SimpleNamespace(**{flag: True})
+        # A host-weight plan installs the transformer without load_weights(),
+        # so the fusion and its completeness check would both be skipped.
+        with pytest.raises(ValueError, match="cannot be combined with"):
+            pipeline._adopt_fasth3_contract()
 
 
 def test_adopting_the_contract_refuses_a_vsa_variant_and_ref2va(tmp_path):

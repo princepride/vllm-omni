@@ -118,7 +118,6 @@ from .denoise_loop import (
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .fasth3 import (
-    FASTH3_FLOW_SHIFT,
     FASTH3_SIGMA_POINTS,
     FASTH3_SUPPORTED_TASKS,
     FastH3WeightFusion,
@@ -1007,24 +1006,33 @@ class MiniMaxH3Pipeline(
         """Hold this pipeline to the ladder the FastH3 student was trained on."""
         if self.partition == "ref2va":
             raise ValueError("FastH3 preview v1 distills T2VA only, so it cannot serve a Ref2VA partition")
+        offloads = [
+            flag
+            for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload")
+            if getattr(self.od_config, flag, False)
+        ]
+        if offloads:
+            # A host-weight plan installs the transformer without going through
+            # load_weights(), which is where the fusion and its completeness
+            # check live. Serving base H3 weights under a four-step schedule
+            # would otherwise degrade output with nothing to signal it.
+            raise ValueError(
+                f"FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
+                f"{sorted(offloads)}. Serve it without offload."
+            )
         if self._fasth3.requires_vsa:
             raise ValueError(
                 f"{self._fasth3.source} is a Video Sparse Attention variant of FastH3, and its "
                 "compression gates have no counterpart in vLLM-Omni's dense H3 attention. Use the "
                 "release's Dense variant until VSA lands for H3's packed sequence."
             )
-        # The student's four-jump ladder is uniform, so the five-point schedule
-        # H3 already derives from num_inference_steps reproduces it once the
-        # rectified-flow shift is neutralised. Base H3 shifts video by 12 and
-        # audio by 3; leaving either in place would move every sampling point
-        # off the rungs the student was trained on.
-        self.default_video_shift = FASTH3_FLOW_SHIFT
-        self.default_audio_shift = FASTH3_FLOW_SHIFT
         logger.info(
-            "FastH3 adapter active: %d sigma points for %d transformer forwards, flow_shift=%g, tasks=%s",
+            "FastH3 adapter active: %d sigma points for %d transformer forwards, "
+            "flow_shift=%g, audio_flow_shift=%g, tasks=%s",
             FASTH3_SIGMA_POINTS,
             FASTH3_SIGMA_POINTS - 1,
-            FASTH3_FLOW_SHIFT,
+            self.default_video_shift,
+            self.default_audio_shift,
             sorted(FASTH3_SUPPORTED_TASKS),
         )
 
@@ -1080,6 +1088,20 @@ class MiniMaxH3Pipeline(
                 f"FastH3 is a four-step student and requires num_inference_steps={FASTH3_SIGMA_POINTS} "
                 f"({FASTH3_SIGMA_POINTS} sigma points produce {FASTH3_SIGMA_POINTS - 1} transformer forwards)"
             )
+        # The checkpoint's per-modality shifts turn the five uniform points into
+        # the noise levels the student was distilled at, so a request that moves
+        # them samples where it was never trained.
+        extra = sampling.extra_args or {}
+        for key, expected in (
+            ("flow_shift", self.default_video_shift),
+            ("audio_flow_shift", self.default_audio_shift),
+        ):
+            try:
+                requested = float(extra.get(key, expected))
+            except (TypeError, ValueError) as exc:
+                raise OmniClientError(f"FastH3 requires {key}={expected:g}") from exc
+            if not math.isclose(requested, expected):
+                raise OmniClientError(f"FastH3 requires {key}={expected:g}, got {requested:g}")
 
     def _resolve_shape(
         self,
