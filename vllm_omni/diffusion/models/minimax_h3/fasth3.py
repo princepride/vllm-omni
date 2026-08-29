@@ -51,8 +51,18 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# FastVideo's generic adapter container, not a FastH3 marker: their LoRA
+# extraction and MiniMax-H3 conversion tools emit the same format for ordinary
+# H3 adapters, so the format alone never identifies the release.
 FASTH3_FORMAT = "fastvideo-lora-v2"
 FASTH3_MANIFEST = "adapter_manifest.json"
+# The release identity. Every FastH3 variant records the distilled student it
+# was extracted from under ``finetuned_model`` (the Dense/Data-Free file names
+# ``FastVideo/FastVideo-FastH3-Dense-4-step-v1``), and the base it edits under
+# ``base_model``.
+FASTH3_BASE_MODEL = "MiniMaxAI/MiniMax-H3"
+_FASTH3_IDENTITY_KEY = "finetuned_model"
+_FASTH3_IDENTITY_MARKER = "fasth3"
 
 # The rectified-flow positions the student was distilled at, and the ladder the
 # server samples on. The release states them as `dmd_denoising_steps`
@@ -207,6 +217,27 @@ def _split_adapter_key(name: str) -> tuple[str, str] | None:
     return None
 
 
+def _is_fasth3_release(metadata: Mapping[str, str]) -> bool:
+    """Whether this artifact is a FastH3 release rather than FastVideo's format.
+
+    ``format=fastvideo-lora-v2`` is a container: FastVideo's general LoRA
+    extraction and MiniMax-H3 conversion tools write it for ordinary H3
+    adapters too. Claiming on the container alone would fuse such an adapter
+    permanently into the checkpoint and put every request on FastH3's four-step
+    schedule, which it was never distilled for. So the claim needs the release
+    identity - the distilled student the adapter was extracted from, and the
+    base it edits - and anything else stays on the dynamic LoRA route.
+    """
+    if metadata.get("format") != FASTH3_FORMAT:
+        return False
+    if _FASTH3_IDENTITY_MARKER not in metadata.get(_FASTH3_IDENTITY_KEY, "").lower():
+        return False
+    # Absent on an artifact this loader has no other way to place, so it is
+    # only held against a file that states it.
+    base_model = metadata.get("base_model")
+    return base_model is None or base_model.casefold() == FASTH3_BASE_MODEL.casefold()
+
+
 def _check_declared_counts(
     metadata: Mapping[str, str],
     counted: Mapping[str, int],
@@ -218,12 +249,16 @@ def _check_declared_counts(
     The writer of the ``fastvideo-lora-v2`` format records how many tensors of
     each kind it emitted, which is the one statement in the file about its own
     completeness. A truncated or partially re-exported artifact is otherwise
-    indistinguishable from a small one.
+    indistinguishable from a small one, so a file that has claimed the FastH3
+    identity has to carry all of them rather than opt out by omission.
     """
     for key, seen in counted.items():
         declared = metadata.get(key)
         if declared is None:
-            continue
+            raise FastH3AdapterError(
+                f"{weights_path} declares the FastH3 identity but omits {key}; the declared counts are "
+                "the only statement a truncated or partially re-exported adapter makes about itself"
+            )
         try:
             expected = int(declared)
         except (TypeError, ValueError) as exc:
@@ -305,7 +340,9 @@ class FastH3WeightFusion:
         """Build a fusion from an adapter file or directory, else ``None``.
 
         Returning ``None`` keeps every other ``--lora-path`` artifact on the
-        dynamic LoRA route; only a ``fastvideo-lora-v2`` file is claimed here.
+        dynamic LoRA route; only a file carrying the FastH3 release identity is
+        claimed here. A generic ``fastvideo-lora-v2`` H3 adapter is declined
+        rather than refused, because the dynamic route is where it belongs.
 
         The block counts are the model's, and the artifact has to cover them:
         claiming a partial adapter would switch the server onto the four-step
@@ -322,7 +359,7 @@ class FastH3WeightFusion:
         counted = {"low_rank_tensors": 0, "diff_tensors": 0}
         with safe_open(weights_path, framework="pt", device="cpu") as checkpoint:
             metadata = checkpoint.metadata() or {}
-            if metadata.get("format") != FASTH3_FORMAT:
+            if not _is_fasth3_release(metadata):
                 return None
             for name in checkpoint.keys():
                 split = _split_adapter_key(name)
@@ -615,6 +652,7 @@ def _resolve_adapter_file(path: str | Path) -> Path | None:
 
 
 __all__ = [
+    "FASTH3_BASE_MODEL",
     "FASTH3_BASE_SCHEDULE",
     "FASTH3_FORMAT",
     "FASTH3_SIGMA_POINTS",

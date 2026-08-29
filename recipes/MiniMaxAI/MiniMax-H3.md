@@ -963,8 +963,18 @@ them at the checkpoint values (video 12, audio 3). A request that overrides
 `flow_shift` or `audio_flow_shift` is rejected: it would sample the student at
 noise levels it was never distilled at.
 
-The adapter is also held to the model it is loaded against: a variant that
-declares more tensors than it carries, or that leaves any transformer block
+Only a FastH3 release is fused. The artifact's `fastvideo-lora-v2` format is
+FastVideo's generic adapter container - their LoRA extraction and MiniMax-H3
+conversion tools write it for ordinary H3 adapters too - so the claim needs the
+release identity the file records in `finetuned_model` (the Dense/Data-Free
+variant names `FastVideo/FastVideo-FastH3-Dense-4-step-v1`) over
+`base_model=MiniMaxAI/MiniMax-H3`. Any other `fastvideo-lora-v2` adapter stays
+on the dynamic LoRA route rather than being fused onto a four-step schedule it
+was never distilled for.
+
+Once claimed, the adapter is held to the model it is loaded against and to its
+own metadata: a variant that omits any of the tensor counts it is expected to
+declare, declares more tensors than it carries, or leaves any transformer block
 unedited, is refused at startup instead of serving mostly base H3 weights on a
 four-step schedule.
 

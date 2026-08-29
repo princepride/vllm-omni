@@ -11,6 +11,7 @@ import torch
 from safetensors.torch import save_file
 
 from vllm_omni.diffusion.models.minimax_h3.fasth3 import (
+    FASTH3_BASE_MODEL,
     FASTH3_BASE_SCHEDULE,
     FASTH3_FORMAT,
     FASTH3_SIGMA_POINTS,
@@ -45,7 +46,7 @@ def _write_adapter(
     tensors=None,
     drop: str | None = None,
     blocks: int = 1,
-    metadata: dict[str, str] | None = None,
+    metadata: dict[str, str | None] | None = None,
 ) -> None:
     """Write an artifact in the published ``fastvideo-lora-v2`` shape."""
     payload: dict[str, torch.Tensor] = {}
@@ -69,12 +70,17 @@ def _write_adapter(
     # are as self-describing as the real artifact.
     declared = {
         "format": FASTH3_FORMAT,
+        "finetuned_model": "FastVideo/FastVideo-FastH3-Dense-4-step-v1",
+        "base_model": FASTH3_BASE_MODEL,
         "rank": str(_RANK),
         "low_rank_tensors": str(sum(1 for key in payload if key.endswith((".lora_A.weight", ".lora_B.weight")))),
         "diff_tensors": str(sum(1 for key in payload if key.endswith((".diff", ".diff_b")))),
         "set_weight_tensors": str(sum(1 for key in payload if key.endswith(".set_weight"))),
     }
-    save_file(payload, str(path), metadata={**declared, **(metadata or {})})
+    # safetensors metadata is string-only, so a ``None`` override means the
+    # published writer never emitted that key.
+    declared.update(metadata or {})
+    save_file(payload, str(path), metadata={key: value for key, value in declared.items() if value is not None})
 
 
 def _claim(path, **kwargs) -> FastH3WeightFusion | None:
@@ -92,7 +98,7 @@ def _load(path, **kwargs) -> FastH3WeightFusion:
     return fusion
 
 
-def test_only_a_fastvideo_lora_v2_artifact_is_claimed(tmp_path):
+def test_only_an_artifact_carrying_the_release_identity_is_claimed(tmp_path):
     plain = tmp_path / "peft" / "adapter_model.safetensors"
     plain.parent.mkdir(parents=True)
     save_file({"transformer_blocks.0.attn.to_q.lora_A.weight": torch.ones((_RANK, _HIDDEN))}, str(plain))
@@ -104,6 +110,43 @@ def test_only_a_fastvideo_lora_v2_artifact_is_claimed(tmp_path):
     claimed = tmp_path / "fasth3" / "adapter_model.safetensors"
     _write_adapter(claimed)
     assert _claim(claimed.parent) is not None
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        # FastVideo's own LoRA extraction and MiniMax-H3 conversion tools emit
+        # fastvideo-lora-v2 for ordinary H3 adapters, which are not distilled
+        # for a four-step schedule.
+        {"finetuned_model": "someone/minimax-h3-style-lora"},
+        {"finetuned_model": ""},
+        # The format with no identity statement at all.
+        {"finetuned_model": None},
+        # A FastH3 name over a different base model is not this checkpoint's.
+        {"base_model": "Wan-AI/Wan2.2-TI2V-5B"},
+    ],
+)
+def test_a_generic_fastvideo_h3_adapter_stays_on_the_dynamic_route(identity, tmp_path):
+    """The container format is not the release identity.
+
+    This fixture edits every block of the model it is loaded against, so it
+    clears block coverage, tensor mapping and the declared counts. Only the
+    identity separates it from FastH3, and being claimed would fuse it
+    permanently and force the four-step ladder it was never distilled for.
+    """
+    path = tmp_path / "generic" / "adapter_model.safetensors"
+    _write_adapter(path, metadata=identity)
+
+    assert _claim(path.parent) is None
+
+
+def test_a_claimed_artifact_must_declare_every_tensor_count(tmp_path):
+    """Declining is for other people's adapters; a FastH3 file is held to its word."""
+    path = tmp_path / "fasth3" / "adapter_model.safetensors"
+    _write_adapter(path, metadata={"diff_tensors": None})
+
+    with pytest.raises(FastH3AdapterError, match="omits diff_tensors"):
+        _claim(path.parent)
 
 
 def test_the_published_bundle_root_is_refused_rather_than_guessed(tmp_path):
