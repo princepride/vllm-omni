@@ -124,6 +124,10 @@ from .minimax_h3_transformer import (
     MiniMaxH3DiTModel,
     _attention_isolates_packed_requests,
 )
+from .npu.lora import (
+    MINIMAX_H3_NATIVE_INFERENCE_STEPS,
+    load_minimax_h3_native_lora,
+)
 from .packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
@@ -675,6 +679,8 @@ class MiniMaxH3Pipeline(
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
         self._turbo_lora_adapter_ids.discard(lora_request.lora_int_id)
+        self._native_lora_adapter_ids.discard(lora_request.lora_int_id)
+        self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
         if getattr(od_config, "enable_cpu_offload", False):
@@ -690,7 +696,25 @@ class MiniMaxH3Pipeline(
         )
         if loaded is not None:
             self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
-        return loaded
+            return loaded
+
+        # Selection is by the artifact's safetensors ``key_format``, not by the
+        # running platform: the native loader is checkpoint-format parsing with
+        # no ``torch_npu`` dependency, so it needs no ``current_omni_platform``
+        # dispatch and binds the same adapter on NPU, CUDA and CPU.
+        native_loaded = load_minimax_h3_native_lora(
+            partition=self.partition,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=" or ".join(offload_modes) or None,
+        )
+        if native_loaded is not None:
+            lora_model, peft_helper, sigma_schedule = native_loaded
+            self._native_lora_adapter_ids.add(lora_request.lora_int_id)
+            self._lora_sigma_schedules[lora_request.lora_int_id] = sigma_schedule
+            return lora_model, peft_helper
+        return None
 
     def _validate_diffusion_lora_binding(
         self,
@@ -698,12 +722,20 @@ class MiniMaxH3Pipeline(
         lora_model: LoRAModel,
         bound_lora_names: frozenset[str],
     ) -> None:
-        if lora_model.id not in self._turbo_lora_adapter_ids:
+        if lora_model.id in self._turbo_lora_adapter_ids:
+            missing = sorted(set(lora_model.loras) - bound_lora_names)
+            if missing:
+                raise ValueError(
+                    "MiniMax-H3 Turbo LoRA binding is incomplete: "
+                    f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
+                )
+            return
+        if lora_model.id not in self._native_lora_adapter_ids:
             return
         missing = sorted(set(lora_model.loras) - bound_lora_names)
         if missing:
             raise ValueError(
-                "MiniMax-H3 Turbo LoRA binding is incomplete: "
+                "MiniMax-H3 native LoRA binding is incomplete: "
                 f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
             )
 
@@ -714,6 +746,65 @@ class MiniMaxH3Pipeline(
             and not math.isclose(0.0, float(sampling.lora_scale))
             and lora_request.lora_int_id in self._turbo_lora_adapter_ids
         )
+
+    def _has_active_native_lora(self, sampling: Any) -> bool:
+        lora_request = sampling.lora_request
+        return (
+            lora_request is not None
+            and not math.isclose(0.0, float(sampling.lora_scale))
+            and lora_request.lora_int_id in self._native_lora_adapter_ids
+        )
+
+    def _validate_native_sampling(self, sampling: Any, *, task: str) -> None:
+        if task != "t2va":
+            raise OmniClientError("MiniMax-H3 native LoRA supports T2VA requests only")
+        # Derive the expected count from the adapter's own schedule so the
+        # message can never disagree with the schedule the denoise loop runs.
+        schedule = self._lora_sigma_schedules.get(sampling.lora_request.lora_int_id)
+        expected_steps = MINIMAX_H3_NATIVE_INFERENCE_STEPS if schedule is None else schedule.num_inference_steps
+        # Only request mode can take the count from the adapter schedule: step
+        # mode admits the request in ``StepScheduler``, which reads
+        # ``num_inference_steps`` off it before any pipeline hook runs. Reject
+        # omission there rather than advertise a contract that would either fail
+        # admission or disagree with the denoise loop.
+        od_config = getattr(self, "od_config", None)
+        omission_allowed = not getattr(od_config, "step_execution", False)
+        or_omitted = " or omitted" if omission_allowed else ""
+        sigma_steps = sampling.num_inference_steps
+        if sigma_steps is None:
+            if omission_allowed:
+                return
+            raise OmniClientError(
+                f"MiniMax-H3 native LoRA requires an explicit num_inference_steps={expected_steps} "
+                "under step execution, because the step scheduler derives the total step count from "
+                "the request before the adapter schedule is known"
+            )
+        if int(sigma_steps) == expected_steps + 1:
+            raise OmniClientError(
+                "MiniMax-H3 native LoRA uses the distilled interval-count contract; "
+                f"num_inference_steps must be {expected_steps}{or_omitted}, not {expected_steps + 1}"
+            )
+        if int(sigma_steps) != expected_steps:
+            raise OmniClientError(
+                f"MiniMax-H3 native LoRA requires num_inference_steps={expected_steps} "
+                f"(one denoiser evaluation per sigma interval){or_omitted}"
+            )
+
+    def _sigma_schedule_for_request(self, sampling: Any, task: str) -> DMD2SigmaSchedule | None:
+        lora_request = sampling.lora_request
+        if (
+            lora_request is not None
+            and not math.isclose(0.0, float(sampling.lora_scale))
+            and lora_request.lora_int_id in self._lora_sigma_schedules
+        ):
+            adapter_schedule = self._lora_sigma_schedules[lora_request.lora_int_id]
+            checkpoint_schedule = self._base_schedule_for_task(task)
+            if checkpoint_schedule is not None:
+                raise OmniClientError(
+                    "MiniMax-H3 native LoRA cannot be activated on a checkpoint that already pins base_schedule"
+                )
+            return adapter_schedule
+        return self._base_schedule_for_task(task)
 
     def _validate_turbo_sampling(self, sampling: Any) -> None:
         extra = sampling.extra_args or {}
@@ -769,6 +860,8 @@ class MiniMaxH3Pipeline(
             str(od_config.model),
         )
         self._turbo_lora_adapter_ids: set[int] = set()
+        self._native_lora_adapter_ids: set[int] = set()
+        self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
@@ -1008,7 +1101,7 @@ class MiniMaxH3Pipeline(
             # points, which is the unit num_steps speaks in on this path.
             positions = self._fasth3.base_schedule
             return positions, len(positions)
-        sigma_schedule = self._base_schedule_for_task(task)
+        sigma_schedule = self._sigma_schedule_for_request(sampling, task)
         if sigma_schedule is None:
             return None, int(sampling.num_inference_steps or 50)
         # The schedule lists sigma boundaries; the denoise loop runs one step
@@ -1033,6 +1126,7 @@ class MiniMaxH3Pipeline(
         multi_modal_data: dict[str, Any],
         *,
         has_turbo_lora: bool = False,
+        has_native_lora: bool = False,
     ) -> str:
         if requested is None:
             # A Ref2VA-only startup has no FL2VA transformer; preserve its
@@ -1052,6 +1146,8 @@ class MiniMaxH3Pipeline(
             )
         if task == "ref2va" and has_turbo_lora:
             raise OmniClientError("MiniMax-H3 Turbo LoRA supports T2VA/FL2VA requests only")
+        if has_native_lora and task != "t2va":
+            raise OmniClientError("MiniMax-H3 native LoRA supports T2VA requests only")
         if self._fasth3 is not None:
             self._fasth3.check_task(task)
         return task
@@ -2055,13 +2151,17 @@ class MiniMaxH3Pipeline(
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
         has_turbo_lora = self._has_active_turbo_lora(sampling)
+        has_native_lora = self._has_active_native_lora(sampling)
         task = self._resolve_task(
             extra.get("task"),
             multi_modal_data,
             has_turbo_lora=has_turbo_lora,
+            has_native_lora=has_native_lora,
         )
         if has_turbo_lora:
             self._validate_turbo_sampling(sampling)
+        if has_native_lora:
+            self._validate_native_sampling(sampling, task=task)
         if self._fasth3 is not None:
             self._fasth3.check_request(
                 sampling,
