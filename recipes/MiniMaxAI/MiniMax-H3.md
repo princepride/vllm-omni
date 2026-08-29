@@ -887,8 +887,9 @@ export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
 Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a non-offloaded server
 command. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
 correct even though FastH3 preview v1 distills T2VA only. The dynamic LoRA
-manager is skipped for a fused adapter, so `--lora-backend` and per-request
-`lora=` fields do not apply.
+manager is skipped for a fused adapter, so `--lora-backend` does not apply and
+a request that carries a `lora=` field is rejected rather than served without
+the adapter it asked for.
 
 ```bash
 -F 'num_inference_steps=5' \
@@ -896,13 +897,19 @@ manager is skipped for a fused adapter, so `--lora-backend` and per-request
 ```
 
 Requests must ask for `num_inference_steps=5`, the five sigma points that bound
-the student's four transformer forwards, and must use `task=t2va`. The release's
-`dmd_denoising_steps` `[999, 749, 500, 250]` are timestep indices out of 1000,
-that is the pre-shift positions of that uniform five-point ladder, so H3's own
-per-modality shifts still apply and the server keeps them at the checkpoint
-values (video 12, audio 3). A request that overrides `flow_shift` or
-`audio_flow_shift` is rejected: it would sample the student at noise levels it
-was never distilled at.
+the student's four transformer forwards, and must use `task=t2va`. The server
+denoises on the release's own ladder rather than the uniform one that step count
+would otherwise derive: `dmd_denoising_steps` `[999, 749, 500, 250]` are timestep
+indices out of 1000, so the positions are `[0.999, 0.749, 0.5, 0.25, 0.0]`. They
+are pre-shift, so H3's own per-modality shifts still apply and the server keeps
+them at the checkpoint values (video 12, audio 3). A request that overrides
+`flow_shift` or `audio_flow_shift` is rejected: it would sample the student at
+noise levels it was never distilled at.
+
+The adapter is also held to the model it is loaded against: a variant that
+declares more tensors than it carries, or that leaves any transformer block
+unedited, is refused at startup instead of serving mostly base H3 weights on a
+four-step schedule.
 
 Offload is refused with this adapter. A host-weight plan installs the
 transformer without going through the pipeline's `load_weights()`, which is

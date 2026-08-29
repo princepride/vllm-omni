@@ -11,12 +11,15 @@ import torch
 from safetensors.torch import save_file
 
 from vllm_omni.diffusion.models.minimax_h3.fasth3 import (
+    FASTH3_BASE_SCHEDULE,
     FASTH3_FORMAT,
     FASTH3_SIGMA_POINTS,
     FastH3AdapterError,
     FastH3WeightFusion,
+    resolve_fasth3_fusion,
 )
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import _reorder_grouped_qkv_to_qkv
+from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -36,30 +39,50 @@ def _factors(out_dim: int, in_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
     return a, b
 
 
-def _write_adapter(path, *, tensors=None, drop: str | None = None) -> None:
-    """Write a single-block artifact in the published ``fastvideo-lora-v2`` shape."""
+def _write_adapter(
+    path,
+    *,
+    tensors=None,
+    drop: str | None = None,
+    blocks: int = 1,
+    metadata: dict[str, str] | None = None,
+) -> None:
+    """Write an artifact in the published ``fastvideo-lora-v2`` shape."""
     payload: dict[str, torch.Tensor] = {}
-    for suffix, (out_dim, in_dim) in {
-        "attn.to_q": (_INNER, _HIDDEN),
-        "attn.to_k": (_INNER, _HIDDEN),
-        "attn.to_v": (_INNER, _HIDDEN),
-        "attn.to_out.0": (_HIDDEN, _INNER),
-        "ff.net.0.proj": (2 * _FFN, _HIDDEN),
-        "ff.net.2": (_HIDDEN, _FFN),
-    }.items():
-        a, b = _factors(out_dim, in_dim)
-        payload[f"transformer_blocks.0.{suffix}.lora_A.weight"] = a
-        payload[f"transformer_blocks.0.{suffix}.lora_B.weight"] = b
+    for block in range(blocks):
+        for suffix, (out_dim, in_dim) in {
+            "attn.to_q": (_INNER, _HIDDEN),
+            "attn.to_k": (_INNER, _HIDDEN),
+            "attn.to_v": (_INNER, _HIDDEN),
+            "attn.to_out.0": (_HIDDEN, _INNER),
+            "ff.net.0.proj": (2 * _FFN, _HIDDEN),
+            "ff.net.2": (_HIDDEN, _FFN),
+        }.items():
+            a, b = _factors(out_dim, in_dim)
+            payload[f"transformer_blocks.{block}.{suffix}.lora_A.weight"] = a
+            payload[f"transformer_blocks.{block}.{suffix}.lora_B.weight"] = b
     payload.update(tensors or {})
     if drop is not None:
         payload.pop(drop, None)
     path.parent.mkdir(parents=True, exist_ok=True)
-    save_file(payload, str(path), metadata={"format": FASTH3_FORMAT, "rank": str(_RANK)})
+    # The published writer records what it emitted; mirror it so the fixtures
+    # are as self-describing as the real artifact.
+    declared = {
+        "format": FASTH3_FORMAT,
+        "rank": str(_RANK),
+        "low_rank_tensors": str(sum(1 for key in payload if key.endswith((".lora_A.weight", ".lora_B.weight")))),
+        "diff_tensors": str(sum(1 for key in payload if key.endswith((".diff", ".diff_b")))),
+        "set_weight_tensors": str(sum(1 for key in payload if key.endswith(".set_weight"))),
+    }
+    save_file(payload, str(path), metadata={**declared, **(metadata or {})})
 
 
 def _claim(path, **kwargs) -> FastH3WeightFusion | None:
     """Whatever from_path decides, including declining the artifact."""
-    return FastH3WeightFusion.from_path(path, head_dim=kwargs.pop("head_dim", _HEAD_DIM), **kwargs)
+    kwargs.setdefault("head_dim", _HEAD_DIM)
+    kwargs.setdefault("num_blocks", 1)
+    kwargs.setdefault("num_refiner_blocks", 0)
+    return FastH3WeightFusion.from_path(path, **kwargs)
 
 
 def _load(path, **kwargs) -> FastH3WeightFusion:
@@ -243,14 +266,28 @@ def _pipeline_stub(fusion=None):
     pipeline._turbo_lora_adapter_ids = set()
     pipeline._fasth3 = fusion
     pipeline.od_config = SimpleNamespace()
+    pipeline.default_video_shift, pipeline.default_audio_shift = 12.0, 3.0
     return pipeline
+
+
+def _sampling(steps=FASTH3_SIGMA_POINTS, **kwargs) -> SimpleNamespace:
+    fields = {"num_inference_steps": steps, "extra_args": {}, "lora_request": None}
+    return SimpleNamespace(**{**fields, **kwargs})
+
+
+def _check_request(fusion, sampling) -> None:
+    fusion.check_request(sampling, video_shift=12.0, audio_shift=3.0)
+
+
+def _fusion(tmp_path, **kwargs) -> FastH3WeightFusion:
+    path = tmp_path / "fasth3" / "adapter_model.safetensors"
+    _write_adapter(path, **kwargs)
+    return _load(path.parent)
 
 
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])
 def test_an_active_fasth3_fusion_restricts_requests_to_t2va(task, tmp_path):
-    path = tmp_path / "fasth3" / "adapter_model.safetensors"
-    _write_adapter(path)
-    pipeline = _pipeline_stub(_load(path.parent))
+    pipeline = _pipeline_stub(_fusion(tmp_path))
 
     with pytest.raises(OmniClientError, match="distills \\['t2va'\\] only"):
         pipeline._resolve_task(task, {})
@@ -260,28 +297,49 @@ def test_an_active_fasth3_fusion_restricts_requests_to_t2va(task, tmp_path):
 
 @pytest.mark.parametrize("num_inference_steps", [None, 4, 50, "5"])
 def test_fasth3_requires_five_sigma_points_for_four_forwards(num_inference_steps, tmp_path):
-    path = tmp_path / "fasth3" / "adapter_model.safetensors"
-    _write_adapter(path)
-    pipeline = _pipeline_stub(_load(path.parent))
-    pipeline.default_video_shift, pipeline.default_audio_shift = 12.0, 3.0
+    fusion = _fusion(tmp_path)
 
     with pytest.raises(OmniClientError, match=f"num_inference_steps={FASTH3_SIGMA_POINTS}"):
-        pipeline._validate_fasth3_sampling(SimpleNamespace(num_inference_steps=num_inference_steps, extra_args={}))
-    pipeline._validate_fasth3_sampling(SimpleNamespace(num_inference_steps=FASTH3_SIGMA_POINTS, extra_args={}))
+        _check_request(fusion, _sampling(num_inference_steps))
+    _check_request(fusion, _sampling())
+
+
+def test_the_request_denoises_on_the_release_ladder(tmp_path):
+    pipeline = _pipeline_stub(_fusion(tmp_path))
+    pipeline._base_schedule_by_partition = {"combined": None}
+
+    positions, num_steps = pipeline._resolve_sigma_positions("t2va", _sampling())
+
+    # dmd_denoising_steps [999, 749, 500, 250] out of 1000, closed with the
+    # terminal 0.0: the pre-shift positions the student was distilled at, not
+    # the uniform ladder num_inference_steps would otherwise derive.
+    assert positions == (0.999, 0.749, 0.5, 0.25, 0.0)
+    assert num_steps == FASTH3_SIGMA_POINTS
+    # H3's own per-modality shifts still apply on top, and are what turn those
+    # positions into the noise levels the four forwards run at.
+    assert minimax_h3_time_shift_sigmas(shift_scale=12.0, base_schedule=positions) == pytest.approx(
+        [0.999917, 0.972833, 0.923077, 0.8, 0.0], abs=1e-6
+    )
+    assert minimax_h3_time_shift_sigmas(shift_scale=3.0, base_schedule=positions) == pytest.approx(
+        [0.999666, 0.899520, 0.75, 0.5, 0.0], abs=1e-6
+    )
+    # Without a fused adapter the same request keeps the undistilled ladder.
+    assert _pipeline_stub()._resolve_sigma_positions("t2va", _sampling()) == (None, FASTH3_SIGMA_POINTS)
 
 
 def test_the_contract_leaves_the_checkpoint_shifts_alone(tmp_path):
-    path = tmp_path / "fasth3" / "adapter_model.safetensors"
-    _write_adapter(path)
-    pipeline = _pipeline_stub(_load(path.parent))
+    pipeline = _pipeline_stub(_fusion(tmp_path))
     pipeline.partition = "fl2va"
-    pipeline.default_video_shift, pipeline.default_audio_shift = 12.0, 3.0
 
-    pipeline._adopt_fasth3_contract()
+    pipeline._fasth3.check_serving_contract(
+        partition=pipeline.partition,
+        od_config=pipeline.od_config,
+        video_shift=pipeline.default_video_shift,
+        audio_shift=pipeline.default_audio_shift,
+    )
 
-    # dmd_denoising_steps [999, 749, 500, 250] are pre-shift timestep indices;
-    # H3's own 12/3 shifts turn the uniform five points into the levels the
-    # student was distilled at, so the contract must not touch them.
+    # The ladder is stated pre-shift, so H3's 12/3 shifts are what place the
+    # student on the levels it was distilled at; the contract must not touch them.
     assert pipeline.default_video_shift == 12.0
     assert pipeline.default_audio_shift == 3.0
 
@@ -291,50 +349,46 @@ def test_the_contract_leaves_the_checkpoint_shifts_alone(tmp_path):
     [{"flow_shift": 1.0}, {"audio_flow_shift": 1.0}, {"flow_shift": "bad"}],
 )
 def test_a_request_may_not_move_the_student_off_its_rungs(extra, tmp_path):
-    path = tmp_path / "fasth3" / "adapter_model.safetensors"
-    _write_adapter(path)
-    pipeline = _pipeline_stub(_load(path.parent))
-    pipeline.default_video_shift, pipeline.default_audio_shift = 12.0, 3.0
-    sampling = SimpleNamespace(num_inference_steps=FASTH3_SIGMA_POINTS, extra_args=extra)
+    fusion = _fusion(tmp_path)
 
     with pytest.raises(OmniClientError, match="FastH3 requires"):
-        pipeline._validate_fasth3_sampling(sampling)
+        _check_request(fusion, _sampling(extra_args=extra))
 
-    pipeline._validate_fasth3_sampling(
-        SimpleNamespace(
-            num_inference_steps=FASTH3_SIGMA_POINTS,
-            extra_args={"flow_shift": 12.0, "audio_flow_shift": 3.0},
-        )
-    )
+    _check_request(fusion, _sampling(extra_args={"flow_shift": 12.0, "audio_flow_shift": 3.0}))
+
+
+def test_a_request_may_not_carry_a_lora_on_a_fused_server(tmp_path):
+    fusion = _fusion(tmp_path)
+
+    # The dynamic LoRA manager is skipped for a fused adapter, so an adapter
+    # asked for per request would be neither applied nor reported.
+    with pytest.raises(OmniClientError, match="per-request lora is unavailable"):
+        _check_request(fusion, _sampling(lora_request=SimpleNamespace(lora_int_id=1)))
 
 
 def test_offload_is_refused_because_it_bypasses_the_fusion(tmp_path):
-    path = tmp_path / "fasth3" / "adapter_model.safetensors"
-    _write_adapter(path)
+    fusion = _fusion(tmp_path)
     for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload"):
-        pipeline = _pipeline_stub(_load(path.parent))
-        pipeline.partition = "fl2va"
-        pipeline.od_config = SimpleNamespace(**{flag: True})
         # A host-weight plan installs the transformer without load_weights(),
         # so the fusion and its completeness check would both be skipped.
         with pytest.raises(ValueError, match="cannot be combined with"):
-            pipeline._adopt_fasth3_contract()
+            fusion.check_serving_contract(
+                partition="fl2va",
+                od_config=SimpleNamespace(**{flag: True}),
+                video_shift=12.0,
+                audio_shift=3.0,
+            )
 
 
 def test_adopting_the_contract_refuses_a_vsa_variant_and_ref2va(tmp_path):
     sparse = tmp_path / "vsa" / "adapter_model.safetensors"
     _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
-    pipeline = _pipeline_stub(_load(sparse.parent))
-    pipeline.partition = "fl2va"
+    contract = {"od_config": SimpleNamespace(), "video_shift": 12.0, "audio_shift": 3.0}
     with pytest.raises(ValueError, match="Video Sparse Attention variant"):
-        pipeline._adopt_fasth3_contract()
+        _load(sparse.parent).check_serving_contract(partition="fl2va", **contract)
 
-    dense = tmp_path / "dense" / "adapter_model.safetensors"
-    _write_adapter(dense)
-    pipeline = _pipeline_stub(_load(dense.parent))
-    pipeline.partition = "ref2va"
     with pytest.raises(ValueError, match="cannot serve a Ref2VA partition"):
-        pipeline._adopt_fasth3_contract()
+        _fusion(tmp_path).check_serving_contract(partition="ref2va", **contract)
 
 
 def test_a_full_rank_delta_on_a_fused_parameter_is_refused(tmp_path):
@@ -346,9 +400,53 @@ def test_a_full_rank_delta_on_a_fused_parameter_is_refused(tmp_path):
         _claim(path.parent)
 
 
-def test_a_pipeline_that_fused_its_adapter_needs_no_lora_manager(tmp_path):
+def test_an_adapter_that_leaves_blocks_untouched_is_refused(tmp_path):
+    path = tmp_path / "fasth3" / "adapter_model.safetensors"
+    _write_adapter(path, blocks=2)
+
+    # Every tensor in this file is well formed and pairs up, so the fusion's
+    # own completeness check passes; only the model's depth reveals that a
+    # third of it would have been served as base H3 weights.
+    with pytest.raises(FastH3AdapterError, match="missing=\\[2\\]"):
+        _claim(path.parent, num_blocks=3)
+    with pytest.raises(FastH3AdapterError, match="unknown=\\[1\\]"):
+        _claim(path.parent, num_blocks=1)
+    assert _claim(path.parent, num_blocks=2) is not None
+
+
+def test_an_adapter_shorter_than_it_declares_is_refused(tmp_path):
+    path = tmp_path / "fasth3" / "adapter_model.safetensors"
+    _write_adapter(path, metadata={"low_rank_tensors": "724", "diff_tensors": "85"})
+
+    # The writer records what it emitted, which is the file's one statement
+    # about its own completeness.
+    with pytest.raises(FastH3AdapterError, match="declares low_rank_tensors=724 but carries 12"):
+        _claim(path.parent)
+
+
+def test_only_a_configured_adapter_path_is_read(tmp_path):
     path = tmp_path / "fasth3" / "adapter_model.safetensors"
     _write_adapter(path)
+    transformer = SimpleNamespace(
+        arch=SimpleNamespace(attention_head_dim=_HEAD_DIM, num_layers=1, token_refiner_num_layers=0)
+    )
+    unbuilt = object()  # a transformer whose arch must not be touched
 
-    assert _pipeline_stub(_load(path.parent)).lora_is_fused is True
+    assert resolve_fasth3_fusion(SimpleNamespace(lora_path=str(path)), transformer) is not None
+    assert resolve_fasth3_fusion(SimpleNamespace(lora_path=[str(path)]), transformer) is not None
+    # Nothing configured, or more than one artifact, stays on the dynamic route
+    # without reading anything off the model.
+    assert resolve_fasth3_fusion(SimpleNamespace(lora_path=None), unbuilt) is None
+    assert resolve_fasth3_fusion(SimpleNamespace(), unbuilt) is None
+    assert resolve_fasth3_fusion(SimpleNamespace(lora_path=[str(path), str(path)]), unbuilt) is None
+
+
+def test_a_pipeline_that_fused_its_adapter_needs_no_lora_manager(tmp_path):
+    assert _pipeline_stub(_fusion(tmp_path)).lora_is_fused is True
     assert _pipeline_stub().lora_is_fused is False
+
+
+def test_the_ladder_is_the_one_the_release_publishes():
+    # FASTH3_SIGMA_POINTS is derived from it, so the two cannot drift apart.
+    assert FASTH3_BASE_SCHEDULE.base_schedule == (0.999, 0.749, 0.5, 0.25, 0.0)
+    assert FASTH3_BASE_SCHEDULE.num_inference_steps == FASTH3_SIGMA_POINTS - 1 == 4

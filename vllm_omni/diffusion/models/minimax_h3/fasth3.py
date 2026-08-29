@@ -32,32 +32,43 @@ the released full checkpoint (``FastVideo-FastH3-4-step-Preview-v1-Dense-DataFre
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import torch
 from safetensors import safe_open
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
+from vllm_omni.errors import OmniClientError
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from .minimax_h3_transformer import MiniMaxH3DiTModel
 
 logger = init_logger(__name__)
 
 FASTH3_FORMAT = "fastvideo-lora-v2"
 FASTH3_MANIFEST = "adapter_manifest.json"
 
-# Five scheduler points bound the four transformer forwards the student was
-# trained for. The ladder is the release's `dmd_denoising_steps` divided by
-# 1000; it starts at 0.999 rather than 1.0 because training capped the noise
-# level there (`max_timestep_ratio`), and it is uniform, so no rectified-flow
-# time shift is applied on top of it.
-# ``dmd_denoising_steps`` in the release contract is [999, 749, 500, 250]:
-# timestep indices out of 1000, i.e. the pre-shift positions of the uniform
-# five-point ladder, not final sigmas. H3's schedulers then apply their own
-# per-modality shift on top (12 for video, 3 for audio), which reproduces the
-# levels the student was distilled at. Nothing here overrides those shifts.
-FASTH3_SIGMA_POINTS = 5
+# The rectified-flow positions the student was distilled at, and the ladder the
+# server samples on. The release states them as `dmd_denoising_steps`
+# [999, 749, 500, 250] (`sampling.base_timesteps` in the bundle manifest):
+# timestep indices out of 1000, i.e. pre-shift positions, closed here with the
+# terminal 0.0 every rectified-flow schedule ends on. The opening rung is 0.999
+# rather than 1.0 because training capped the noise level there
+# (`max_timestep_ratio`).
+#
+# These are positions, not final sigmas: H3's schedulers apply their own
+# per-modality shift on top (12 for video, 3 for audio), which is what
+# reproduces the levels the student saw. Nothing here overrides those shifts.
+FASTH3_BASE_SCHEDULE = DMD2SigmaSchedule.from_positions((0.999, 0.749, 0.5, 0.25, 0.0))
+# Its five points bound the four transformer forwards the student was trained
+# for, and that count is what a request speaks in.
+FASTH3_SIGMA_POINTS = len(FASTH3_BASE_SCHEDULE.base_schedule)
 # Preview v1 distills the text-to-video-and-audio path only.
 FASTH3_SUPPORTED_TASKS = frozenset({"t2va"})
 
@@ -157,11 +168,16 @@ def _place_in_grouped_qkv(deltas: Mapping[str, torch.Tensor], *, head_dim: int) 
     return torch.cat(parts, dim=1).reshape(groups * 3 * head_dim, *parts[0].shape[2:])
 
 
-def _resolve_native_target(module: str) -> tuple[str, str] | None:
-    """Map an adapter module path to ``(native module path, layout)``."""
+def _resolve_native_target(module: str) -> tuple[str, str, tuple[str, int] | None] | None:
+    """Map an adapter module path to ``(native path, layout, block)``.
+
+    ``block`` is the ``(native block prefix, index)`` the module sits in, or
+    ``None`` for a model-level one. Coverage is checked per block, so the index
+    has to survive the mapping rather than being folded into the path.
+    """
     native = _MODEL_LEVEL_TARGETS.get(module)
     if native is not None:
-        return native, _PLAIN
+        return native, _PLAIN, None
     for adapter_prefix, native_prefix in _BLOCK_PREFIXES:
         if not module.startswith(adapter_prefix):
             continue
@@ -173,7 +189,7 @@ def _resolve_native_target(module: str) -> tuple[str, str] | None:
         if target is None:
             return None
         native_suffix, layout = target
-        return f"{native_prefix}{index}.{native_suffix}", layout
+        return f"{native_prefix}{index}.{native_suffix}", layout, (native_prefix, int(index))
     return None
 
 
@@ -189,6 +205,60 @@ def _split_adapter_key(name: str) -> tuple[str, str] | None:
         if name.endswith(marker):
             return name[: -len(marker)], role
     return None
+
+
+def _check_declared_counts(
+    metadata: Mapping[str, str],
+    counted: Mapping[str, int],
+    *,
+    weights_path: Path,
+) -> None:
+    """Hold the artifact to the tensor counts its own metadata declares.
+
+    The writer of the ``fastvideo-lora-v2`` format records how many tensors of
+    each kind it emitted, which is the one statement in the file about its own
+    completeness. A truncated or partially re-exported artifact is otherwise
+    indistinguishable from a small one.
+    """
+    for key, seen in counted.items():
+        declared = metadata.get(key)
+        if declared is None:
+            continue
+        try:
+            expected = int(declared)
+        except (TypeError, ValueError) as exc:
+            raise FastH3AdapterError(f"{weights_path} declares a non-numeric {key}={declared!r}") from exc
+        if expected != seen:
+            raise FastH3AdapterError(
+                f"{weights_path} declares {key}={expected} but carries {seen}; the adapter is incomplete "
+                "and would leave most of the transformer on base H3 weights"
+            )
+
+
+def _check_block_coverage(
+    seen: Mapping[str, set[int]],
+    *,
+    expected: Mapping[str, int],
+    weights_path: Path,
+) -> None:
+    """Every block of the model this adapter is loaded against must be edited.
+
+    The release drops tensors training left unchanged, so per-parameter
+    coverage is legitimately sparse - but a distilled student touches every
+    block, so a block with no edits at all means the artifact does not match
+    this model.
+    """
+    for prefix, count in expected.items():
+        indices = seen.get(prefix, set())
+        wanted = set(range(count))
+        if indices == wanted:
+            continue
+        missing = sorted(wanted - indices)
+        extra = sorted(indices - wanted)
+        raise FastH3AdapterError(
+            f"{weights_path} edits {len(indices)} of the model's {count} {prefix}* blocks "
+            f"(missing={missing[:5]}, unknown={extra[:5]}); it is not an adapter for this checkpoint"
+        )
 
 
 class FastH3WeightFusion:
@@ -213,12 +283,33 @@ class FastH3WeightFusion:
     def source(self) -> Path:
         return self._source
 
+    @property
+    def base_schedule(self) -> tuple[float, ...]:
+        """The rectified-flow positions this student samples on.
+
+        The fused checkpoint is a four-step student, so the ladder comes from
+        the release rather than from the many-step teacher's metadata or from
+        the uniform one ``num_inference_steps`` would otherwise derive.
+        """
+        return FASTH3_BASE_SCHEDULE.base_schedule
+
     @classmethod
-    def from_path(cls, path: str | Path, *, head_dim: int) -> FastH3WeightFusion | None:
+    def from_path(
+        cls,
+        path: str | Path,
+        *,
+        head_dim: int,
+        num_blocks: int,
+        num_refiner_blocks: int,
+    ) -> FastH3WeightFusion | None:
         """Build a fusion from an adapter file or directory, else ``None``.
 
         Returning ``None`` keeps every other ``--lora-path`` artifact on the
         dynamic LoRA route; only a ``fastvideo-lora-v2`` file is claimed here.
+
+        The block counts are the model's, and the artifact has to cover them:
+        claiming a partial adapter would switch the server onto the four-step
+        contract while most of the transformer still held base H3 weights.
         """
         weights_path = _resolve_adapter_file(path)
         if weights_path is None:
@@ -227,6 +318,8 @@ class FastH3WeightFusion:
         patches: dict[str, _ParamPatch] = {}
         gate_tensors: list[str] = []
         unmapped: list[str] = []
+        blocks_seen: dict[str, set[int]] = {}
+        counted = {"low_rank_tensors": 0, "diff_tensors": 0}
         with safe_open(weights_path, framework="pt", device="cpu") as checkpoint:
             metadata = checkpoint.metadata() or {}
             if metadata.get("format") != FASTH3_FORMAT:
@@ -246,7 +339,10 @@ class FastH3WeightFusion:
                 if target is None:
                     unmapped.append(name)
                     continue
-                native_module, layout = target
+                native_module, layout, block = target
+                if block is not None:
+                    blocks_seen.setdefault(block[0], set()).add(block[1])
+                counted["diff_tensors" if role in ("diff", "diff_b") else "low_rank_tensors"] += 1
                 native_param = f"{native_module}.{'bias' if role == 'diff_b' else 'weight'}"
                 patch = patches.setdefault(native_param, _ParamPatch(layout=layout))
                 tensor = checkpoint.get_tensor(name)
@@ -263,6 +359,16 @@ class FastH3WeightFusion:
                 f"FastH3 adapter at {weights_path} has {len(unmapped)} tensors that name no known "
                 f"H3 parameter: {sorted(unmapped)[:5]}"
             )
+        _check_declared_counts(
+            metadata,
+            {**counted, "set_weight_tensors": len(gate_tensors)},
+            weights_path=weights_path,
+        )
+        _check_block_coverage(
+            blocks_seen,
+            expected={"blocks.": num_blocks, "token_refiner.blocks.": num_refiner_blocks},
+            weights_path=weights_path,
+        )
         for native_param, patch in patches.items():
             for slot, (a, b) in patch.low_rank.items():
                 if a is None or b is None:
@@ -383,6 +489,107 @@ class FastH3WeightFusion:
             patch.low_rank.clear()
             patch.diff = None
 
+    def check_serving_contract(
+        self,
+        *,
+        partition: str,
+        od_config: Any,
+        video_shift: float,
+        audio_shift: float,
+    ) -> None:
+        """Hold a starting server to the ladder this student was trained on."""
+        if partition == "ref2va":
+            raise ValueError("FastH3 preview v1 distills T2VA only, so it cannot serve a Ref2VA partition")
+        offloads = [
+            flag
+            for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload")
+            if getattr(od_config, flag, False)
+        ]
+        if offloads:
+            # A host-weight plan installs the transformer without going through
+            # load_weights(), which is where the fusion and its completeness
+            # check live. Serving base H3 weights under a four-step schedule
+            # would otherwise degrade output with nothing to signal it.
+            raise ValueError(
+                f"FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
+                f"{sorted(offloads)}. Serve it without offload."
+            )
+        if self.requires_vsa:
+            raise ValueError(
+                f"{self.source} is a Video Sparse Attention variant of FastH3, and its "
+                "compression gates have no counterpart in vLLM-Omni's dense H3 attention. Use the "
+                "release's Dense variant until VSA lands for H3's packed sequence."
+            )
+        logger.info(
+            "FastH3 adapter active: sigma points %s for %d transformer forwards, "
+            "flow_shift=%g, audio_flow_shift=%g, tasks=%s",
+            list(self.base_schedule),
+            FASTH3_SIGMA_POINTS - 1,
+            video_shift,
+            audio_shift,
+            sorted(FASTH3_SUPPORTED_TASKS),
+        )
+
+    def check_task(self, task: str) -> None:
+        """Refuse a task this preview never distilled."""
+        if task not in FASTH3_SUPPORTED_TASKS:
+            raise OmniClientError(
+                f"FastH3 preview v1 distills {sorted(FASTH3_SUPPORTED_TASKS)} only, got task={task!r}"
+            )
+
+    def check_request(self, sampling: Any, *, video_shift: float, audio_shift: float) -> None:
+        """Refuse a request that would sample the student off its rungs."""
+        if sampling.lora_request is not None:
+            # The adapter is already in the weights and the dynamic LoRA manager
+            # is skipped, so nothing would apply the requested one. Serving the
+            # request anyway would quietly ignore it.
+            raise OmniClientError(
+                f"this server fused {self.source} into the checkpoint at startup, so per-request "
+                "lora is unavailable; drop the lora field"
+            )
+        if sampling.num_inference_steps != FASTH3_SIGMA_POINTS:
+            raise OmniClientError(
+                f"FastH3 is a four-step student and requires num_inference_steps={FASTH3_SIGMA_POINTS} "
+                f"({FASTH3_SIGMA_POINTS} sigma points produce {FASTH3_SIGMA_POINTS - 1} transformer forwards)"
+            )
+        # The checkpoint's per-modality shifts turn the release's positions into
+        # the noise levels the student was distilled at, so a request that moves
+        # them samples where it was never trained.
+        extra = sampling.extra_args or {}
+        for key, expected in (("flow_shift", video_shift), ("audio_flow_shift", audio_shift)):
+            try:
+                requested = float(extra.get(key, expected))
+            except (TypeError, ValueError) as exc:
+                raise OmniClientError(f"FastH3 requires {key}={expected:g}") from exc
+            if not math.isclose(requested, expected):
+                raise OmniClientError(f"FastH3 requires {key}={expected:g}, got {requested:g}")
+
+
+def resolve_fasth3_fusion(od_config: Any, transformer: MiniMaxH3DiTModel) -> FastH3WeightFusion | None:
+    """Claim ``--lora-path`` when it points at a FastH3 adapter.
+
+    FastH3 rewrites RMSNorm weights and biases, so it cannot be expressed as a
+    request-switchable LoRA and is fused into the checkpoint instead. Any other
+    artifact returns None here and stays on the dynamic LoRA route.
+    """
+    lora_path = getattr(od_config, "lora_path", None)
+    if isinstance(lora_path, (list, tuple)):
+        if len(lora_path) != 1:
+            return None
+        lora_path = lora_path[0]
+    if not lora_path:
+        return None
+    # Placing a delta into the fused QKV parameter needs the head size, and
+    # completeness is judged against the model's depth, so the architecture is
+    # only read once an adapter is actually configured.
+    arch = transformer.arch
+    return FastH3WeightFusion.from_path(
+        lora_path,
+        head_dim=arch.attention_head_dim,
+        num_blocks=arch.num_layers,
+        num_refiner_blocks=arch.token_refiner_num_layers,
+    )
+
 
 def _resolve_adapter_file(path: str | Path) -> Path | None:
     """Find the single adapter file at ``path``, or ``None``."""
@@ -408,9 +615,11 @@ def _resolve_adapter_file(path: str | Path) -> Path | None:
 
 
 __all__ = [
+    "FASTH3_BASE_SCHEDULE",
     "FASTH3_FORMAT",
     "FASTH3_SIGMA_POINTS",
     "FASTH3_SUPPORTED_TASKS",
     "FastH3AdapterError",
     "FastH3WeightFusion",
+    "resolve_fasth3_fusion",
 ]

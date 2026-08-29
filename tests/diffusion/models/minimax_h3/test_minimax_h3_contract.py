@@ -572,7 +572,7 @@ def test_base_schedule_overrides_the_uniform_sigma_positions():
 @pytest.mark.parametrize(
     "base_schedule",
     [
-        [0.9, 0.5, 0.0],
+        [1.5, 0.5, 0.0],
         [1.0, 0.5, 0.1],
         [1.0, 0.5, 0.5, 0.0],
         [1.0],
