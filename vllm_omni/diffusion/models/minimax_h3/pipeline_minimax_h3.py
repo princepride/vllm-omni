@@ -355,6 +355,9 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
 
     The callable crosses the multiprocessing result queue, so it must remain a
     module-level function that the standard pickle module can resolve.
+
+    ``decode`` already quantises the video to uint8 frames on the accelerator,
+    so there is nothing left to scale or transpose here.
     """
     if not isinstance(output, tuple) or len(output) != 2:
         return output
@@ -362,7 +365,7 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     if output_type == "latent":
         return output
     if output_type == "np":
-        video = video.detach().float().cpu().permute(0, 2, 3, 4, 1).clamp(0, 1).numpy()
+        video = video.detach().cpu().numpy()
         audio = audio.detach().float().cpu().numpy()
         video = [sample for sample in video]
     return {
@@ -2082,7 +2085,13 @@ class MiniMaxH3Pipeline(
                 enabled=True,
             ):
                 video = self.video_vae.decode_latent(video_latent)
-        video = video[..., :height, :width].contiguous()
+        video = video[..., :height, :width]
+        # Quantise here, on the accelerator, in the layout the muxer reads.
+        # The response crosses two process boundaries on its way out - shared
+        # memory to the engine, then msgpack over ZMQ to the stage - and both
+        # copy it whole, so float32 costs four times the bytes for precision an
+        # 8-bit MP4 discards anyway.
+        video = (video.permute(0, 2, 3, 4, 1).clamp(0, 1) * 255).round().to(torch.uint8).contiguous()
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
         return video, audio
