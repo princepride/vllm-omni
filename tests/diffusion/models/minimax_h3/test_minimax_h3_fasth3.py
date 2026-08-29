@@ -77,8 +77,7 @@ def _write_adapter(
         "diff_tensors": str(sum(1 for key in payload if key.endswith((".diff", ".diff_b")))),
         "set_weight_tensors": str(sum(1 for key in payload if key.endswith(".set_weight"))),
     }
-    # safetensors metadata is string-only, so a ``None`` override means the
-    # published writer never emitted that key.
+    # safetensors metadata is string-only, so a ``None`` override drops the key.
     declared.update(metadata or {})
     save_file(payload, str(path), metadata={key: value for key, value in declared.items() if value is not None})
 
@@ -115,25 +114,16 @@ def test_only_an_artifact_carrying_the_release_identity_is_claimed(tmp_path):
 @pytest.mark.parametrize(
     "identity",
     [
-        # FastVideo's own LoRA extraction and MiniMax-H3 conversion tools emit
-        # fastvideo-lora-v2 for ordinary H3 adapters, which are not distilled
-        # for a four-step schedule.
+        # An ordinary H3 adapter out of FastVideo's own extraction tools.
         {"finetuned_model": "someone/minimax-h3-style-lora"},
         {"finetuned_model": ""},
-        # The format with no identity statement at all.
         {"finetuned_model": None},
-        # A FastH3 name over a different base model is not this checkpoint's.
+        # A FastH3 name over a different base model.
         {"base_model": "Wan-AI/Wan2.2-TI2V-5B"},
     ],
 )
 def test_a_generic_fastvideo_h3_adapter_stays_on_the_dynamic_route(identity, tmp_path):
-    """The container format is not the release identity.
-
-    This fixture edits every block of the model it is loaded against, so it
-    clears block coverage, tensor mapping and the declared counts. Only the
-    identity separates it from FastH3, and being claimed would fuse it
-    permanently and force the four-step ladder it was never distilled for.
-    """
+    """The fixture edits every block, so only the identity separates it from FastH3."""
     path = tmp_path / "generic" / "adapter_model.safetensors"
     _write_adapter(path, metadata=identity)
 
