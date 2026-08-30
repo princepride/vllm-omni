@@ -56,9 +56,12 @@ logger = init_logger(__name__)
 FASTH3_FORMAT = "fastvideo-lora-v2"
 FASTH3_MANIFEST = "adapter_manifest.json"
 # The release identity: the distilled student the adapter came from, over the
-# base it edits.
+# base it edits. The name is held to FastVideo's own namespace as well as the
+# student's name, so an unrelated adapter that merely mentions FastH3 is not
+# claimed.
 FASTH3_BASE_MODEL = "MiniMaxAI/MiniMax-H3"
 _FASTH3_IDENTITY_KEY = "finetuned_model"
+_FASTH3_IDENTITY_NAMESPACE = "fastvideo/"
 _FASTH3_IDENTITY_MARKER = "fasth3"
 
 # The rectified-flow positions the student was distilled at, and the ladder the
@@ -73,9 +76,11 @@ _FASTH3_IDENTITY_MARKER = "fasth3"
 # per-modality shift on top (12 for video, 3 for audio), which is what
 # reproduces the levels the student saw. Nothing here overrides those shifts.
 FASTH3_BASE_SCHEDULE = DMD2SigmaSchedule.from_positions((0.999, 0.749, 0.5, 0.25, 0.0))
-# Its five points bound the four transformer forwards the student was trained
-# for, and that count is what a request speaks in.
-FASTH3_SIGMA_POINTS = len(FASTH3_BASE_SCHEDULE.base_schedule)
+# Its five points bound four transformer forwards, one per sigma interval. That
+# count is the one a request states, the one Cache-DiT is refreshed with and the
+# one step execution admits a request on - the same interval contract H3's
+# pinned checkpoint schedules and native LoRAs already use.
+FASTH3_DENOISE_STEPS = FASTH3_BASE_SCHEDULE.num_inference_steps
 # Preview v1 distills the text-to-video-and-audio path only.
 FASTH3_SUPPORTED_TASKS = frozenset({"t2va"})
 
@@ -219,11 +224,13 @@ def _is_fasth3_release(metadata: Mapping[str, str]) -> bool:
 
     Claiming on the container alone would fuse an ordinary H3 adapter into the
     checkpoint and put every request on a four-step schedule it was never
-    distilled for.
+    distilled for, and so would a bare ``fasth3`` substring: an adapter someone
+    else named after the student is not the student.
     """
     if metadata.get("format") != FASTH3_FORMAT:
         return False
-    if _FASTH3_IDENTITY_MARKER not in metadata.get(_FASTH3_IDENTITY_KEY, "").lower():
+    identity = metadata.get(_FASTH3_IDENTITY_KEY, "").lower()
+    if not identity.startswith(_FASTH3_IDENTITY_NAMESPACE) or _FASTH3_IDENTITY_MARKER not in identity:
         return False
     # Only held against a file that states it.
     base_model = metadata.get("base_model")
@@ -497,6 +504,11 @@ class FastH3WeightFusion:
 
     def apply(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
         """Fuse every streamed checkpoint tensor on its way into the model."""
+        if self._applied:
+            # ``validate_fully_applied`` released the deltas, so a second stream
+            # would fuse nothing and then pass its own completeness check: the
+            # server would serve base H3 weights on the student's ladder.
+            raise FastH3AdapterError(f"{self._source} has already been fused into this checkpoint")
         for name, weight in weights:
             yield name, self.fuse(name, weight)
 
@@ -552,7 +564,7 @@ class FastH3WeightFusion:
             "FastH3 adapter active: sigma points %s for %d transformer forwards, "
             "flow_shift=%g, audio_flow_shift=%g, tasks=%s",
             list(self.base_schedule),
-            FASTH3_SIGMA_POINTS - 1,
+            FASTH3_DENOISE_STEPS,
             video_shift,
             audio_shift,
             sorted(FASTH3_SUPPORTED_TASKS),
@@ -575,10 +587,10 @@ class FastH3WeightFusion:
                 f"this server fused {self.source} into the checkpoint at startup, so per-request "
                 "lora is unavailable; drop the lora field"
             )
-        if sampling.num_inference_steps != FASTH3_SIGMA_POINTS:
+        if int(sampling.num_inference_steps or 0) != FASTH3_DENOISE_STEPS:
             raise OmniClientError(
-                f"FastH3 is a four-step student and requires num_inference_steps={FASTH3_SIGMA_POINTS} "
-                f"({FASTH3_SIGMA_POINTS} sigma points produce {FASTH3_SIGMA_POINTS - 1} transformer forwards)"
+                f"FastH3 is a four-step student and requires num_inference_steps={FASTH3_DENOISE_STEPS} "
+                "(one transformer forward per sigma interval)"
             )
         # The checkpoint's per-modality shifts turn the release's positions into
         # the noise levels the student was distilled at, so a request that moves
@@ -619,6 +631,15 @@ def resolve_fasth3_fusion(od_config: Any, transformer: MiniMaxH3DiTModel) -> Fas
     )
 
 
+def _safetensors_metadata(path: Path) -> Mapping[str, str]:
+    """The header metadata of a safetensors file, or ``{}`` if unreadable."""
+    try:
+        with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            return checkpoint.metadata() or {}
+    except Exception:  # noqa: BLE001 - a path that will not open is simply not ours
+        return {}
+
+
 def _resolve_adapter_file(path: str | Path) -> Path | None:
     """Find the single adapter file at ``path``, or ``None``."""
     candidate = Path(path)
@@ -632,11 +653,15 @@ def _resolve_adapter_file(path: str | Path) -> Path | None:
     files = sorted(candidate.glob("*.safetensors"))
     if len(files) == 1:
         return files[0]
-    # The published repository bundles four variants under one root, so a
-    # directory holding several adapters is ambiguous rather than loadable.
-    if len(files) > 1 or (candidate / FASTH3_MANIFEST).is_file():
+    # The published repository bundles four variants under one root, marked by an
+    # adapter_manifest.json. Such a bundle is ambiguous rather than loadable - but
+    # only hold that against a directory that actually carries FastH3 artifacts;
+    # an unrelated multi-shard LoRA stays on the dynamic route via ``None``.
+    if (candidate / FASTH3_MANIFEST).is_file() or any(
+        _is_fasth3_release(_safetensors_metadata(file)) for file in files
+    ):
         raise FastH3AdapterError(
-            f"{candidate} holds {len(files)} adapters; point --lora-path at one variant "
+            f"{candidate} holds several FastH3 adapters; point --lora-path at one variant "
             "(for example dense-datafree/adapter_model.safetensors)"
         )
     return None
@@ -645,8 +670,8 @@ def _resolve_adapter_file(path: str | Path) -> Path | None:
 __all__ = [
     "FASTH3_BASE_MODEL",
     "FASTH3_BASE_SCHEDULE",
+    "FASTH3_DENOISE_STEPS",
     "FASTH3_FORMAT",
-    "FASTH3_SIGMA_POINTS",
     "FASTH3_SUPPORTED_TASKS",
     "FastH3AdapterError",
     "FastH3WeightFusion",

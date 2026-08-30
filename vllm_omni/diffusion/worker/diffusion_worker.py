@@ -747,11 +747,15 @@ class DiffusionWorker:
             logger.warning("LoRA activation skipped: %s", exc)
 
     def remove_lora(self, adapter_id: int) -> bool:
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.remove_adapter(adapter_id)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         # NOTE (Alex): We have not implemented the API routing
         # for the frontend server yet.
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.add_adapter(lora_request)
 
     def submit_interaction(
@@ -764,9 +768,13 @@ class DiffusionWorker:
         self.model_runner.submit_interaction(request_id, interaction)
 
     def list_loras(self) -> list[int]:
+        if self.lora_manager is None:
+            return []
         return self.lora_manager.list_adapters()
 
     def pin_lora(self, adapter_id: int) -> bool:
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.pin_adapter(adapter_id)
 
     def sleep(self, level: int = 1) -> int:

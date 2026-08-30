@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Shared helper utilities for OpenAI-compatible video generation API.
 """
@@ -464,8 +464,10 @@ def _coerce_video_to_frames(video: Any) -> list[np.ndarray]:
     """Convert a video payload into a list of normalized frames.
 
     Frames are float32 in [0, 1], except uint8 ones, which pass through: the
-    muxer's own dtype is uint8, and both encoders below consume it directly, so
-    normalising it here would only pay for a full-size conversion each way.
+    muxer's own dtype is uint8, so normalising here would only pay for a
+    full-size conversion each way. The direct planar path additionally needs
+    contiguous channel planes and falls back for interleaved RGB whatever the
+    dtype; the standard muxer takes the uint8 frames as they are.
     """
     if isinstance(video, torch.Tensor):
         video_array = _normalize_video_tensor(video)

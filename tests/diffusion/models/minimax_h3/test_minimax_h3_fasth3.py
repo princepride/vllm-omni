@@ -13,8 +13,8 @@ from safetensors.torch import save_file
 from vllm_omni.diffusion.models.minimax_h3.fasth3 import (
     FASTH3_BASE_MODEL,
     FASTH3_BASE_SCHEDULE,
+    FASTH3_DENOISE_STEPS,
     FASTH3_FORMAT,
-    FASTH3_SIGMA_POINTS,
     FastH3AdapterError,
     FastH3WeightFusion,
     resolve_fasth3_fusion,
@@ -116,6 +116,8 @@ def test_only_an_artifact_carrying_the_release_identity_is_claimed(tmp_path):
     [
         # An ordinary H3 adapter out of FastVideo's own extraction tools.
         {"finetuned_model": "someone/minimax-h3-style-lora"},
+        # Somebody else's adapter that merely names the student it imitates.
+        {"finetuned_model": "someone/fasth3-style-lora-for-h3"},
         {"finetuned_model": ""},
         {"finetuned_model": None},
         # A FastH3 name over a different base model.
@@ -149,6 +151,19 @@ def test_the_published_bundle_root_is_refused_rather_than_guessed(tmp_path):
         _load(root)
     # One variant inside it is unambiguous.
     assert _claim(root / "dense-datafree") is not None
+
+
+def test_a_multi_shard_non_fasth3_adapter_stays_on_the_dynamic_route(tmp_path):
+    # A plain PEFT LoRA saved as several shards must not hard-fail startup with a
+    # FastH3-specific message; it has to fall through to the dynamic LoRA route.
+    directory = tmp_path / "peft-sharded"
+    directory.mkdir()
+    for shard in ("adapter_model-00001-of-00002.safetensors", "adapter_model-00002-of-00002.safetensors"):
+        save_file(
+            {"transformer_blocks.0.attn.to_q.lora_A.weight": torch.ones((_RANK, _HIDDEN))}, str(directory / shard)
+        )
+
+    assert _claim(directory) is None
 
 
 def test_low_rank_factors_reach_the_fused_projections(tmp_path):
@@ -208,13 +223,22 @@ def test_diff_and_diff_b_edit_weights_and_biases(tmp_path):
     assert torch.allclose(fusion.fuse("condition_proj.bias", torch.zeros(_HIDDEN)).cpu(), torch.full((_HIDDEN,), 2.0))
 
 
-def test_an_unpatched_parameter_passes_through_untouched(tmp_path):
+def test_a_streamed_checkpoint_keeps_the_parameters_the_adapter_never_edits(tmp_path):
     path = tmp_path / "fasth3" / "adapter_model.safetensors"
-    _write_adapter(path)
+    _write_adapter(path, tensors={"transformer_blocks.0.norm1.diff": torch.full((_HIDDEN,), 3.0)})
     fusion = _load(path.parent)
 
-    weight = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
-    assert fusion.fuse("blocks.0.attn.q_norm.weight", weight) is weight
+    untouched = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+    streamed = dict(
+        fusion.apply([("blocks.0.norm1.weight", torch.zeros(_HIDDEN)), ("blocks.0.attn.q_norm.weight", untouched)])
+    )
+    assert torch.allclose(streamed["blocks.0.norm1.weight"].cpu(), torch.full((_HIDDEN,), 3.0))
+    assert streamed["blocks.0.attn.q_norm.weight"] is untouched
+
+    # validate_fully_applied() releases the deltas, so a second stream would
+    # fuse nothing at all; it has to fail rather than serve base H3 weights.
+    with pytest.raises(FastH3AdapterError, match="already been fused"):
+        next(fusion.apply([("blocks.0.norm1.weight", torch.zeros(_HIDDEN))]))
 
 
 def test_the_fused_result_keeps_the_parameter_dtype(tmp_path):
@@ -272,23 +296,6 @@ def test_a_delta_the_checkpoint_never_offered_is_reported(tmp_path):
     fusion.validate_fully_applied()
 
 
-def test_apply_fuses_a_whole_weight_stream(tmp_path):
-    path = tmp_path / "fasth3" / "adapter_model.safetensors"
-    _write_adapter(path, tensors={"transformer_blocks.0.norm1.diff": torch.full((_HIDDEN,), 3.0)})
-    fusion = _load(path.parent)
-
-    streamed = dict(
-        fusion.apply(
-            [
-                ("blocks.0.norm1.weight", torch.zeros(_HIDDEN)),
-                ("blocks.0.attn.q_norm.weight", torch.zeros(_HIDDEN)),
-            ]
-        )
-    )
-    assert torch.allclose(streamed["blocks.0.norm1.weight"].cpu(), torch.full((_HIDDEN,), 3.0))
-    assert torch.allclose(streamed["blocks.0.attn.q_norm.weight"].cpu(), torch.zeros(_HIDDEN))
-
-
 def _pipeline_stub(fusion=None):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -303,7 +310,7 @@ def _pipeline_stub(fusion=None):
     return pipeline
 
 
-def _sampling(steps=FASTH3_SIGMA_POINTS, **kwargs) -> SimpleNamespace:
+def _sampling(steps=FASTH3_DENOISE_STEPS, **kwargs) -> SimpleNamespace:
     fields = {"num_inference_steps": steps, "extra_args": {}, "lora_request": None}
     return SimpleNamespace(**{**fields, **kwargs})
 
@@ -328,18 +335,22 @@ def test_an_active_fasth3_fusion_restricts_requests_to_t2va(task, tmp_path):
     assert _pipeline_stub()._resolve_task(task, {}) == task
 
 
-@pytest.mark.parametrize("num_inference_steps", [None, 4, 50, "5"])
-def test_fasth3_requires_five_sigma_points_for_four_forwards(num_inference_steps, tmp_path):
+@pytest.mark.parametrize("num_inference_steps", [None, 5, 50])
+def test_fasth3_requires_one_forward_per_sigma_interval(num_inference_steps, tmp_path):
     fusion = _fusion(tmp_path)
 
-    with pytest.raises(OmniClientError, match=f"num_inference_steps={FASTH3_SIGMA_POINTS}"):
+    # The five sigma points bound four forwards, and a request states forwards:
+    # the interval contract the pinned schedules use, and the count the step
+    # scheduler admits a request on before any pipeline hook runs.
+    with pytest.raises(OmniClientError, match=f"num_inference_steps={FASTH3_DENOISE_STEPS}"):
         _check_request(fusion, _sampling(num_inference_steps))
     _check_request(fusion, _sampling())
+    # The pinned branch coerces the string form; this one cannot disagree.
+    _check_request(fusion, _sampling(str(FASTH3_DENOISE_STEPS)))
 
 
 def test_the_request_denoises_on_the_release_ladder(tmp_path):
     pipeline = _pipeline_stub(_fusion(tmp_path))
-    pipeline._base_schedule_by_partition = {"combined": None}
 
     positions, num_steps = pipeline._resolve_sigma_positions("t2va", _sampling())
 
@@ -347,7 +358,9 @@ def test_the_request_denoises_on_the_release_ladder(tmp_path):
     # terminal 0.0: the pre-shift positions the student was distilled at, not
     # the uniform ladder num_inference_steps would otherwise derive.
     assert positions == (0.999, 0.749, 0.5, 0.25, 0.0)
-    assert num_steps == FASTH3_SIGMA_POINTS
+    # Five sigma points bound four transformer forwards, and forwards is the
+    # unit num_steps carries downstream (Cache-DiT, quality hints).
+    assert num_steps == FASTH3_DENOISE_STEPS == len(positions) - 1
     # H3's own per-modality shifts still apply on top, and are what turn those
     # positions into the noise levels the four forwards run at.
     assert minimax_h3_time_shift_sigmas(shift_scale=12.0, base_schedule=positions) == pytest.approx(
@@ -357,7 +370,7 @@ def test_the_request_denoises_on_the_release_ladder(tmp_path):
         [0.999666, 0.899520, 0.75, 0.5, 0.0], abs=1e-6
     )
     # Without a fused adapter the same request keeps the undistilled ladder.
-    assert _pipeline_stub()._resolve_sigma_positions("t2va", _sampling()) == (None, FASTH3_SIGMA_POINTS)
+    assert _pipeline_stub()._resolve_sigma_positions("t2va", _sampling()) == (None, FASTH3_DENOISE_STEPS)
 
 
 def test_the_contract_leaves_the_checkpoint_shifts_alone(tmp_path):
@@ -480,6 +493,6 @@ def test_a_pipeline_that_fused_its_adapter_needs_no_lora_manager(tmp_path):
 
 
 def test_the_ladder_is_the_one_the_release_publishes():
-    # FASTH3_SIGMA_POINTS is derived from it, so the two cannot drift apart.
+    # FASTH3_DENOISE_STEPS is derived from it, so the two cannot drift apart.
     assert FASTH3_BASE_SCHEDULE.base_schedule == (0.999, 0.749, 0.5, 0.25, 0.0)
-    assert FASTH3_BASE_SCHEDULE.num_inference_steps == FASTH3_SIGMA_POINTS - 1 == 4
+    assert FASTH3_BASE_SCHEDULE.num_inference_steps == FASTH3_DENOISE_STEPS == 4

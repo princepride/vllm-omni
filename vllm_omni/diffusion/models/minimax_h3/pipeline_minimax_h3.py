@@ -362,6 +362,12 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     if not isinstance(output, tuple) or len(output) != 2:
         return output
     video, audio = output
+    if video.dtype != torch.uint8 or video.ndim != 5 or video.shape[-1] not in (3, 4):
+        # Float or channel-first frames would reach the muxer as a black or
+        # banded video rather than as an error.
+        raise ValueError(
+            f"MiniMax-H3 post-processing expects (B, T, H, W, C) uint8, got {tuple(video.shape)} {video.dtype}"
+        )
     if output_type == "latent":
         return output
     if output_type == "np":
@@ -1100,10 +1106,11 @@ class MiniMaxH3Pipeline(
         if self._fasth3 is not None:
             # A fused student carries its own positions; the checkpoint
             # underneath it is the many-step teacher, whose schedule does not
-            # apply. ``check_request`` already held the request to these sigma
-            # points, which is the unit num_steps speaks in on this path.
+            # apply. Its five points bound four transformer forwards, and
+            # forwards is the unit ``check_request``, the pinned-schedule branch
+            # below and Cache-DiT all speak in.
             positions = self._fasth3.base_schedule
-            return positions, len(positions)
+            return positions, len(positions) - 1
         sigma_schedule = self._sigma_schedule_for_request(sampling, task)
         if sigma_schedule is None:
             return None, int(sampling.num_inference_steps or 50)
