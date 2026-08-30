@@ -565,11 +565,14 @@ def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
 
 
 def _direct_planar_fallback_reason(
-    frames: list[np.ndarray],
     frame_shape: tuple[int, ...],
     common_dtype: np.dtype,
 ) -> str | None:
-    """Return a stable reason when direct planar muxing cannot consume frames."""
+    """Return a stable reason when direct planar muxing cannot consume frames.
+
+    Only the per-frame layout matters: ``_build_frame`` deinterleaves each
+    channel with a strided NumPy copy, so channel planes need not be contiguous.
+    """
     if len(frame_shape) != 3 or frame_shape[0] <= 0 or frame_shape[1] <= 0 or frame_shape[2] not in (3, 4):
         return "unsupported_shape"
 
@@ -579,9 +582,6 @@ def _direct_planar_fallback_reason(
         or np.issubdtype(common_dtype, np.floating)
     ):
         return "unsupported_dtype"
-
-    if not all(frame[..., channel].flags.c_contiguous for frame in frames for channel in range(3)):
-        return "non_contiguous_rgb_planes"
 
     return None
 
@@ -786,7 +786,7 @@ def _encode_video_bytes(
     # input is reported before any muxer is opened.
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     effective_audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate) if audio is not None else None
-    fallback_reason = _direct_planar_fallback_reason(frames, frame_shape, common_dtype)
+    fallback_reason = _direct_planar_fallback_reason(frame_shape, common_dtype)
     if fallback_reason is not None:
         _log_video_encoding_path(
             selected_path="legacy_fallback",
