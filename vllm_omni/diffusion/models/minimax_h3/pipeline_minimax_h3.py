@@ -356,8 +356,9 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     The callable crosses the multiprocessing result queue, so it must remain a
     module-level function that the standard pickle module can resolve.
 
-    ``decode`` already quantises the video to uint8 frames on the accelerator,
-    so there is nothing left to scale or transpose here.
+    ``_prepare_minimax_h3_video_output`` already quantises the video to uint8
+    frames on the accelerator, so there is nothing left to scale or transpose
+    here.
     """
     if not isinstance(output, tuple) or len(output) != 2:
         return output
@@ -380,6 +381,16 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
         "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
         "fps": MINIMAX_H3_FPS,
     }
+
+
+def _prepare_minimax_h3_video_output(video: torch.Tensor) -> torch.Tensor:
+    """Quantize decoded frames in place before worker-to-engine transfer."""
+    video = video.detach().float()
+    video.clamp_(0, 1).mul_(255).round_()
+    return video.permute(0, 2, 3, 4, 1).to(
+        dtype=torch.uint8,
+        memory_format=torch.contiguous_format,
+    )
 
 
 def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any) -> None:
@@ -2092,13 +2103,7 @@ class MiniMaxH3Pipeline(
                 enabled=True,
             ):
                 video = self.video_vae.decode_latent(video_latent)
-        video = video[..., :height, :width]
-        # Quantise here, on the accelerator, in the layout the muxer reads.
-        # The response crosses two process boundaries on its way out - shared
-        # memory to the engine, then msgpack over ZMQ to the stage - and both
-        # copy it whole, so float32 costs four times the bytes for precision an
-        # 8-bit MP4 discards anyway.
-        video = (video.permute(0, 2, 3, 4, 1).clamp(0, 1) * 255).round().to(torch.uint8).contiguous()
+        video = video[..., :height, :width].contiguous()
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
         return video, audio
@@ -2467,10 +2472,10 @@ class MiniMaxH3Pipeline(
                 height=context["height"],
                 width=context["width"],
             )
-            videos.append(video)
+            videos.append(_prepare_minimax_h3_video_output(video))
             audios.append(audio)
-        video = torch.cat(videos, dim=0)
-        audio = torch.cat(audios, dim=0)
+        video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
+        audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
@@ -2772,6 +2777,7 @@ class MiniMaxH3Pipeline(
             height=shape["height"],
             width=shape["width"],
         )
+        video = _prepare_minimax_h3_video_output(video)
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
