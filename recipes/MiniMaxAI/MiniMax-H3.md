@@ -922,15 +922,9 @@ differ from each other.
 
 [FastH3](https://haoailab.com/blogs/fasth3-preview/) is FastVideo's four-step
 DMD2 student of H3-Base. It reuses H3's text encoder, VAEs, tokenizers, and
-schedulers unchanged, replacing 49 denoiser evaluations with four.
-
-Unlike Turbo it is not a request-switchable LoRA. Its own metadata states the
-reconstruction as `W = W_base + lora_B @ lora_A; then .diff/.diff_b added and
-.set_weight assigned`, so besides rank-64 factors it carries full-rank deltas
-for RMSNorm weights, biases, patch projections and the final layer, which no
-LoRA layer can express. vLLM-Omni therefore fuses it into the checkpoint while
-weights stream in, before any sharding, which is what the release requires and
-what FastVideo's own loader does.
+schedulers unchanged, replacing 49 denoiser evaluations with four. It is fused
+into the checkpoint at load time rather than switched per request, because it
+carries full-rank deltas that no LoRA layer can express.
 
 The bundle publishes four variants, so download one and point `--lora-path` at
 it; the repository root is refused rather than guessed at:
@@ -944,48 +938,29 @@ export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
 
 Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a non-offloaded server
 command. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
-correct even though FastH3 preview v1 distills T2VA only. The dynamic LoRA
-manager is skipped for a fused adapter, so `--lora-backend` does not apply and
-a request that carries a `lora=` field is rejected rather than served without
-the adapter it asked for.
+correct even though FastH3 preview v1 distills T2VA only. Because the adapter is
+fused, `--lora-backend` does not apply and a request carrying a `lora=` field is
+rejected rather than served without the adapter it asked for.
 
 ```bash
 -F 'num_inference_steps=4' \
 -F 'extra_params={"task":"t2va","duration":4.4}'
 ```
 
-Requests must ask for `num_inference_steps=4` and `task=t2va`. As on the native
-LoRA path above, this is the distilled interval-count contract: the release's
-five sigma points bound four denoiser evaluations, and that count is what the
-step scheduler admits a request on. The server denoises on the release's own
-ladder rather than the uniform one that step count would otherwise derive:
-`dmd_denoising_steps` `[999, 749, 500, 250]` are timestep indices out of 1000,
-so the positions are `[0.999, 0.749, 0.5, 0.25, 0.0]`. They are pre-shift, so
-H3's own per-modality shifts still apply and the server keeps them at the
-checkpoint values (video 12, audio 3). A request that overrides `flow_shift` or
-`audio_flow_shift` is rejected: it would sample the student at noise levels it
-was never distilled at.
+Requests must ask for `num_inference_steps=4` and `task=t2va`: the release's five
+sigma points bound four denoiser evaluations, and that count is what the step
+scheduler admits a request on. The server denoises on the release's own ladder,
+keeping H3's per-modality shifts at the checkpoint values, so a request that
+overrides `flow_shift` or `audio_flow_shift` is rejected - it would sample the
+student at noise levels it was never distilled at.
 
-Only a FastH3 release is fused. The artifact's `fastvideo-lora-v2` format is
-FastVideo's generic adapter container - their LoRA extraction and MiniMax-H3
-conversion tools write it for ordinary H3 adapters too - so the claim needs the
-release identity the file records in `finetuned_model` (the Dense/Data-Free
-variant names `FastVideo/FastVideo-FastH3-Dense-4-step-v1`) over
-`base_model=MiniMaxAI/MiniMax-H3`. Any other `fastvideo-lora-v2` adapter stays
-on the dynamic LoRA route rather than being fused onto a four-step schedule it
-was never distilled for.
-
-Once claimed, the adapter is held to the model it is loaded against and to its
-own metadata: a variant that omits any of the tensor counts it is expected to
-declare, declares more tensors than it carries, or leaves any transformer block
-unedited, is refused at startup instead of serving mostly base H3 weights on a
-four-step schedule.
-
-Offload is refused with this adapter. A host-weight plan installs the
-transformer without going through the pipeline's `load_weights()`, which is
-where the fusion happens, so `--enable-cpu-offload`,
-`--enable-layerwise-offload` and `--enable-distributed-layerwise-offload` all
-fail fast rather than serving unfused base H3 weights on a four-step schedule.
+Only a release that identifies itself as FastH3 is fused; any other
+`fastvideo-lora-v2` adapter stays on the dynamic LoRA route. A claimed artifact
+is then held to its own metadata: one that misdeclares its tensor counts or
+leaves a transformer block unedited is refused at startup instead of serving
+mostly base H3 weights on a four-step schedule. Offload is refused for the same
+reason - `--enable-cpu-offload`, `--enable-layerwise-offload` and
+`--enable-distributed-layerwise-offload` all bypass the fusion, so they fail fast.
 
 > [!NOTE]
 > Only the **Dense / Data-Free** variant is supported today. The three VSA
