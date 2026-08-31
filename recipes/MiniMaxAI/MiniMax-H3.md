@@ -1001,7 +1001,7 @@ Measured on 8x NVIDIA B300 with USP8, VAE patch-parallel 8, `TRTLLM_ATTN`, at
 | Adapter | Steps | End-to-end | Diffusion engine |
 | --- | ---: | ---: | ---: |
 | none (base H3) | 50 | 25.8 / 26.4 s | 16.22 / 16.28 s |
-| FastH3 Dense | 5 (4 forwards) | 11.7 / 11.8 s | 2.37 / 2.36 s |
+| FastH3 Dense | 4 (5 sigma points) | 11.7 / 11.8 s | 2.37 / 2.36 s |
 
 The denoising speedup is 6.9x. End-to-end is 2.2x because text encoding, VAE
 decoding and muxing are a fixed cost that dominates a clip this short; longer
