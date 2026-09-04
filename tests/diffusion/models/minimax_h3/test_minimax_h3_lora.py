@@ -99,18 +99,9 @@ def _write_tiny_turbo(
 
 def _spec(filename: str = "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors") -> TurboSpec:
     """Build the spec a loaded artifact of this name would carry."""
-    fields = parse_turbo_filename(filename)
-    assert fields is not None
-    return TurboSpec(
-        filename=filename,
-        task_family=str(fields["task_family"]),
-        version=str(fields["version"]),
-        denoise_steps=int(fields["denoise_steps"]),
-        video_shift=float(fields["video_shift"]),
-        audio_shift=float(fields["audio_shift"]),
-        rank=128,
-        alpha=128.0,
-    )
+    spec = parse_turbo_filename(filename)
+    assert spec is not None
+    return spec
 
 
 def test_h3_turbo_loads_through_legacy_lora_model_and_swaps_ffn(tmp_path):
@@ -259,6 +250,68 @@ def test_h3_turbo_ref2v_artifact_loads_on_a_ref2va_server(tmp_path):
     assert spec.sigma_points == 9
 
 
+@pytest.mark.parametrize(
+    "offload_mode",
+    [
+        "model-level CPU offload (--enable-cpu-offload)",
+        "layerwise offload (--enable-layerwise-offload)",
+    ],
+)
+def test_h3_turbo_rejects_offload_modes(tmp_path, offload_mode):
+    path = tmp_path / "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
+    _write_tiny_turbo(path)
+
+    with pytest.raises(ValueError, match="does not support"):
+        load_minimax_h3_turbo_lora(
+            partition="fl2va",
+            lora_request=_request(path),
+            lora_path=path,
+            dtype=torch.float32,
+            unsupported_offload_mode=offload_mode,
+        )
+
+
+def test_h3_turbo_allows_distributed_layerwise_offload(monkeypatch):
+    """DLO keeps the LoRA buffers resident, so it is not an unsupported mode."""
+
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import (
+        pipeline_minimax_h3 as pipeline_module,
+    )
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    pipeline._turbo_lora_specs = {}
+    pipeline._native_lora_adapter_ids = set()
+    pipeline._lora_sigma_schedules = {}
+    pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=True,
+    )
+    captured = {}
+    spec = _spec()
+
+    def load_turbo(**kwargs):
+        captured.update(kwargs)
+        return object(), object(), spec
+
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", load_turbo)
+    loaded = pipeline._load_diffusion_lora_adapter(
+        lora_request=_request("turbo"),
+        lora_path="turbo",
+        dtype=torch.bfloat16,
+    )
+
+    assert loaded is not None
+    assert captured["unsupported_offload_mode"] is None
+    # The pipeline passes its own partition through and keeps the spec that
+    # decides the request contract.
+    assert captured["partition"] == "fl2va"
+    assert pipeline._turbo_lora_specs == {1: spec}
+
+
 def test_h3_turbo_rejects_the_comfyui_export_by_name(tmp_path):
     """The ComfyUI exports fuse Q/K/V; refuse them with the reason instead of
     letting the fused tensors reach the Diffusers-layout reader."""
@@ -364,7 +417,6 @@ def test_only_an_active_recognized_turbo_adapter_restricts_ref2va(monkeypatch):
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
-    pipeline._turbo_lora_adapter_ids = set()
     pipeline._turbo_lora_specs = {}
     pipeline._native_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
@@ -382,7 +434,7 @@ def test_only_an_active_recognized_turbo_adapter_restricts_ref2va(monkeypatch):
         return pipeline._resolve_task(
             "ref2va",
             {},
-            turbo_spec=(pipeline._turbo_spec(sampling) if pipeline._has_active_turbo_lora(sampling) else None),
+            turbo_spec=pipeline._active_turbo_spec(sampling),
         )
 
     recognized = (object(), object(), _spec())
@@ -404,8 +456,7 @@ def test_h3_turbo_requires_all_loaded_targets_to_bind():
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline._turbo_lora_adapter_ids = {1}
-    pipeline._turbo_lora_specs = {}
+    pipeline._turbo_lora_specs = {1: _spec()}
     lora_model = SimpleNamespace(id=1, loras={"to_q": object(), "to_k": object()})
 
     pipeline._validate_diffusion_lora_binding(

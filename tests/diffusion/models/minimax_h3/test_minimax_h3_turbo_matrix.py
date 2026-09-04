@@ -33,12 +33,16 @@ PUBLISHED = [
 
 @pytest.mark.parametrize(("filename", "task", "steps", "video_shift"), PUBLISHED)
 def test_every_published_artifact_is_recognised(filename: str, task: str, steps: int, video_shift: float) -> None:
-    fields = parse_turbo_filename(filename)
-    assert fields is not None, filename
-    assert fields["task_family"] == task
-    assert fields["denoise_steps"] == steps
-    assert fields["video_shift"] == video_shift
-    assert fields["audio_shift"] == _TURBO_AUDIO_SHIFT
+    spec = parse_turbo_filename(filename)
+    assert spec is not None, filename
+    assert spec.filename == filename
+    assert spec.task_family == task
+    assert spec.denoise_steps == steps
+    assert spec.video_shift == video_shift
+    assert spec.audio_shift == _TURBO_AUDIO_SHIFT
+    # Alpha is the rank-matched default until the loader reads the metadata.
+    assert spec.rank == 128
+    assert spec.alpha == 128.0
 
 
 def test_all_seven_artifacts_are_covered() -> None:
@@ -63,19 +67,10 @@ def test_unrelated_names_are_rejected(filename: str) -> None:
     assert parse_turbo_filename(filename) is None
 
 
-def _spec(filename: str, alpha: float = 128.0) -> TurboSpec:
-    fields = parse_turbo_filename(filename)
-    assert fields is not None
-    return TurboSpec(
-        filename=filename,
-        task_family=str(fields["task_family"]),
-        version=str(fields["version"]),
-        denoise_steps=int(fields["denoise_steps"]),
-        video_shift=float(fields["video_shift"]),
-        audio_shift=float(fields["audio_shift"]),
-        rank=128,
-        alpha=alpha,
-    )
+def _spec(filename: str) -> TurboSpec:
+    spec = parse_turbo_filename(filename)
+    assert spec is not None
+    return spec
 
 
 def test_sigma_points_follow_the_step_count() -> None:

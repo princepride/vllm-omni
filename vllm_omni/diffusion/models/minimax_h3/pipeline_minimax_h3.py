@@ -695,7 +695,6 @@ class MiniMaxH3Pipeline(
     ) -> tuple[LoRAModel, PEFTHelper] | None:
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
-        self._turbo_lora_adapter_ids.discard(lora_request.lora_int_id)
         self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
         self._native_lora_adapter_ids.discard(lora_request.lora_int_id)
         self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
@@ -714,7 +713,6 @@ class MiniMaxH3Pipeline(
         )
         if loaded is not None:
             lora_model, peft_helper, turbo_spec = loaded
-            self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
             self._turbo_lora_specs[lora_request.lora_int_id] = turbo_spec
             return lora_model, peft_helper
 
@@ -742,7 +740,7 @@ class MiniMaxH3Pipeline(
         lora_model: LoRAModel,
         bound_lora_names: frozenset[str],
     ) -> None:
-        if lora_model.id in self._turbo_lora_adapter_ids:
+        if lora_model.id in self._turbo_lora_specs:
             missing = sorted(set(lora_model.loras) - bound_lora_names)
             if missing:
                 raise ValueError(
@@ -758,14 +756,6 @@ class MiniMaxH3Pipeline(
                 "MiniMax-H3 native LoRA binding is incomplete: "
                 f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
             )
-
-    def _has_active_turbo_lora(self, sampling: Any) -> bool:
-        lora_request = sampling.lora_request
-        return (
-            lora_request is not None
-            and not math.isclose(0.0, float(sampling.lora_scale))
-            and lora_request.lora_int_id in self._turbo_lora_adapter_ids
-        )
 
     def _has_active_native_lora(self, sampling: Any) -> bool:
         lora_request = sampling.lora_request
@@ -826,9 +816,15 @@ class MiniMaxH3Pipeline(
             return adapter_schedule
         return self._base_schedule_for_task(task)
 
-    def _turbo_spec(self, sampling: Any) -> TurboSpec | None:
+    def _active_turbo_spec(self, sampling: Any) -> TurboSpec | None:
+        """Return the spec of the Turbo adapter this request actually applies.
+
+        A recognized adapter at scale 0 contributes nothing, so it neither
+        constrains the task nor imposes its sampler contract.
+        """
+
         lora_request = sampling.lora_request
-        if lora_request is None:
+        if lora_request is None or math.isclose(0.0, float(sampling.lora_scale)):
             return None
         return self._turbo_lora_specs.get(lora_request.lora_int_id)
 
@@ -892,7 +888,6 @@ class MiniMaxH3Pipeline(
             getattr(od_config, "task_type", None),
             str(od_config.model),
         )
-        self._turbo_lora_adapter_ids: set[int] = set()
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
@@ -2200,7 +2195,7 @@ class MiniMaxH3Pipeline(
         quality = sampling.quality
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
-        turbo_spec = self._turbo_spec(sampling) if self._has_active_turbo_lora(sampling) else None
+        turbo_spec = self._active_turbo_spec(sampling)
         has_native_lora = self._has_active_native_lora(sampling)
         task = self._resolve_task(
             extra.get("task"),

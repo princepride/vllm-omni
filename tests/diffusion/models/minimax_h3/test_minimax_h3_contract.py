@@ -28,18 +28,9 @@ def _append_and_return(items: list[_ItemT], item: _ItemT, result: _ResultT) -> _
 
 def _turbo_spec(filename: str) -> TurboSpec:
     """Build the spec a loaded artifact of this name would carry."""
-    fields = parse_turbo_filename(filename)
-    assert fields is not None
-    return TurboSpec(
-        filename=filename,
-        task_family=str(fields["task_family"]),
-        version=str(fields["version"]),
-        denoise_steps=int(fields["denoise_steps"]),
-        video_shift=float(fields["video_shift"]),
-        audio_shift=float(fields["audio_shift"]),
-        rank=128,
-        alpha=128.0,
-    )
+    spec = parse_turbo_filename(filename)
+    assert spec is not None
+    return spec
 
 
 def test_h3_prepares_resolved_cache_state_immediately_before_denoise():

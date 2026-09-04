@@ -21,7 +21,7 @@ rank, target naming and QKV layout, so it owns its own parsing and packing.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import regex as re
@@ -68,7 +68,7 @@ _TURBO_DEFAULT_ALPHA = float(_TURBO_RANK)
 
 @dataclass(frozen=True)
 class TurboSpec:
-    """The sampler contract and tensor layout of one Turbo artifact."""
+    """The sampler contract one Turbo artifact was distilled for."""
 
     filename: str
     task_family: str
@@ -79,6 +79,9 @@ class TurboSpec:
     audio_shift: float
     rank: int
     alpha: float
+    """Per-projection LoRA alpha. ``parse_turbo_filename`` fills in the
+    rank-matched default; the loader replaces it with the value the artifact
+    declares in safetensors metadata."""
 
     @property
     def sigma_points(self) -> int:
@@ -92,8 +95,12 @@ class TurboSpec:
         return frozenset({"t2va", "fl2va"})
 
 
-def parse_turbo_filename(name: str) -> dict[str, object] | None:
-    """Return the contract encoded in a Turbo filename, or ``None``."""
+def parse_turbo_filename(name: str) -> TurboSpec | None:
+    """Return the contract a Turbo filename encodes, or ``None`` if it is not one.
+
+    The returned spec carries the rank-matched default alpha; only the loader,
+    which reads the artifact's metadata, can fill in the declared one.
+    """
 
     match = _TURBO_NAME_RE.match(name)
     if match is None:
@@ -101,13 +108,16 @@ def parse_turbo_filename(name: str) -> dict[str, object] | None:
     steps = int(match.group("steps"))
     if steps <= 0:
         return None
-    return {
-        "task_family": match.group("task"),
-        "version": match.group("version"),
-        "denoise_steps": steps,
-        "video_shift": (_TURBO_VIDEO_SHIFT_768P if match.group("res") else _TURBO_VIDEO_SHIFT_544P),
-        "audio_shift": _TURBO_AUDIO_SHIFT,
-    }
+    return TurboSpec(
+        filename=name,
+        task_family=match.group("task"),
+        version=match.group("version"),
+        denoise_steps=steps,
+        video_shift=_TURBO_VIDEO_SHIFT_768P if match.group("res") else _TURBO_VIDEO_SHIFT_544P,
+        audio_shift=_TURBO_AUDIO_SHIFT,
+        rank=_TURBO_RANK,
+        alpha=_TURBO_DEFAULT_ALPHA,
+    )
 
 
 _LORA_A_SUFFIX = ".lora_A.default.weight"
@@ -264,10 +274,10 @@ def load_minimax_h3_turbo_lora(
     lora_file = _select_turbo_file(lora_path)
     if lora_file is None:
         return None
-    fields = parse_turbo_filename(lora_file.name)
+    spec = parse_turbo_filename(lora_file.name)
     with safe_open(lora_file, framework="pt", device="cpu") as checkpoint:
         metadata = checkpoint.metadata() or {}
-        if fields is None:
+        if spec is None:
             if lora_file.name.startswith("minimax_h3_") and _COMFYUI_MARKER in lora_file.name:
                 raise ValueError(
                     f"{lora_file.name} is a ComfyUI-layout MiniMax-H3 Turbo export, which is not "
@@ -294,31 +304,20 @@ def load_minimax_h3_turbo_lora(
             )
         raw_alpha = metadata.get("alpha")
         if raw_alpha is None:
-            alpha = _TURBO_DEFAULT_ALPHA
             logger.warning(
                 "MiniMax-H3 Turbo artifact %s declares no alpha; assuming alpha=%g (scale 1.0). "
                 "Override with the request-level LoRA scale if output looks over- or under-driven.",
-                lora_file.name,
-                alpha,
+                spec.filename,
+                spec.alpha,
             )
         else:
             try:
-                alpha = float(raw_alpha)
+                spec = replace(spec, alpha=float(raw_alpha))
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"MiniMax-H3 Turbo alpha must be numeric, got {raw_alpha!r}") from exc
-        if not math.isfinite(alpha) or alpha <= 0:
+        if not math.isfinite(spec.alpha) or spec.alpha <= 0:
             raise ValueError(f"MiniMax-H3 Turbo alpha must be a positive number, got {raw_alpha!r}")
 
-        spec = TurboSpec(
-            filename=lora_file.name,
-            task_family=str(fields["task_family"]),
-            version=str(fields["version"]),
-            denoise_steps=int(fields["denoise_steps"]),
-            video_shift=float(fields["video_shift"]),
-            audio_shift=float(fields["audio_shift"]),
-            rank=_TURBO_RANK,
-            alpha=alpha,
-        )
         if partition == "ref2va" and spec.task_family == "fl2v":
             raise ValueError(f"{spec.filename} is an FL2VA/T2VA Turbo artifact; a Ref2VA-only server cannot serve it.")
         # A ``combined`` server builds the Ref2VA DiT as ``transformers_ref``
