@@ -310,6 +310,7 @@ def test_pipeline_native_schedule_and_task_validation(monkeypatch):
     pipeline.partition = "fl2va"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     pipeline._turbo_lora_adapter_ids = set()
+    pipeline._turbo_lora_specs = {}
     pipeline._native_lora_adapter_ids = {7}
     pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
     pipeline._base_schedule_by_partition = {"fl2va": None}
@@ -330,7 +331,7 @@ def test_pipeline_native_schedule_and_task_validation(monkeypatch):
         pipeline._resolve_task(
             "fl2va",
             {},
-            has_turbo_lora=False,
+            turbo_spec=None,
             has_native_lora=True,
         )
 
@@ -419,6 +420,7 @@ def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_p
         enable_distributed_layerwise_offload=False,
     )
     pipeline._turbo_lora_adapter_ids = set()
+    pipeline._turbo_lora_specs = {}
     pipeline._native_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
 
@@ -473,6 +475,7 @@ def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
         enable_distributed_layerwise_offload=True,
     )
     pipeline._turbo_lora_adapter_ids = set()
+    pipeline._turbo_lora_specs = {}
     pipeline._native_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     captured: dict[str, object] = {}
@@ -613,6 +616,7 @@ def test_legacy_manager_uses_native_loader(tmp_path):
                 enable_distributed_layerwise_offload=False,
             )
             pipeline._turbo_lora_adapter_ids = set()
+            pipeline._turbo_lora_specs = {}
             pipeline._native_lora_adapter_ids = set()
             pipeline._lora_sigma_schedules = {}
             return pipeline._load_diffusion_lora_adapter(**kwargs)
@@ -635,6 +639,7 @@ def test_pipeline_schedule_inactive_when_scale_zero():
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline._turbo_lora_adapter_ids = set()
+    pipeline._turbo_lora_specs = {}
     pipeline._native_lora_adapter_ids = {7}
     pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
     pipeline._base_schedule_by_partition = {"fl2va": None}
@@ -665,6 +670,7 @@ def test_pipeline_schedule_falls_back_after_eviction(monkeypatch, tmp_path):
         enable_distributed_layerwise_offload=False,
     )
     pipeline._turbo_lora_adapter_ids = set()
+    pipeline._turbo_lora_specs = {}
     pipeline._native_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     pipeline._base_schedule_by_partition = {"fl2va": None}

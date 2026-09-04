@@ -844,13 +844,32 @@ balanced switch order.
 
 ### Turbo LoRA
 
-Only the native Diffusers 4-step FL2VA/T2VA v1.0 artifact is supported:
+The seven Diffusers-layout LightX2V Turbo artifacts are supported. The
+filename records the contract, so the server reads the step count, task family
+and flow shift from it rather than assuming one configuration:
 
-```text
-lightx2v/Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
-```
+| Artifact | Task | Forwards | `num_inference_steps` | `flow_shift` |
+| --- | --- | ---: | ---: | ---: |
+| `minimax_h3_fl2v_turbo_4step_v0.1` | T2VA / FL2VA | 4 | 5 | 12 |
+| `minimax_h3_fl2v_turbo_4step_v1.0_768p` | T2VA / FL2VA | 4 | 5 | 6 |
+| `minimax_h3_fl2v_turbo_4step_v1.1_768p` | T2VA / FL2VA | 4 | 5 | 6 |
+| `minimax_h3_fl2v_turbo_8step_v1.0` | T2VA / FL2VA | 8 | 9 | 12 |
+| `minimax_h3_fl2v_turbo_8step_v1.0_768p` | T2VA / FL2VA | 8 | 9 | 6 |
+| `minimax_h3_ref2v_turbo_4step_v0.1` | Ref2VA | 4 | 5 | 12 |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p` | Ref2VA | 8 | 9 | 6 |
 
-Download only that file:
+Most rows also ship a `_comfyui_` export of the same weights. Those fuse Q/K/V
+into one projection and are **not** supported; downloading one is refused by
+name. Take the Diffusers file. The filename is the contract, so do not rename an
+artifact either -- a renamed file is rejected rather than served on a guess.
+
+`audio_flow_shift` is `3.0` across the family. FL2VA artifacts serve `t2va` and
+`fl2va` on any FL2VA or combined server. Ref2VA artifacts require
+`--task-type ref2va`: a combined server serves `ref2va` from a second DiT that
+the adapter cannot bind to, so loading one there is refused rather than silently
+running an undistilled model on the few-step schedule.
+
+Download the artifact you want:
 
 ```bash
 export TURBO_DIR=/path/to/minimax-h3-turbo
@@ -859,10 +878,13 @@ hf download lightx2v/Minimax-h3-Turbo "${TURBO_FILE}" --local-dir "${TURBO_DIR}"
 export TURBO_LORA="${TURBO_DIR}/${TURBO_FILE}"
 ```
 
+`--lora-path` accepts either the file or a directory holding exactly one Turbo
+artifact.
+
 Start from a non-offloaded or DLO FL2VA server command and add
 `--task-type fl2va --lora-backend peft --lora-path "${TURBO_LORA}"`.
 `--lora-path` preloads the adapter; each request still activates it and uses
-the published sampling settings:
+that artifact's sampling settings:
 
 ```bash
 -F 'num_inference_steps=5' \
@@ -871,14 +893,23 @@ the published sampling settings:
 -F "lora={\"name\":\"h3-turbo-v1.0\",\"path\":\"${TURBO_LORA}\",\"scale\":1.0}"
 ```
 
-For FL2VA, change `task` and add `input_reference` as shown above. The 8-step,
-ComfyUI, Ref2VA, and v1.1 artifacts are not supported. This integration is
-dynamic-only and does not support prefusion or LoRA composition. DLO is
+Serving the 8-step artifact only changes two request fields:
+`num_inference_steps=9` and, for the 544p artifact, `flow_shift=12`. A request
+that does not match the loaded artifact is rejected by name, so a mismatch
+cannot silently degrade output.
+
+`minimax_h3_fl2v_turbo_4step_v0.1` is the one artifact that declares no LoRA
+alpha. It loads at alpha equal to its rank (scale 1.0), matching both later
+four-step FL2VA artifacts, and logs a warning; use the request-level `scale` to
+adjust it.
+
+For FL2VA, change `task` and add `input_reference` as shown above. This
+integration is dynamic-only and does not support prefusion or LoRA composition. DLO is
 supported by keeping the request-switchable LoRA A/B buffers resident on the
 accelerator while DLO streams only the base blocks; budget for this additional
 fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
-The five requested sigma points produce the four denoiser evaluations expected
-by the Turbo artifact.
+The requested sigma points always number one more than the artifact's denoiser
+evaluations.
 
 ### FlashGen native LoRA
 
