@@ -17,13 +17,14 @@ from vllm_omni.diffusion.models.minimax_h3.lora import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-# The seven Diffusers-layout artifacts published at lightx2v/Minimax-h3-Turbo,
+# The eight Diffusers-layout artifacts published at lightx2v/Minimax-h3-Turbo,
 # with the contract each one implies. The ComfyUI export of an artifact is a
 # fused-QKV re-packing of the same weights and is not served.
 PUBLISHED = [
     ("minimax_h3_fl2v_turbo_4step_v0.1.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_544P),
     ("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
+    ("minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors", "fl2v", 4, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors", "fl2v", 8, _TURBO_VIDEO_SHIFT_544P),
     ("minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors", "fl2v", 8, _TURBO_VIDEO_SHIFT_768P),
     ("minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors", "ref2v", 4, _TURBO_VIDEO_SHIFT_544P),
@@ -45,9 +46,9 @@ def test_every_published_artifact_is_recognised(filename: str, task: str, steps:
     assert spec.alpha == 128.0
 
 
-def test_all_seven_artifacts_are_covered() -> None:
-    assert len(PUBLISHED) == 7
-    assert len({name for name, *_ in PUBLISHED}) == 7
+def test_all_eight_artifacts_are_covered() -> None:
+    assert len(PUBLISHED) == 8
+    assert len({name for name, *_ in PUBLISHED}) == 8
 
 
 @pytest.mark.parametrize(

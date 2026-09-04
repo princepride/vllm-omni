@@ -844,21 +844,27 @@ balanced switch order.
 
 ### Turbo LoRA
 
-The seven Diffusers-layout LightX2V Turbo artifacts are supported. The
+The eight Diffusers-layout LightX2V Turbo artifacts are supported. The
 filename records the contract, so the server reads the step count, task family
 and flow shift from it rather than assuming one configuration:
 
-| Artifact | Task | Forwards | `num_inference_steps` | `flow_shift` |
-| --- | --- | ---: | ---: | ---: |
-| `minimax_h3_fl2v_turbo_4step_v0.1` | T2VA / FL2VA | 4 | 5 | 12 |
-| `minimax_h3_fl2v_turbo_4step_v1.0_768p` | T2VA / FL2VA | 4 | 5 | 6 |
-| `minimax_h3_fl2v_turbo_4step_v1.1_768p` | T2VA / FL2VA | 4 | 5 | 6 |
-| `minimax_h3_fl2v_turbo_8step_v1.0` | T2VA / FL2VA | 8 | 9 | 12 |
-| `minimax_h3_fl2v_turbo_8step_v1.0_768p` | T2VA / FL2VA | 8 | 9 | 6 |
-| `minimax_h3_ref2v_turbo_4step_v0.1` | Ref2VA | 4 | 5 | 12 |
-| `minimax_h3_ref2v_turbo_8step_v1.0_768p` | Ref2VA | 8 | 9 | 6 |
+| Artifact | Task | Forwards | `num_inference_steps` | `flow_shift` | declared `alpha` |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `minimax_h3_fl2v_turbo_4step_v0.1` | T2VA / FL2VA | 4 | 5 | 12 | none |
+| `minimax_h3_fl2v_turbo_4step_v1.0_768p` | T2VA / FL2VA | 4 | 5 | 6 | 128 |
+| `minimax_h3_fl2v_turbo_4step_v1.1_768p` | T2VA / FL2VA | 4 | 5 | 6 | 128 |
+| `minimax_h3_fl2v_turbo_4step_v1.2_768p` | T2VA / FL2VA | 4 | 5 | 6 | 8 |
+| `minimax_h3_fl2v_turbo_8step_v1.0` | T2VA / FL2VA | 8 | 9 | 12 | 8 |
+| `minimax_h3_fl2v_turbo_8step_v1.0_768p` | T2VA / FL2VA | 8 | 9 | 6 | 8 |
+| `minimax_h3_ref2v_turbo_4step_v0.1` | Ref2VA | 4 | 5 | 12 | see the file |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p` | Ref2VA | 8 | 9 | 6 | see the file |
 
-Most rows also ship a `_comfyui_` export of the same weights. Those fuse Q/K/V
+Every artifact is rank 128, so the `alpha=8` rows apply their delta at 1/16 the
+strength of the `alpha=128` rows. The server reads that from the file; a request
+`scale` multiplies it.
+
+Every row except `4step_v0.1` also ships a `_comfyui_` export of the same
+weights. Those fuse Q/K/V
 into one projection and are **not** supported; downloading one is refused by
 name. Take the Diffusers file. The filename is the contract, so do not rename an
 artifact either -- a renamed file is rejected rather than served on a guess.
@@ -898,10 +904,9 @@ Serving the 8-step artifact only changes two request fields:
 that does not match the loaded artifact is rejected by name, so a mismatch
 cannot silently degrade output.
 
-`minimax_h3_fl2v_turbo_4step_v0.1` is the one artifact that declares no LoRA
-alpha. It loads at alpha equal to its rank (scale 1.0), matching both later
-four-step FL2VA artifacts, and logs a warning; use the request-level `scale` to
-adjust it.
+`minimax_h3_fl2v_turbo_4step_v0.1` declares no LoRA alpha at all. It loads at
+alpha equal to its rank (scale 1.0), matching the v1.0 and v1.1 four-step
+artifacts, and logs a warning; use the request-level `scale` to adjust it.
 
 For FL2VA, change `task` and add `input_reference` as shown above. This
 integration is dynamic-only and does not support prefusion or LoRA composition. DLO is

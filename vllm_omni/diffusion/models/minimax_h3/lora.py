@@ -59,10 +59,11 @@ _COMFYUI_MARKER = "_comfyui"
 _TURBO_VIDEO_SHIFT_768P = 6.0
 _TURBO_VIDEO_SHIFT_544P = 12.0
 _TURBO_AUDIO_SHIFT = 3.0
-# ``minimax_h3_fl2v_turbo_4step_v0.1.safetensors`` is the one artifact that
-# declares no alpha.  Both later four-step FL2VA artifacts declare alpha ==
-# rank, so scale 1.0 is the documented assumption; request-level ``scale``
-# remains available to override it.
+# ``minimax_h3_fl2v_turbo_4step_v0.1.safetensors`` is the one published
+# artifact that declares no alpha.  The published alphas are not uniform --
+# v1.0 and v1.1 declare alpha == rank while v1.2 and both eight-step artifacts
+# declare 8 -- so this default only claims the v1.0/v1.1 value that v0.1's own
+# lineage shares; request-level ``scale`` remains available to override it.
 _TURBO_DEFAULT_ALPHA = float(_TURBO_RANK)
 
 
