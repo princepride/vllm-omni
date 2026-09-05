@@ -48,7 +48,7 @@ def _request(path) -> LoRARequest:
 def _write_tiny_turbo(
     path,
     *,
-    alpha: str = "128",
+    alpha: str | None = "128",
     key_format: str = "minimax-h3-diffusers",
     omit_target: str | None = None,
     shape_overrides: dict[str, tuple[int, int]] | None = None,
@@ -90,11 +90,10 @@ def _write_tiny_turbo(
                         )
                 else:
                     tensors[b_name] = torch.ones(overrides.get(b_name, (output_dim, rank)))
-    save_file(
-        tensors,
-        str(path),
-        metadata={"alpha": alpha, "key_format": key_format},
-    )
+    metadata = {"key_format": key_format}
+    if alpha is not None:
+        metadata["alpha"] = alpha
+    save_file(tensors, str(path), metadata=metadata)
 
 
 def _spec(filename: str = "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors") -> TurboSpec:
@@ -310,6 +309,28 @@ def test_h3_turbo_allows_distributed_layerwise_offload(monkeypatch):
     # decides the request contract.
     assert captured["partition"] == "fl2va"
     assert pipeline._turbo_lora_specs == {1: spec}
+
+
+def test_h3_turbo_uses_the_reference_alpha_when_the_artifact_declares_none(tmp_path):
+    """``4step_v0.1`` ships no alpha. LightX2V's reference script applies
+    ``scale * alpha / rank`` with alpha defaulting to 8, so the fallback must be
+    8; alpha == rank would drive the adapter 16x too strongly."""
+
+    path = tmp_path / "minimax_h3_fl2v_turbo_4step_v0.1.safetensors"
+    _write_tiny_turbo(path, alpha=None)
+
+    loaded = load_minimax_h3_turbo_lora(
+        partition="fl2va",
+        lora_request=_request(path),
+        lora_path=path,
+        dtype=torch.float32,
+    )
+
+    assert loaded is not None
+    _, peft_helper, spec = loaded
+    assert spec.alpha == 8
+    assert peft_helper.lora_alpha == 8
+    assert spec.alpha / spec.rank == 0.0625
 
 
 def test_h3_turbo_declines_the_comfyui_export(tmp_path):

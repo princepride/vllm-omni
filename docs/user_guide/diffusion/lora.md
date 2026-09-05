@@ -253,7 +253,8 @@ MiniMax-H3 supports two few-step mechanisms that must not be conflated:
   read from its filename. A four-step artifact requests five sigma points and an
   eight-step one requests nine; the 768p retrains enforce `flow_shift=6` and the
   544p artifacts `flow_shift=12`. `audio_flow_shift=3` across the family. A
-  request that does not match the loaded artifact is rejected by name. `ref2v`
+  request that does not match the loaded artifact is rejected by name. Alpha
+  comes from the artifact's metadata, or 8 when it declares none. `ref2v`
   artifacts require `--task-type ref2va`; `fl2v` artifacts serve T2VA and FL2VA.
   The ComfyUI exports use a fused-QKV layout and are not supported.
 - **Runtime native LoRA**: FlashGen-style artifacts declare

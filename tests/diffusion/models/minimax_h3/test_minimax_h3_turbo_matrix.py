@@ -41,9 +41,9 @@ def test_every_published_artifact_is_recognised(filename: str, task: str, steps:
     assert spec.denoise_steps == steps
     assert spec.video_shift == video_shift
     assert spec.audio_shift == _TURBO_AUDIO_SHIFT
-    # Alpha is the rank-matched default until the loader reads the metadata.
+    # Until the loader reads metadata, alpha is LightX2V's reference default.
     assert spec.rank == 128
-    assert spec.alpha == 128.0
+    assert spec.alpha == 8.0
 
 
 def test_all_eight_artifacts_are_covered() -> None:

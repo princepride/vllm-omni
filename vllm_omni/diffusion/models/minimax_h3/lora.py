@@ -44,9 +44,11 @@ _TURBO_NAME_RE = re.compile(
 _TURBO_VIDEO_SHIFT_768P = 6.0
 _TURBO_VIDEO_SHIFT_544P = 12.0
 _TURBO_AUDIO_SHIFT = 3.0
-# Only ``4step_v0.1`` declares no alpha; the others declare 128 (v1.0/v1.1) or
-# 8. This fallback claims the v1.0/v1.1 value that v0.1's lineage shares.
-_TURBO_DEFAULT_ALPHA = float(_TURBO_RANK)
+# Only ``4step_v0.1`` declares no alpha. LightX2V's reference script never reads
+# the metadata: it applies ``scale * alpha / rank`` with ``--lora-alpha``
+# defaulting to 8, and its documented v0.1 command does not override that. So an
+# artifact that declares nothing is driven at 8, not at its rank.
+_TURBO_DEFAULT_ALPHA = 8.0
 
 
 @dataclass(frozen=True)
@@ -265,10 +267,11 @@ def load_minimax_h3_turbo_lora(
         raw_alpha = metadata.get("alpha")
         if raw_alpha is None:
             logger.warning(
-                "MiniMax-H3 Turbo artifact %s declares no alpha; assuming alpha=%g (scale 1.0). "
-                "Override with the request-level LoRA scale if output looks over- or under-driven.",
+                "MiniMax-H3 Turbo artifact %s declares no alpha; using the LightX2V reference "
+                "default alpha=%g (scale %g). Override with the request-level LoRA scale.",
                 spec.filename,
                 spec.alpha,
+                spec.alpha / spec.rank,
             )
         else:
             try:

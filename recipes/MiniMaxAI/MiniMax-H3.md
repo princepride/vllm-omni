@@ -850,7 +850,7 @@ and flow shift from it rather than assuming one configuration:
 
 | Artifact | Task | Forwards | `num_inference_steps` | `flow_shift` | declared `alpha` |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `minimax_h3_fl2v_turbo_4step_v0.1` | T2VA / FL2VA | 4 | 5 | 12 | none |
+| `minimax_h3_fl2v_turbo_4step_v0.1` | T2VA / FL2VA | 4 | 5 | 12 | none -> 8 |
 | `minimax_h3_fl2v_turbo_4step_v1.0_768p` | T2VA / FL2VA | 4 | 5 | 6 | 128 |
 | `minimax_h3_fl2v_turbo_4step_v1.1_768p` | T2VA / FL2VA | 4 | 5 | 6 | 128 |
 | `minimax_h3_fl2v_turbo_4step_v1.2_768p` | T2VA / FL2VA | 4 | 5 | 6 | 8 |
@@ -905,8 +905,9 @@ that does not match the loaded artifact is rejected by name, so a mismatch
 cannot silently degrade output.
 
 `minimax_h3_fl2v_turbo_4step_v0.1` declares no LoRA alpha at all. It loads at
-alpha equal to its rank (scale 1.0), matching the v1.0 and v1.1 four-step
-artifacts, and logs a warning; use the request-level `scale` to adjust it.
+alpha 8 -- the default of LightX2V's reference script, which never reads the
+metadata and applies `scale * alpha / rank` -- giving an effective multiplier of
+`8/128`, and logs a warning; use the request-level `scale` to adjust it.
 
 For FL2VA, change `task` and add `input_reference` as shown above. This
 integration is dynamic-only and does not support prefusion or LoRA composition. DLO is
