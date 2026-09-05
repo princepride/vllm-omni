@@ -3,19 +3,11 @@
 
 """Loader for the LightX2V Turbo MiniMax-H3 LoRA family.
 
-LightX2V publishes a matrix of Turbo artifacts rather than a single file:
-``fl2v``/``ref2v`` task families, four- and eight-step distillations, and 544p
-and 768p training resolutions.  They share rank 128 and target set but differ
-in LoRA alpha and in the sampler contract they were distilled for (sigma points
-and flow shift), so :class:`TurboSpec` carries what a given file needs and the
-pipeline validates a request against the artifact actually loaded.
-
-Only the Diffusers-PEFT exports are served.  LightX2V also ships a ComfyUI
-export of most artifacts; those fuse Q/K/V into one projection, so this loader
-refuses them by name instead of guessing at the layout.
-
-The native FlashGen contract lives in ``.npu.lora``; that artifact differs in
-rank, target naming and QKV layout, so it owns its own parsing and packing.
+The published artifacts differ in task family, step count, training resolution
+and LoRA alpha, so :class:`TurboSpec` carries the contract of the file actually
+loaded and the pipeline validates each request against it. Only the
+Diffusers-PEFT exports are served. The native FlashGen contract lives in
+``.npu.lora``.
 """
 
 from __future__ import annotations
@@ -41,29 +33,19 @@ _TURBO_RANK = 128
 _TURBO_HIDDEN_SIZE = 5376
 _TURBO_ATTENTION_INNER_SIZE = 7168
 _TURBO_FFN_HIDDEN_SIZE = 14336
-# Every published Diffusers-layout Turbo artifact is named
-# ``minimax_h3_<task>_turbo_<n>step_v<major.minor>[_768p][_bf16]``.
-# The name is the only place the sampler contract is recorded, so it -- not a
-# single hard-coded filename -- decides which requests the adapter accepts.
+# ``minimax_h3_<task>_turbo_<n>step_v<major.minor>[_768p][_bf16]``. The name is
+# the only place the sampler contract is recorded.
 _TURBO_NAME_RE = re.compile(
     r"^minimax_h3_(?P<task>fl2v|ref2v)_turbo_(?P<steps>\d+)step"
-    r"_v(?P<version>\d+\.\d+)(?P<res>_768p)?(?:_bf16)?\.safetensors$"
+    r"_v\d+\.\d+(?P<res>_768p)?(?:_bf16)?\.safetensors$"
 )
-# The ComfyUI exports share that stem but carry a fused-QKV layout. They are
-# named so a mistaken download is refused with the reason rather than falling
-# through to a loader that cannot read them either.
-_COMFYUI_MARKER = "_comfyui"
-# The 768p retrains moved to a shorter video flow shift; the original
-# mixed-aspect 544p artifacts keep the base model's shift.  Audio shift is 3.0
-# across the family.
+# The 768p retrains moved to a shorter video flow shift; the 544p artifacts keep
+# the base model's.
 _TURBO_VIDEO_SHIFT_768P = 6.0
 _TURBO_VIDEO_SHIFT_544P = 12.0
 _TURBO_AUDIO_SHIFT = 3.0
-# ``minimax_h3_fl2v_turbo_4step_v0.1.safetensors`` is the one published
-# artifact that declares no alpha.  The published alphas are not uniform --
-# v1.0 and v1.1 declare alpha == rank while v1.2 and both eight-step artifacts
-# declare 8 -- so this default only claims the v1.0/v1.1 value that v0.1's own
-# lineage shares; request-level ``scale`` remains available to override it.
+# Only ``4step_v0.1`` declares no alpha; the others declare 128 (v1.0/v1.1) or
+# 8. This fallback claims the v1.0/v1.1 value that v0.1's lineage shares.
 _TURBO_DEFAULT_ALPHA = float(_TURBO_RANK)
 
 
@@ -74,15 +56,11 @@ class TurboSpec:
     filename: str
     task_family: str
     """``fl2v`` (serves t2va and fl2va) or ``ref2v`` (serves ref2va)."""
-    version: str
     denoise_steps: int
     video_shift: float
     audio_shift: float
     rank: int
     alpha: float
-    """Per-projection LoRA alpha. ``parse_turbo_filename`` fills in the
-    rank-matched default; the loader replaces it with the value the artifact
-    declares in safetensors metadata."""
 
     @property
     def sigma_points(self) -> int:
@@ -97,10 +75,10 @@ class TurboSpec:
 
 
 def parse_turbo_filename(name: str) -> TurboSpec | None:
-    """Return the contract a Turbo filename encodes, or ``None`` if it is not one.
+    """Return the contract a Turbo filename encodes, or ``None``.
 
-    The returned spec carries the rank-matched default alpha; only the loader,
-    which reads the artifact's metadata, can fill in the declared one.
+    ``alpha`` is the rank-matched default; the loader replaces it with the
+    artifact's declared value.
     """
 
     match = _TURBO_NAME_RE.match(name)
@@ -112,7 +90,6 @@ def parse_turbo_filename(name: str) -> TurboSpec | None:
     return TurboSpec(
         filename=name,
         task_family=match.group("task"),
-        version=match.group("version"),
         denoise_steps=steps,
         video_shift=_TURBO_VIDEO_SHIFT_768P if match.group("res") else _TURBO_VIDEO_SHIFT_544P,
         audio_shift=_TURBO_AUDIO_SHIFT,
@@ -174,9 +151,6 @@ def _select_turbo_file(artifact_path: str | Path) -> Path | None:
     if not path.is_dir():
         return None
 
-    # A directory may hold several artifacts of the family; only an
-    # unambiguous single candidate can be selected without a request-level
-    # choice, so anything else is left to the caller to name explicitly.
     candidates = sorted(child for child in path.glob("*.safetensors") if parse_turbo_filename(child.name))
     if len(candidates) == 1:
         return candidates[0]
@@ -276,32 +250,17 @@ def load_minimax_h3_turbo_lora(
     if lora_file is None:
         return None
     spec = parse_turbo_filename(lora_file.name)
+    if spec is None:
+        # Not a Turbo artifact by name; leave it to the next loader.
+        return None
     with safe_open(lora_file, framework="pt", device="cpu") as checkpoint:
+        # Three published artifacts declare no key_format, so absence is not an
+        # error; a declaration naming a different format is.
         metadata = checkpoint.metadata() or {}
-        if spec is None:
-            if lora_file.name.startswith("minimax_h3_") and _COMFYUI_MARKER in lora_file.name:
-                raise ValueError(
-                    f"{lora_file.name} is a ComfyUI-layout MiniMax-H3 Turbo export, which is not "
-                    "supported; download the Diffusers export of the same artifact instead."
-                )
-            # Not a Turbo artifact by name.  Only claim it when the metadata
-            # says it is one, so other adapters fall through to their loader.
-            if metadata.get("key_format") != "minimax-h3-diffusers":
-                return None
-            raise ValueError(
-                f"{lora_file.name!r} carries MiniMax-H3 Turbo metadata but its name does not follow "
-                "minimax_h3_<fl2v|ref2v>_turbo_<n>step_v<x.y>[_768p][_bf16].safetensors, "
-                "so its sampler contract cannot be determined."
-            )
-
-        # Three published artifacts (both v0.1 files and the 544p eight-step
-        # one) declare no key_format at all, so absence is not an error; a
-        # declaration that names a *different* format is.
         declared_format = metadata.get("key_format")
-        if declared_format is not None and declared_format != "minimax-h3-diffusers":
+        if declared_format not in (None, "minimax-h3-diffusers"):
             raise ValueError(
-                f"{lora_file.name} is named as a MiniMax-H3 Turbo artifact but requires safetensors "
-                f"metadata key_format='minimax-h3-diffusers', got {declared_format!r}"
+                f"{lora_file.name} declares key_format={declared_format!r}, expected 'minimax-h3-diffusers'"
             )
         raw_alpha = metadata.get("alpha")
         if raw_alpha is None:
@@ -321,12 +280,9 @@ def load_minimax_h3_turbo_lora(
 
         if partition == "ref2va" and spec.task_family == "fl2v":
             raise ValueError(f"{spec.filename} is an FL2VA/T2VA Turbo artifact; a Ref2VA-only server cannot serve it.")
-        # A ``combined`` server builds the Ref2VA DiT as ``transformers_ref``
-        # and serves ref2va requests from it, but the LoRA target pattern only
-        # injects into ``transformer`` -- the FL2VA DiT. A Ref2VA adapter loaded
-        # there binds to the stack that never runs, leaving ref2va requests to
-        # execute an undistilled DiT on the artifact's few-step schedule. Only a
-        # Ref2VA-only server, whose single DiT *is* ``transformer``, can serve it.
+        # ``combined`` serves ref2va from ``transformers_ref``, but the LoRA
+        # target pattern only injects into ``transformer``: the adapter would
+        # bind to the stack that never runs.
         if spec.task_family == "ref2v" and partition != "ref2va":
             raise ValueError(
                 f"{spec.filename} is a Ref2VA Turbo artifact; start the server with --task-type ref2va "
@@ -354,11 +310,10 @@ def load_minimax_h3_turbo_lora(
     )
     _pack_h3_turbo_fc1(lora_model)
     logger.info(
-        "MiniMax-H3 Turbo adapter %s: task=%s v%s, %d denoiser forwards (%d sigma points), "
+        "MiniMax-H3 Turbo adapter %s: task=%s, %d denoiser forwards (%d sigma points), "
         "rank=%d alpha=%g, flow_shift=%g/%g",
         spec.filename,
         spec.task_family,
-        spec.version,
         spec.denoise_steps,
         spec.sigma_points,
         spec.rank,

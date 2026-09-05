@@ -312,20 +312,21 @@ def test_h3_turbo_allows_distributed_layerwise_offload(monkeypatch):
     assert pipeline._turbo_lora_specs == {1: spec}
 
 
-def test_h3_turbo_rejects_the_comfyui_export_by_name(tmp_path):
-    """The ComfyUI exports fuse Q/K/V; refuse them with the reason instead of
-    letting the fused tensors reach the Diffusers-layout reader."""
+def test_h3_turbo_declines_the_comfyui_export(tmp_path):
+    """The ComfyUI exports fuse Q/K/V, so they are not this loader's format."""
 
     path = tmp_path / "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
     _write_tiny_turbo(path)
 
-    with pytest.raises(ValueError, match="ComfyUI-layout"):
+    assert (
         load_minimax_h3_turbo_lora(
             partition="fl2va",
             lora_request=_request(path),
             lora_path=path,
             dtype=torch.float32,
         )
+        is None
+    )
 
 
 def test_h3_turbo_accepts_every_published_artifact_name(tmp_path):
@@ -398,7 +399,7 @@ def test_non_h3_checkpoint_falls_back_to_the_generic_peft_loader(tmp_path):
 
     declared = tmp_path / "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_turbo(declared, key_format="other")
-    with pytest.raises(ValueError, match="requires safetensors metadata"):
+    with pytest.raises(ValueError, match="expected 'minimax-h3-diffusers'"):
         load_minimax_h3_turbo_lora(
             partition="fl2va",
             lora_request=_request(declared),
