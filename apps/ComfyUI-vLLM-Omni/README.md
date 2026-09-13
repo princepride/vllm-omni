@@ -166,12 +166,12 @@ The VSA profile also requires a compatible `fastvideo-kernel` installation. See 
 
 Open the **vLLM-Omni FastH3 Text to Video** template, then:
 
-- Set the server URL, served model name, and matching `dense-datafree` or `vsa-datafree` label on **FastH3 Deployment**.
+- Set the server URL and served model name on **FastH3 Deployment**.
 - Connect its output to **Generate Video → fast_h3**. When connected, the deployment node's URL and model take precedence over the corresponding Generate Video widgets.
 - Keep `frame`, `references`, **LoRA**, and **MiniMax-H3 Video Params** disconnected. FastH3 Preview v1 supports T2VA only, is already fused, and owns both flow shifts.
 - A connected **Diffusion Sampling Params** node may set seed and other ordinary sampling options. The integration always enforces four denoising steps and 24 FPS for FastH3.
 
-The profile field records which pre-deployed service the workflow targets; it does not switch adapters or attention backends on a running server.
+The node records which server the workflow targets; it does not start one, nor switch adapters or attention backends on a running server.
 
 ### TTS (e.g., Qwen TTS series)
 

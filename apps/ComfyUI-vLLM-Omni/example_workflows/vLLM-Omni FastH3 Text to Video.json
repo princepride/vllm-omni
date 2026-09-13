@@ -17,7 +17,7 @@
       "title": "FastH3 server prerequisite",
       "properties": {},
       "widgets_values": [
-        "FastH3 must be fused when the vLLM-Omni server starts. Use --task-type fl2va and --lora-path pointing to exactly one FastH3 adapter file. Do not use CPU or layerwise offload. For VSA / Data-Free, also install fastvideo-kernel and use --diffusion-attention-backend FASTVIDEO_VSA --fastvideo-vsa-topk 64. The profile below documents which already-running service this workflow targets; it does not switch the running server."
+        "FastH3 must be fused when the vLLM-Omni server starts. Use --task-type fl2va and --lora-path pointing to exactly one FastH3 adapter file. Do not use CPU or layerwise offload. For VSA / Data-Free, also install fastvideo-kernel and use --diffusion-attention-backend FASTVIDEO_VSA --fastvideo-vsa-topk 64."
       ],
       "color": "#432",
       "bgcolor": "#000"
@@ -44,13 +44,6 @@
           "type": "STRING",
           "widget": {"name": "model"},
           "link": null
-        },
-        {
-          "localized_name": "profile",
-          "name": "profile",
-          "type": "COMBO",
-          "widget": {"name": "profile"},
-          "link": null
         }
       ],
       "outputs": [
@@ -64,8 +57,7 @@
       "properties": {"Node name for S&R": "VLLMOmniFastH3Deployment"},
       "widgets_values": [
         "http://localhost:8000/v1",
-        "MiniMaxAI/MiniMax-H3",
-        "dense-datafree"
+        "MiniMaxAI/MiniMax-H3"
       ]
     },
     {

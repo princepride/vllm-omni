@@ -941,7 +941,6 @@ async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingC
     (deployment,) = deployment_node.get_deployment(
         url=api_server,
         model=deployment_model,
-        profile="dense-datafree",
     )
 
     result = await VLLMOmniGenerateVideo().generate(

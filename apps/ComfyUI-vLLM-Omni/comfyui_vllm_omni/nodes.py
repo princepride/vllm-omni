@@ -26,7 +26,6 @@ from .utils.validators import (
 
 logger = get_logger(__name__)
 
-FASTH3_PROFILES = ("dense-datafree", "vsa-datafree")
 FASTH3_INFERENCE_STEPS = 4
 FASTH3_FPS = 24
 # A FastH3 deployment may expose H3 under any --served-model-name, so the payload
@@ -34,18 +33,15 @@ FASTH3_FPS = 24
 FASTH3_SPEC_MODEL = "MiniMax-H3"
 
 
-def _resolve_fast_h3_deployment(deployment: dict) -> tuple[str, str, str]:
+def _resolve_fast_h3_deployment(deployment: dict) -> tuple[str, str]:
     if not isinstance(deployment, dict):
         raise ValueError("FastH3 deployment must be provided by a FastH3 Deployment node.")
 
     url = str(deployment.get("url") or "").strip().rstrip("/")
     model = str(deployment.get("model") or "").strip()
-    profile = str(deployment.get("profile") or "").strip()
     if not url or not model:
         raise ValueError("FastH3 deployment requires both URL and model.")
-    if profile not in FASTH3_PROFILES:
-        raise ValueError(f"Unsupported FastH3 profile {profile!r}; expected one of {FASTH3_PROFILES}.")
-    return url, model, profile
+    return url, model
 
 
 class _VLLMOmniGenerateBase:
@@ -260,8 +256,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                     "FastH3 is already fused into the selected server; disconnect the request-level LoRA input."
                 )
 
-            url, model, profile = _resolve_fast_h3_deployment(fast_h3)
-            logger.info("Using FastH3 deployment profile %s at %s", profile, url)
+            url, model = _resolve_fast_h3_deployment(fast_h3)
+            logger.info("Using FastH3 deployment at %s", url)
             fps = FASTH3_FPS
             # The served name is whatever the operator passed to --served-model-name.
             # Left alone, lookup_model_spec would miss H3 for an alias such as
@@ -802,13 +798,6 @@ class VLLMOmniFastH3Deployment:
                         "tooltip": "Model name exposed by the FastH3 deployment.",
                     },
                 ),
-                "profile": (
-                    list(FASTH3_PROFILES),
-                    {
-                        "default": FASTH3_PROFILES[0],
-                        "tooltip": "Must match the FastH3 adapter and attention backend used by the server.",
-                    },
-                ),
             }
         }
 
@@ -822,16 +811,16 @@ class VLLMOmniFastH3Deployment:
     )
 
     @classmethod
-    def VALIDATE_INPUTS(cls, url, model, profile) -> str | Literal[True]:
+    def VALIDATE_INPUTS(cls, url, model) -> str | Literal[True]:
         try:
-            _resolve_fast_h3_deployment({"url": url, "model": model, "profile": profile})
+            _resolve_fast_h3_deployment({"url": url, "model": model})
         except ValueError as exc:
             return str(exc)
         return True
 
-    def get_deployment(self, url: str, model: str, profile: str):
-        url, model, profile = _resolve_fast_h3_deployment({"url": url, "model": model, "profile": profile})
-        return (FastH3Deployment({"url": url, "model": model, "profile": profile}),)
+    def get_deployment(self, url: str, model: str):
+        url, model = _resolve_fast_h3_deployment({"url": url, "model": model})
+        return (FastH3Deployment({"url": url, "model": model}),)
 
 
 class VLLMOmniQwenTTSParams:
