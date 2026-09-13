@@ -58,6 +58,18 @@ This extension also offers example workflows (at **ComfyUI sidebar -> Templates 
 > [!NOTE]
 > The node UI and feature designs are intended to match vLLM-Omni online serving interfaces. It cannot offer more than what the interfaces support.
 
+Every node carries the vLLM-Omni mark in its title bar and is tinted by what it outputs, so a graph is readable at a glance:
+
+| Colour | Nodes | What they produce |
+| --- | --- | --- |
+| Blue | Generate Image, Generate Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated image, video, audio, or text. These are the only nodes that reach a server. |
+| Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
+| Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
+| Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
+| Teal | Video References | Reference media |
+
+Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
+
 To build a simple workflow yourself,
 
 - Drag a generation node onto the canvas.
@@ -187,6 +199,8 @@ The profile field records which pre-deployed service the workflow targets; it do
 ## Develop
 
 Follow the [development convention and rules of vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/).
+
+Node tints and the title-bar mark are applied in `web/main.js`, keyed off each node's declared output types rather than a list of node names. A new node that returns an existing type is themed with no front-end change; a new output type needs one entry in `FAMILY_BY_OUTPUT` there.
 
 ## Limitation and Non-Goals
 
