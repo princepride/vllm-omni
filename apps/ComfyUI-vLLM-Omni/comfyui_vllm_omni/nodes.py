@@ -29,6 +29,9 @@ logger = get_logger(__name__)
 FASTH3_PROFILES = ("dense-datafree", "vsa-datafree")
 FASTH3_INFERENCE_STEPS = 4
 FASTH3_FPS = 24
+# A FastH3 deployment may expose H3 under any --served-model-name, so the payload
+# spec has to be named outright rather than recovered from that alias.
+FASTH3_SPEC_MODEL = "MiniMax-H3"
 
 
 def _resolve_fast_h3_deployment(deployment: dict) -> tuple[str, str, str]:
@@ -245,6 +248,10 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         logger.debug("Got sampling params: %s", sampling_params)
         logger.debug("Got model params: %s", model_params)
 
+        # Which spec builds the payload. Only a FastH3 deployment separates this
+        # from the served name; every other path keeps them equal.
+        spec_model = model
+
         if fast_h3 is not None:
             if frame is not None or references is not None:
                 raise ValueError("FastH3 Preview supports T2VA only; disconnect frame and references inputs.")
@@ -256,6 +263,11 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             url, model, profile = _resolve_fast_h3_deployment(fast_h3)
             logger.info("Using FastH3 deployment profile %s at %s", profile, url)
             fps = FASTH3_FPS
+            # The served name is whatever the operator passed to --served-model-name.
+            # Left alone, lookup_model_spec would miss H3 for an alias such as
+            # "fasth3", drop the params builder, and send a t2va request carrying no
+            # aspect_ratio -- which the server refuses.
+            spec_model = FASTH3_SPEC_MODEL
 
             if sampling_params is None:
                 sampling_params = DiffusionSamplingParams()
@@ -280,7 +292,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         # duration is measured against the fps the server will actually apply.
         num_frames = max(1, round(duration * fps))
 
-        validate_model_and_sampling_params_types(model, sampling_params)
+        validate_model_and_sampling_params_types(spec_model, sampling_params)
 
         # Currently, all video generation models are single-stage diffusion models
         if isinstance(sampling_params, list):
@@ -300,6 +312,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         client = VLLMOmniClient(url)
         output = await client.generate_video(
             model=model,
+            spec_model=spec_model,
             prompt=prompt,
             frame=frame,  # frame present => fl2va / Wan I2V
             references=references,

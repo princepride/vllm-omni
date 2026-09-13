@@ -70,6 +70,8 @@ Every node carries the vLLM-Omni mark in its title bar and is tinted by what it 
 
 Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
 
+**Generate Video** takes a clip length in seconds (`duration`), not a frame count. Frames stay the wire unit and are derived with the node's `fps`, so the length is always measured against the rate that is actually served; models that accept only certain frame counts still round to their own lattice server-side. Graphs saved before this widget existed stored `num_frames` in its place and are converted on load, using the fps recorded alongside it -- the browser console names every node it rewrites.
+
 To build a simple workflow yourself,
 
 - Drag a generation node onto the canvas.

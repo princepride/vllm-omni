@@ -903,27 +903,44 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "server_case",
+    "server_case,deployment_model",
     [
-        ServerCase(
-            served_model="MiniMaxAI/MiniMax-H3",
-            stage_list=["diffusion"],
-            stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
-            outputs=[_build_diffusion_video_output()],
-        )
+        pytest.param(
+            ServerCase(
+                served_model="MiniMaxAI/MiniMax-H3",
+                stage_list=["diffusion"],
+                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            "MiniMaxAI/MiniMax-H3",
+            id="canonical_model_name",
+        ),
+        pytest.param(
+            ServerCase(
+                served_model="fasth3",
+                stage_list=["diffusion"],
+                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            "fasth3",
+            # A --served-model-name alias lookup_model_spec cannot resolve to H3. The
+            # request must still be built by the H3 params builder, or it goes out
+            # without the aspect_ratio (and task) a t2va request is refused without.
+            id="served_model_alias",
+        ),
     ],
-    indirect=True,
+    indirect=["server_case"],
 )
 @pytest.mark.parametrize(
     "sampling_case",
     [SamplingCase(kind=SamplingKind.VIDEO_FASTH3, sampling_params=DIFFUSION_VIDEO_SINGLE_SAMPLING_PARAMS)],
     indirect=True,
 )
-async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingCase):
+async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingCase, deployment_model: str):
     deployment_node = VLLMOmniFastH3Deployment()
     (deployment,) = deployment_node.get_deployment(
         url=api_server,
-        model="MiniMaxAI/MiniMax-H3",
+        model=deployment_model,
         profile="dense-datafree",
     )
 
