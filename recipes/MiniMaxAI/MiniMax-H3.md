@@ -1254,7 +1254,7 @@ same 960x544 -> 1920x1088 upscale:
 curl -sS -X POST "${API_URL}" \
   -F 'prompt=...' \
   -F 'width=960' -F 'height=544' -F 'fps=24' \
-  -F 'extra_args={"task":"t2va","duration":8.7,"latent_upscale":2.0}' \
+  -F 'extra_params={"task":"t2va","duration":8.7,"latent_upscale":2.0}' \
   -o t2va_1080p.mp4
 
 # or name the output size in pixels
@@ -1263,7 +1263,10 @@ curl -sS -X POST "${API_URL}" \
 #   "latent_upscale":{"megapixels":2.0}
 ```
 
-Offline, the same value goes in `extra_args`:
+Over HTTP the field is `extra_params`: the videos request model declares that
+name and nothing else, so an `extra_args` form field is dropped without an
+error and the request silently returns the un-upscaled size. Offline, the same
+value goes in `extra_args`:
 
 ```python
 omni = Omni(
@@ -1299,7 +1302,7 @@ curl -sS -X POST "${API_URL}" \
   -F 'prompt=...' \
   -F 'width=960' -F 'height=544' -F 'fps=24' \
   -F 'num_inference_steps=50' \
-  -F 'extra_args={"task":"t2va","duration":8.7,"latent_upscale":2.0,"latent_refine":0.4}' \
+  -F 'extra_params={"task":"t2va","duration":8.7,"latent_upscale":2.0,"latent_refine":0.4}' \
   -o t2va_1080p.mp4
 ```
 
