@@ -1361,6 +1361,12 @@ target is rejected, and `scale` 1.0 is a no-op that skips the stage. The
 `latent_refine` value is a strength in `(0, 1]`, `false`, or
 `{"strength": 0.4}`; it needs no checkpoint of its own.
 
+When `latent_refine` is enabled, both resolved output dimensions must be
+divisible by 32 pixels for the DiT's spatial patches. A custom `align` that
+produces an incompatible target is rejected before denoising; upscale-only
+requests can still use the VAE's 16-pixel grid. Numeric upscale fields must be
+positive and finite, and `width`, `height`, and `align` must be integers.
+
 Temporal chunking bounds activation memory on long clips -- a 15-second clip is
 102 latent frames, more than three chunks. It is an approximation rather than a
 partition: the network's GroupNorms pool statistics over whatever clip they are

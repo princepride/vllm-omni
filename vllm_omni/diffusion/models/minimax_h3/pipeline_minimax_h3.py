@@ -28,6 +28,7 @@ from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
     RequestScopedCacheDiTRuntime,
 )
+from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_world_group,
@@ -2302,6 +2303,14 @@ class MiniMaxH3Pipeline(
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
+        # Each pass (including each output and hi-res refine) owns its cache.
+        # Refine can change both the packed shape and the schedule length.
+        registry = getattr(transformer, "_hook_registry", None)
+        if registry is not None:
+            registry.reset_hook(TeaCacheHook._HOOK_NAME)
+        cache_runtime = getattr(self, "_cache_dit_runtime", None)
+        if cache_runtime is not None:
+            cache_runtime.refresh(len(inputs["sigmas_video"]) - 1)
         with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
@@ -2455,6 +2464,11 @@ class MiniMaxH3Pipeline(
                 latent_width=latent_w,
                 **spec,
             )
+            if self._resolve_latent_refine(extra) is not None and (target.latent_height % 2 or target.latent_width % 2):
+                raise MiniMaxH3LatentUpscalerError(
+                    "latent_refine requires upscale latent height and width divisible by 2 "
+                    "(32 pixels); use align=32 or a compatible target size"
+                )
         except MiniMaxH3LatentUpscalerError as exc:
             raise OmniClientError(str(exc)) from exc
         if (target.latent_height, target.latent_width) == (latent_h, latent_w):
