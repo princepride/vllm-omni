@@ -221,6 +221,68 @@ def test_weights_park_in_host_memory_between_requests():
     assert all(parameter.device.type == "cpu" for parameter in upscaler.parameters())
 
 
+@pytest.mark.parametrize("key", ["scale", "megapixels", "width", "height", "align"])
+@pytest.mark.parametrize("value", [True, False, "not-a-number", [], {}, float("nan"), float("inf"), -1, 0])
+def test_upscale_numeric_errors_are_client_errors(key, value):
+    from vllm_omni.errors import OmniClientError
+
+    with pytest.raises(MiniMaxH3LatentUpscalerError, match=key):
+        parse_minimax_h3_latent_upscale_request({key: value})
+    pipeline = build_pipeline(upscaler=torch.nn.Identity())
+    with pytest.raises(OmniClientError, match=key):
+        pipeline._resolve_latent_upscale({"latent_upscale": {key: value}}, latent_h=34, latent_w=60)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 10**400])
+def test_bare_upscale_rejects_nonfinite_numbers(value):
+    with pytest.raises(MiniMaxH3LatentUpscalerError, match="scale"):
+        parse_minimax_h3_latent_upscale_request(value)
+
+
+@pytest.mark.parametrize("key", ["width", "height", "align"])
+def test_upscale_integer_fields_reject_fractional_values(key):
+    with pytest.raises(MiniMaxH3LatentUpscalerError, match="positive integer"):
+        parse_minimax_h3_latent_upscale_request({key: 32.5})
+
+
+@pytest.mark.parametrize("height,width", [(560, 992), (576, 976)])
+@pytest.mark.parametrize("default_refine", [False, True])
+def test_refine_rejects_odd_latent_axes_during_target_resolution(height, width, default_refine):
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = build_pipeline(
+        additional_config={"latent_refine": 0.4} if default_refine else {},
+        upscaler=torch.nn.Identity(),
+    )
+    extra: dict = {"latent_upscale": {"height": height, "width": width, "align": 16}}
+    if not default_refine:
+        extra["latent_refine"] = 0.4
+    with pytest.raises(OmniClientError, match="divisible by 2"):
+        pipeline._resolve_latent_upscale(extra, latent_h=34, latent_w=60)
+    extra["latent_refine"] = False
+    target = pipeline._resolve_latent_upscale(extra, latent_h=34, latent_w=60)
+    assert (target.height, target.width) == (height, width)
+
+
+def test_refine_accepts_compatible_dimensions_with_custom_alignment():
+    pipeline = build_pipeline(upscaler=torch.nn.Identity())
+    target = pipeline._resolve_latent_upscale(
+        {"latent_upscale": {"height": 576, "width": 992, "align": 16}, "latent_refine": 0.4},
+        latent_h=34,
+        latent_w=60,
+    )
+    assert (target.latent_height, target.latent_width) == (36, 62)
+
+
+@pytest.mark.parametrize("key", ["scale", "megapixels"])
+def test_finite_upscale_values_that_overflow_target_resolution_are_client_errors(key):
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = build_pipeline(upscaler=torch.nn.Identity())
+    with pytest.raises(OmniClientError, match="finite"):
+        pipeline._resolve_latent_upscale({"latent_upscale": {key: 1e308}}, latent_h=34, latent_w=60)
+
+
 def build_pipeline(additional_config=None, upscaler=None):
     """A pipeline stub carrying only what the latent-upscale stage reads."""
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
@@ -543,31 +605,48 @@ def test_a_pinned_pad_seq_len_does_not_follow_the_pass_that_outgrew_it():
     assert recorded["pad_seq_len"] == 4096
 
 
-def test_the_hi_res_route_runs_a_shortened_pass_at_the_new_size():
+@pytest.mark.parametrize("resize", [False, True])
+def test_the_hi_res_route_runs_a_shortened_pass_at_the_new_size(resize):
     """diffuse() twice: a cheap first pass, then a partial one after the upscale.
 
     Against a stand-in DiT this covers what unit-testing the pieces cannot --
     that the packed layout, the branch masks and the row bookkeeping all agree
     at a resolution the first pass never used.
     """
+    from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
+    from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3.latent_upscaler import MiniMaxH3LatentRefineSpec
 
     from .test_minimax_h3_step_execution import _SegmentMeanModel
 
-    calls = []
+    calls: list[torch.Tensor] = []
+    hook = TeaCacheHook(TeaCacheConfig(transformer_type="MiniMaxH3DiTModel"))
+    refresh_steps: list[int] = []
+
+    def reset_hook(name):
+        assert name == TeaCacheHook._HOOK_NAME
+        hook.reset_state(model)
 
     class CountingModel(_SegmentMeanModel):
         def __call__(self, **kwargs):
+            state = hook.state_manager.get_state()
+            if len(calls) in (0, 10):
+                assert state.previous_modulated_input is None
+                assert state.previous_residual is None
+            state.previous_modulated_input = torch.ones(1)
+            state.previous_residual = torch.ones(1)
             calls.append(kwargs["unique_timesteps"])
             return super().__call__(**kwargs)
 
     model = CountingModel()
+    model._hook_registry = SimpleNamespace(reset_hook=reset_hook)
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
     pipeline.transformer = model
     pipeline._transformer_for_task = lambda task: model
+    pipeline._cache_dit_runtime = SimpleNamespace(refresh=refresh_steps.append)
 
     kwargs = {
         "task": "t2va",
@@ -591,14 +670,16 @@ def test_the_hi_res_route_runs_a_shortened_pass_at_the_new_size():
     first_pass_steps = len(calls)
     assert first_pass_steps == 10
 
-    upscaled = torch.nn.functional.interpolate(video_latent, size=(2, 8, 12), mode="nearest")
+    target_h, target_w = (8, 12) if resize else (4, 6)
+    upscaled = torch.nn.functional.interpolate(video_latent, size=(2, target_h, target_w), mode="nearest")
     refined_video, refined_audio = pipeline.diffuse(
-        **{**kwargs, "latent_h": 8, "latent_w": 12},
+        **{**kwargs, "latent_h": target_h, "latent_w": target_w},
         init_latents=(upscaled, audio_latent),
         refine=MiniMaxH3LatentRefineSpec(strength=0.5),
     )
 
-    assert refined_video.shape == (1, 24, 2, 8, 12)
+    assert refined_video.shape == (1, 24, 2, target_h, target_w)
+    assert refresh_steps == [10, 5]
     assert refined_audio.shape == audio_latent.shape
     # Half the schedule, so half the forwards -- at the expensive size.
     assert len(calls) - first_pass_steps == 5

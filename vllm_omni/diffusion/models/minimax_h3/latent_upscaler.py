@@ -268,6 +268,8 @@ def resolve_minimax_h3_latent_upscale_target(
         target_width = float(width)
 
     cell = MINIMAX_H3_VAE_SPATIAL_DOWNSAMPLE
+    if not math.isfinite(target_height) or not math.isfinite(target_width):
+        raise MiniMaxH3LatentUpscalerError("latent upscale target dimensions must be finite")
     out_height = max(1, int(round(round(target_height / align) * align / cell)))
     out_width = max(1, int(round(round(target_width / align) * align / cell)))
     effective = (out_height / latent_height + out_width / latent_width) / 2.0
@@ -561,6 +563,20 @@ def resolve_minimax_h3_latent_upscaler(
     )
 
 
+def _parse_upscale_number(value, *, key: str) -> float | int:
+    integer = key in {"width", "height", "align"}
+    try:
+        number = float(value)
+        if isinstance(value, bool) or not math.isfinite(number) or number <= 0:
+            raise ValueError
+        if integer and not number.is_integer():
+            raise ValueError
+        return int(value) if integer else number
+    except (TypeError, ValueError, OverflowError) as exc:
+        kind = "positive integer" if integer else "positive finite number"
+        raise MiniMaxH3LatentUpscalerError(f"latent_upscale {key} must be a {kind}, got {value!r}") from exc
+
+
 def parse_minimax_h3_latent_upscale_request(value) -> dict[str, float | int] | None:
     """Normalize ``extra_args['latent_upscale']`` into resolver keywords.
 
@@ -574,7 +590,7 @@ def parse_minimax_h3_latent_upscale_request(value) -> dict[str, float | int] | N
     if isinstance(value, bool):
         raise MiniMaxH3LatentUpscalerError("latent_upscale must be a number or an object, not true")
     if isinstance(value, (int, float)):
-        return {"scale": float(value)}
+        return {"scale": _parse_upscale_number(value, key="scale")}
     if not isinstance(value, Mapping):
         raise MiniMaxH3LatentUpscalerError(f"latent_upscale must be a number or an object, got {type(value).__name__}")
     known = {"scale", "width", "height", "megapixels", "align"}
@@ -582,12 +598,9 @@ def parse_minimax_h3_latent_upscale_request(value) -> dict[str, float | int] | N
     if unknown:
         raise MiniMaxH3LatentUpscalerError(f"unknown latent_upscale keys {sorted(unknown)}; expected {sorted(known)}")
     resolved: dict[str, float | int] = {}
-    for key in ("scale", "megapixels"):
+    for key in ("scale", "megapixels", "width", "height", "align"):
         if value.get(key) is not None:
-            resolved[key] = float(value[key])
-    for key in ("width", "height", "align"):
-        if value.get(key) is not None:
-            resolved[key] = int(value[key])
+            resolved[key] = _parse_upscale_number(value[key], key=key)
     return resolved or None
 
 
