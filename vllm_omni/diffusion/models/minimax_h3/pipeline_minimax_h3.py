@@ -68,6 +68,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
+    is_minimax_h3_modular,
     resolve_minimax_h3_partition,
 )
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
@@ -107,6 +108,7 @@ from .denoise_loop import (
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
+from .fasth3_checkpoint import FastH3CheckpointSpec
 from .latent_upscaler import (
     MiniMaxH3LatentRefineSpec,
     MiniMaxH3LatentUpscalerError,
@@ -224,7 +226,11 @@ def _resolve_minimax_h3_model_root(
         if path.name in {"FL2VA", "Ref2VA"}:
             return path.parent
         return path
-    if load_text_encoder:
+    if is_minimax_h3_modular(model, revision):
+        allow_patterns = ["modular_model_index.json", "fastvideo_inference.json", "provenance.json", "transformer/**"]
+        if load_text_encoder:
+            allow_patterns += ["text_encoder/**", "tokenizer/**", "processor/**"]
+    elif load_text_encoder:
         allow_patterns = (
             MINIMAX_H3_DOWNLOAD_PATTERNS if partition == "combined" else MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[partition]
         )
@@ -328,6 +334,8 @@ def resolve_minimax_h3_diffusion_model_path(
         partition,
         load_text_encoder=False,
     )
+    if is_minimax_h3_modular(str(model_root), revision):
+        return str(model_root)
     if partition == "combined":
         return str(model_root)
     subdir = "Ref2VA" if partition == "ref2va" else "FL2VA"
@@ -599,6 +607,7 @@ class MiniMaxH3Pipeline(
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
     # Set from --lora-path during construction; absent means no FastH3 adapter.
     _fasth3: FastH3WeightFusion | None = None
+    _fasth3_checkpoint: FastH3CheckpointSpec | None = None
 
     def _load_diffusion_lora_adapter(
         self,
@@ -824,10 +833,13 @@ class MiniMaxH3Pipeline(
             self._PROFILER_TARGETS.remove("encode_prompt")
         if not self.load_vae_encoder:
             self._PROFILER_TARGETS.remove("_encode_local_media")
+        modular = is_minimax_h3_modular(str(od_config.model), od_config.revision)
         self.partition = _minimax_h3_partition_for_task(
             getattr(od_config, "task_type", None),
             str(od_config.model),
         )
+        if modular and str(od_config.task_type or "auto").lower() == "auto":
+            self.partition = "fl2va"
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
@@ -837,9 +849,19 @@ class MiniMaxH3Pipeline(
             self.partition,
             load_text_encoder=self.load_text_encoder,
         )
-        model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
-        model_index = json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
-        release = model_index.get("_minimax_h3") or {}
+        if modular:
+            model_path = model_root
+            self._fasth3_checkpoint = FastH3CheckpointSpec.from_metadata(
+                json.loads((model_root / "fastvideo_inference.json").read_text(encoding="utf-8"))
+            )
+            self._fasth3_checkpoint.check_serving_contract(partition=self.partition, od_config=od_config)
+            release = self._fasth3_checkpoint.release_metadata()
+            vae_model_path = self._fasth3_checkpoint.resolve_native_vaes(model_root)
+        else:
+            model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
+            model_index = json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
+            release = model_index.get("_minimax_h3") or {}
+            vae_model_path = model_path
         partition = str(release.get("partition", "")).lower()
         expected_partition = "ref2va" if self.partition == "ref2va" else "fl2va"
         if partition != expected_partition:
@@ -900,11 +922,18 @@ class MiniMaxH3Pipeline(
         self.transformer = MiniMaxH3DiTModel(
             od_config,
             quant_config=transformer_quant_config,
+            diffusers_weights=modular,
         )
+        if self._fasth3_checkpoint is not None:
+            self.transformer.enable_vsa_gates(sparsity=self._fasth3_checkpoint.vsa_sparsity)
+            logger.info(
+                "FastH3 V2 full checkpoint: 8 transformer forwards, video/audio shifts 10/3, VSA sparsity=0.8 tile=64"
+            )
         if ref2va_model_path is not None:
             self.transformers_ref = MiniMaxH3DiTModel(
                 od_config,
                 quant_config=transformer_quant_config,
+                diffusers_weights=modular,
             )
 
         self._fasth3 = resolve_fasth3_fusion(od_config, self.transformer)
@@ -987,14 +1016,14 @@ class MiniMaxH3Pipeline(
         # so VAEs stay resident for new configurations.
         component_load_device = torch.device("cpu") if legacy_manual_components else self.device
         self.video_vae = MiniMaxH3VideoVAE(
-            os.path.join(model_path, "video_vae"),
+            os.path.join(vae_model_path, "video_vae"),
             device=self.device,
             load_device=component_load_device,
             decode_only=not self.load_vae_encoder,
             trust_remote_code=od_config.trust_remote_code,
         )
         self.audio_vae = MiniMaxH3AudioVAE(
-            os.path.join(model_path, "audio_vae"),
+            os.path.join(vae_model_path, "audio_vae"),
             device=self.device,
             load_device=component_load_device,
             decode_only=not self.load_vae_encoder,
@@ -1083,6 +1112,12 @@ class MiniMaxH3Pipeline(
             # load_weights only warns on a parameter the model does not have, so
             # close the adapter against what the DiT actually consumed.
             self._fasth3.validate_fully_applied(transformer_loaded)
+        if self._fasth3_checkpoint is not None:
+            required_gates = {
+                f"blocks.{i}.attn.to_gate_compress.weight" for i in range(self.transformer.arch.num_layers)
+            }
+            if missing_gates := required_gates - transformer_loaded:
+                raise ValueError(f"FastH3 V2 checkpoint is missing compression gates: {sorted(missing_gates)}")
         return loaded_with_prefix
 
     @property
@@ -2367,6 +2402,11 @@ class MiniMaxH3Pipeline(
             self._validate_turbo_sampling(sampling, turbo_spec)
         if has_native_lora:
             self._validate_native_sampling(sampling, task=task)
+        if self._fasth3_checkpoint is not None:
+            self._fasth3_checkpoint.check_request(
+                sampling,
+                step_execution=bool(getattr(self.od_config, "step_execution", False)),
+            )
         if self._fasth3 is not None:
             self._fasth3.check_request(
                 sampling,

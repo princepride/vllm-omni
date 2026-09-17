@@ -423,6 +423,7 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     assert pipeline.partition == expected_partition
     assert pipeline.supported_tasks == expected_tasks
     assert len(created["dit"]) == expected_dits
+    assert all(kwargs["diffusers_weights"] is False for _, kwargs in created["dit"])
     component_path = tmp_path / component_partition
     assert created["video_vae"] == [str(component_path / "video_vae")]
     assert created["audio_vae"] == [str(component_path / "audio_vae")]
