@@ -392,6 +392,36 @@ def test_prepare_encode_rejects_high_quality_cache_dit():
         _step_pipeline(_SegmentMeanModel()).prepare_encode(state)
 
 
+def test_prepare_encode_rejects_refine_from_request_or_default(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _step_pipeline(_SegmentMeanModel())
+    pipeline.od_config = SimpleNamespace(additional_config={"latent_refine": 0.4})
+
+    def reached_request_preparation(self, **kwargs):
+        raise RuntimeError("request preparation reached")
+
+    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_prepare_request_inputs", reached_request_preparation)
+    for extra_args in ({"latent_refine": 0.4}, {}):
+        state = StepRequestState(
+            request_id="req-refine",
+            sampling=SimpleNamespace(num_outputs_per_prompt=1, extra_args=extra_args),
+            prompt="a prompt",
+        )
+        with pytest.raises(OmniClientError, match="does not support latent_refine"):
+            pipeline.prepare_encode(state)
+
+    opted_out = StepRequestState(
+        request_id="req-upscale-only",
+        sampling=SimpleNamespace(num_outputs_per_prompt=1, extra_args={"latent_refine": False}),
+        prompt="a prompt",
+    )
+    with pytest.raises(RuntimeError, match="request preparation reached"):
+        pipeline.prepare_encode(opted_out)
+
+
 def _fake_attention_module(
     *,
     use_ring: bool,

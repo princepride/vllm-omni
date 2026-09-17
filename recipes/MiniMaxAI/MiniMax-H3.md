@@ -1348,8 +1348,9 @@ reused as they are.
 | --- | --- | --- |
 | `latent_upscaler_path` | unset | Checkpoint file, or a directory holding exactly one. Unset disables the stage and loads no extra weights. |
 | `latent_upscaler_dtype` | the engine dtype | `bf16`, `fp16` or `fp32`. |
-| `latent_upscaler_chunk_frames` | `32` | Latent frames per temporal chunk. `0` runs the whole clip in one pass. |
+| `latent_upscaler_chunk_frames` | `0` | `0` runs the whole clip in one pass; a positive value bounds activation memory with approximate temporal chunking. |
 | `latent_upscaler_resident` | `false` | Keep the ~700 MB of weights on the GPU between requests instead of in host memory. |
+| `latent_refine_max_tokens_per_rank` | `65536` | Reject larger refine layouts before denoising. Set `0` only after validating a larger deployment. |
 | `latent_upscale` | unset | A default target applied to every request, in the request's own format. A request overrides it, and `false` opts out. |
 | `latent_refine` | unset | A default refine strength applied to every request. A request overrides it, and `false` opts out. |
 
@@ -1367,14 +1368,15 @@ produces an incompatible target is rejected before denoising; upscale-only
 requests can still use the VAE's 16-pixel grid. Numeric upscale fields must be
 positive and finite, and `width`, `height`, and `align` must be integers.
 
-Temporal chunking bounds activation memory on long clips -- a 15-second clip is
-102 latent frames, more than three chunks. It is an approximation rather than a
+Temporal chunking can bound activation memory on long clips -- a 15-second clip is
+102 latent frames, more than three 32-frame chunks. It is an approximation rather than a
 partition: the network's GroupNorms pool statistics over whatever clip they are
 handed, so a chunked pass can differ from a single pass across the whole output
 and not only at the chunk seams. How much that costs in practice was not
-measured here; `latent_upscaler_chunk_frames: 0` buys the exact result for the
+measured here; the default single pass buys the exact result for the
 memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
-2688x1536 for 15 seconds, measured on one B300).
+2688x1536 for 15 seconds, measured on one B300). Set
+`latent_upscaler_chunk_frames: 32` explicitly if that memory cost is too high.
 
 ## Known limitations
 
@@ -1386,16 +1388,13 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
   own resolution and its own truncated schedule, and the step contract carries
   one schedule per request, so step execution rejects it. `latent_upscale`
   without `latent_refine` works in both modes.
-- Refining at a large target size can abort the workers with `CUDA error: an
-  illegal memory access was encountered`, and the fault tracks the *per-rank*
-  token count rather than the total. Observed on B300: 54,144 tokens per rank
-  completes, 108,288 and 109,360 abort, on both TRTLLM_ATTN and CUDNN_ATTN, so
-  it is not the attention backend. Concretely, a 15s 2688x1536 refine is
-  433,152 tokens: it aborts at `--usp 4` and completes at `--usp 8`. Divide the
-  sequence length (roughly `latent_t * (height/32) * (width/32)`) by the
-  Ulysses degree and keep the result well under ~54k, or raise the degree. A
-  15s refine at 3840x2176 is 874,880 tokens and needs more than 8 GPUs by this
-  rule; it aborts at `--usp 8`.
+- Large refine layouts can abort workers with `CUDA error: an illegal memory
+  access was encountered`. On B300, observed video token counts of 54,144 per
+  rank complete while 108,288 and 109,360 abort. The preflight limit of 65,536
+  counts the full padded layout, including text, audio, and visual references,
+  per Ulysses rank. It rejects the observed failing sizes before the base pass.
+  This is an empirical B300 guard, not a proven kernel limit on every device;
+  deployments with different hardware can adjust the limit after validation.
 - Combined serving requires sibling `FL2VA` and `Ref2VA` directories, loads
   both task-specific DiTs, and loads shared components once from `FL2VA`.
 - Request mode executes one generation request per diffusion batch. Use

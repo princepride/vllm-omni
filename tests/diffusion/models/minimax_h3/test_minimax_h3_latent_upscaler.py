@@ -78,6 +78,7 @@ def test_arch_detection_round_trips_through_a_checkpoint(tmp_path):
     # module layout reproduces the checkpoint's parameter names exactly.
     upscaler = load_minimax_h3_latent_upscaler(tmp_path, device=torch.device("cpu"), dtype=torch.float32, **NORM)
     assert upscaler.resizer.arch == TINY_ARCH
+    assert upscaler.chunk_frames == 0
     assert upscaler.chunk_overlap == TINY_ARCH.temporal_kernel
 
 
@@ -351,6 +352,90 @@ def test_the_upscale_stage_is_skipped_when_no_target_is_resolved():
     pipeline.latent_upscaler = build_upscaler(TINY_ARCH, chunk_frames=0)
     target = resolve_minimax_h3_latent_upscale_target(latent_height=34, latent_width=60, scale=2.0)
     assert MiniMaxH3Pipeline._upscaled_latent(pipeline, latent, target).shape == (1, 24, 7, 68, 120)
+
+
+def test_refine_preflight_rejects_observed_failing_per_rank_layouts():
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = build_pipeline()
+    target = resolve_minimax_h3_latent_upscale_target(latent_height=48, latent_width=84, scale=2.0)
+    args = dict(
+        task="fl2va",
+        target=target,
+        latent_t=102,
+        latent_h=48,
+        latent_w=84,
+        audio_t=300,
+        text_len=100,
+        keyframe_count=1,
+        ref_blocks=None,
+    )
+    pipeline.parallel_config = SimpleNamespace(ulysses_degree=8)
+    pipeline._validate_refine_token_budget(**args)
+    pipeline.parallel_config.ulysses_degree = 4
+    with pytest.raises(OmniClientError, match="packed tokens per Ulysses rank"):
+        pipeline._validate_refine_token_budget(**args)
+
+    # References are part of the packed sequence, including video references.
+    pipeline.parallel_config.ulysses_degree = 8
+    with pytest.raises(OmniClientError, match="packed tokens per Ulysses rank"):
+        pipeline._validate_refine_token_budget(
+            **{
+                **args,
+                "task": "ref2va",
+                "keyframe_count": 0,
+                "ref_blocks": [{"kind": "video", "ref_audio_t": 0, "latent_t": 120, "latent_h": 48, "latent_w": 84}],
+            }
+        )
+
+
+@pytest.mark.parametrize("resident", [False, True])
+def test_model_offload_evicts_dit_only_when_upscaler_runs(monkeypatch, resident):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+
+    class StubUpscaler(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.resident = resident
+            self.resizer = torch.nn.Linear(1, 1)
+
+        def upscale(self, latent, target):
+            events.append("upscale")
+            return latent + 1
+
+    events = []
+    pipeline = object.__new__(mod.MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = torch.nn.Linear(1, 1)
+    pipeline.transformers_ref = None
+    pipeline.text_encoder = torch.nn.Linear(1, 1)
+    pipeline.video_vae = torch.nn.Linear(1, 1)
+    pipeline.audio_vae = torch.nn.Linear(1, 1)
+    pipeline.latent_upscaler = StubUpscaler()
+    pipeline.od_config = SimpleNamespace(diffusion_offload_config={"mode": "model"})
+
+    original_to_cpu = SequentialOffloadHook._to_cpu
+
+    def record_to_cpu(self, module):
+        if module is pipeline.transformer:
+            events.append("evict DiT")
+        return original_to_cpu(self, module)
+
+    monkeypatch.setattr(SequentialOffloadHook, "_to_cpu", record_to_cpu)
+    pipeline.enable_omni_model_cpu_offload(device=torch.device("cpu"), pin_memory=False, use_hsdp=False)
+    try:
+        # The ordinary DiT hook scans the upscaler only if residency was requested.
+        dit_hook = pipeline.transformer._hook_registry.get_hook("sequential_offload")
+        assert (pipeline.latent_upscaler in dit_hook.offload_targets) is resident
+        events.clear()
+        latent = torch.zeros(1)
+        assert pipeline._upscaled_latent(latent, None) is latent
+        assert events == []
+        assert torch.equal(pipeline._upscaled_latent(latent, object()), torch.ones(1))
+        assert events == ["evict DiT", "upscale"]
+    finally:
+        pipeline.disable_omni_model_cpu_offload()
 
 
 # --------------------------------------------------------------------------
@@ -640,7 +725,7 @@ def test_the_hi_res_route_runs_a_shortened_pass_at_the_new_size(resize):
             return super().__call__(**kwargs)
 
     model = CountingModel()
-    model._hook_registry = SimpleNamespace(reset_hook=reset_hook)
+    setattr(model, "_hook_registry", SimpleNamespace(reset_hook=reset_hook))
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")

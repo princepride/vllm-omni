@@ -1664,20 +1664,33 @@ class MiniMaxH3Pipeline(
 
         components = ModuleDiscovery.discover(self)
         dits = components.dits
+        # This optional stage owns its own weight placement. Register it only
+        # with model-level sequential offload; generic VAE discovery would
+        # otherwise move it onto the GPU during unrelated layerwise setup.
+        upscaler = getattr(self, "latent_upscaler", None)
         stages = [*components.encoders, *components.vaes]
+        if upscaler is not None:
+            stages.append(upscaler)
         modules = [*dits, *stages]
+        # The upscaler normally parks its own weights on the host. Keep it as
+        # an execution stage so activating it evicts the DiT, but do not scan
+        # its parameters on every DiT step unless residency was requested.
+        selected_stages = [stage for stage in stages if stage is not upscaler or upscaler.resident]
         selection_options: dict[str, Any] = {}
         if offload_components is not None:
             if DIT_COMPONENT in offload_components and not dits:
                 raise ValueError("MiniMax-H3 has no loaded DiT for selected module offload")
             if TEXT_ENCODER_COMPONENT in offload_components and not components.encoders:
                 raise ValueError("MiniMax-H3 has no loaded text encoder for selected module offload")
+            selected_explicit_stages = [*components.encoders] if TEXT_ENCODER_COMPONENT in offload_components else []
+            if upscaler is not None and upscaler.resident:
+                selected_explicit_stages.append(upscaler)
             selection_options = {
                 "offload_dit_modules": dits if DIT_COMPONENT in offload_components else (),
-                "offload_encoder_modules": (
-                    components.encoders if TEXT_ENCODER_COMPONENT in offload_components else ()
-                ),
+                "offload_encoder_modules": selected_explicit_stages,
             }
+        else:
+            selection_options["offload_encoder_modules"] = selected_stages
         apply_sequential_offload(
             dit_modules=dits,
             encoder_modules=stages,
@@ -2496,6 +2509,57 @@ class MiniMaxH3Pipeline(
         except MiniMaxH3LatentUpscalerError as exc:
             raise OmniClientError(str(exc)) from exc
 
+    def _validate_refine_token_budget(
+        self,
+        *,
+        task: str,
+        target: MiniMaxH3LatentUpscaleTarget | None,
+        latent_t: int,
+        latent_h: int,
+        latent_w: int,
+        audio_t: int,
+        text_len: int,
+        keyframe_count: int,
+        ref_blocks: list[dict[str, Any]] | None,
+    ) -> None:
+        """Reject refine layouts known to exceed the tested per-rank limit.
+
+        Count the same rows as the packed layout without materializing its
+        large position tensors before the first denoise pass.
+        """
+        additional = getattr(getattr(self, "od_config", None), "additional_config", None) or {}
+        limit = additional.get("latent_refine_max_tokens_per_rank", 65_536)
+        if type(limit) is not int or limit < 0:
+            raise OmniClientError("latent_refine_max_tokens_per_rank must be a non-negative integer")
+        if limit == 0:
+            return
+        height = target.latent_height if target is not None else latent_h
+        width = target.latent_width if target is not None else latent_w
+        frame_rows = (height // 2) * (width // 2)
+        used = text_len + 2 * audio_t + latent_t * frame_rows
+        if task == "fl2va":
+            used += keyframe_count * frame_rows
+        elif task == "ref2va":
+            for block in ref_blocks or ():
+                kind = block["kind"]
+                if kind == "image":
+                    used += (block["latent_h"] // 2) * (block["latent_w"] // 2)
+                elif kind == "audio":
+                    used += 2 * block["ref_audio_t"]
+                else:
+                    used += 2 * block["ref_audio_t"]
+                    used += block["latent_t"] * (block["latent_h"] // 2) * (block["latent_w"] // 2)
+        padded = ((used + MINIMAX_H3_SEQ_ALIGN - 1) // MINIMAX_H3_SEQ_ALIGN) * MINIMAX_H3_SEQ_ALIGN
+        parallel = getattr(self, "parallel_config", None)
+        degree = int(getattr(parallel, "ulysses_degree", 1))
+        per_rank = (padded + degree - 1) // degree
+        if per_rank > limit:
+            raise OmniClientError(
+                f"MiniMax H3 latent_refine needs about {per_rank:,} packed tokens per Ulysses rank "
+                f"(limit {limit:,}); reduce the target size or duration, increase --usp, "
+                "or adjust latent_refine_max_tokens_per_rank for a validated deployment"
+            )
+
     def _refine_keyframe_condition(
         self,
         context: dict[str, Any],
@@ -2561,7 +2625,8 @@ class MiniMaxH3Pipeline(
     ) -> torch.Tensor:
         if target is None:
             return video_latent
-        return self.latent_upscaler.upscale(video_latent, target)
+        with self._component_on_device(self.latent_upscaler):
+            return self.latent_upscaler.upscale(video_latent, target)
 
     @staticmethod
     def _extract_prompt(raw_prompt: Any) -> tuple[str, dict[str, Any]]:
@@ -2879,6 +2944,18 @@ class MiniMaxH3Pipeline(
         num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)
         upscale_target = self._resolve_latent_upscale(extra, latent_h=height // 16, latent_w=width // 16)
         latent_refine = self._resolve_latent_refine(extra)
+        if latent_refine is not None:
+            self._validate_refine_token_budget(
+                task=task,
+                target=upscale_target,
+                latent_t=latent_t,
+                latent_h=height // 16,
+                latent_w=width // 16,
+                audio_t=audio_t,
+                text_len=int(text_embeddings.shape[0]),
+                keyframe_count=len(keyframe_frame_indices or ()),
+                ref_blocks=ref_blocks,
+            )
         return {
             "task": task,
             "latent_upscale": upscale_target,
