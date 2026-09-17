@@ -354,6 +354,16 @@ def test_the_upscale_stage_is_skipped_when_no_target_is_resolved():
     assert MiniMaxH3Pipeline._upscaled_latent(pipeline, latent, target).shape == (1, 24, 7, 68, 120)
 
 
+def test_the_network_upscales_two_single_frame_keyframe_latents():
+    upscaler = build_upscaler(TINY_ARCH, chunk_frames=0)
+    target = resolve_minimax_h3_latent_upscale_target(latent_height=4, latent_width=6, scale=2.0)
+
+    output = upscaler.upscale(torch.randn(2, 24, 1, 4, 6, dtype=torch.float64), target)
+
+    assert output.shape == (2, 24, 1, 8, 12)
+    assert torch.isfinite(output).all()
+
+
 def test_refine_preflight_rejects_observed_failing_per_rank_layouts():
     from vllm_omni.errors import OmniClientError
 
@@ -771,18 +781,12 @@ def test_the_hi_res_route_runs_a_shortened_pass_at_the_new_size(resize):
     assert torch.isfinite(refined_video).all()
 
 
-def test_refining_fl2va_re_encodes_the_keyframe_at_the_new_size():
-    """FL2VA condition rows are sized by the output latent, so they must move.
-
-    The packed layout derives the keyframe's row count from ``latent_h`` and
-    ``latent_w``; reusing the first pass's condition at a larger output size
-    would build a sequence whose condition block no longer matches its rows.
-    """
-    from PIL import Image
-
+def test_refining_fl2va_upscales_encoder_keyframes_once_at_the_new_size():
+    """The split encoder supplies base-size keyframe latents to the DiT stage."""
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.latent_upscaler import MiniMaxH3LatentRefineSpec
+    from vllm_omni.diffusion.models.minimax_h3.packed_tokens import minimax_h3_patchify_video_latent
 
     from .test_minimax_h3_step_execution import _SegmentMeanModel
 
@@ -792,15 +796,16 @@ def test_refining_fl2va_re_encodes_the_keyframe_at_the_new_size():
     pipeline.transformer = model
     pipeline._transformer_for_task = lambda task: model
 
-    encoded_sizes: list[tuple[int, int]] = []
+    keyframes = torch.arange(2 * 24 * 4 * 6, dtype=torch.float32).reshape(2, 24, 1, 4, 6)
+    upscale_calls = []
 
-    def fake_encode(images, prepared_videos, *, video_count):
-        encoded_sizes.extend((image.width, image.height) for image in images)
-        shapes = [(1, image.height // 16, image.width // 16) for image in images]
-        rows = sum(t * (h // 2) * (w // 2) for t, h, w in shapes)
-        return torch.zeros(rows, 96, dtype=torch.float32), shapes
+    def fake_upscale(latent, target):
+        upscale_calls.append(tuple(latent.shape))
+        return torch.nn.functional.interpolate(
+            latent, size=(1, target.latent_height, target.latent_width), mode="nearest"
+        )
 
-    pipeline._encode_visual_conditions = fake_encode
+    pipeline._upscaled_latent = fake_upscale
 
     # The first pass ran at 64x96 latent cells 4x6; the refine runs at 8x12.
     context = {
@@ -817,10 +822,11 @@ def test_refining_fl2va_re_encodes_the_keyframe_at_the_new_size():
         "num_steps": 11,
         "video_shift": 12.0,
         "audio_shift": 3.0,
-        "keyframe_frame_indices": [0],
+        "visual_condition": minimax_h3_patchify_video_latent(keyframes, patch_size=(1, 2, 2)),
+        "visual_condition_shapes": [(1, 4, 6), (1, 4, 6)],
+        "keyframe_frame_indices": [0, -1],
         "latent_refine": MiniMaxH3LatentRefineSpec(strength=0.5),
         "latent_upscale": resolve_minimax_h3_latent_upscale_target(latent_height=4, latent_width=6, scale=2.0),
-        "keyframe_images": [Image.new("RGB", (512, 512))],
     }
 
     for seed in (8, 9):
@@ -834,9 +840,14 @@ def test_refining_fl2va_re_encodes_the_keyframe_at_the_new_size():
         assert video_latent.shape == (1, 24, 2, 8, 12)
         assert audio_latent.shape == (2, 32, 3)
 
-    # 4x6 latent cells at 2x is 192x128 pixels, and the encode -- which
-    # broadcasts across the DiT group -- is shared by every output.
-    assert encoded_sizes == [(192, 128)]
+    # Both keyframes move together and the result is reused for each output.
+    assert upscale_calls == [(2, 24, 1, 4, 6)]
+    rows, shapes = context[mod._REFINE_KEYFRAME_CONDITION]
+    assert shapes == [(1, 8, 12), (1, 8, 12)]
+    torch.testing.assert_close(
+        rows,
+        minimax_h3_patchify_video_latent(fake_upscale(keyframes, context["latent_upscale"]), patch_size=(1, 2, 2)),
+    )
 
 
 def test_refining_ref2va_keeps_its_references_at_their_own_size():
