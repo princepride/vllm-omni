@@ -303,7 +303,7 @@ class MiniMaxH3LatentUpscaler(nn.Module):
         dtype: torch.dtype,
         latents_mean: Sequence[float],
         latents_std: Sequence[float],
-        chunk_frames: int = 32,
+        chunk_frames: int = 0,
         chunk_overlap: int | None = None,
         resident: bool = False,
     ) -> None:
@@ -327,6 +327,12 @@ class MiniMaxH3LatentUpscaler(nn.Module):
         self.chunk_overlap = resizer.temporal_kernel if chunk_overlap is None else chunk_overlap
         self.resident = resident
         self.resizer.to(device if resident else torch.device("cpu"))
+
+    def load_to_device(self) -> None:
+        self.resizer.to(self.device)
+
+    def offload_to_cpu(self) -> None:
+        self.resizer.to(torch.device("cpu"))
 
     @torch.inference_mode()
     def upscale(self, latent: torch.Tensor, target: MiniMaxH3LatentUpscaleTarget) -> torch.Tensor:
@@ -485,7 +491,7 @@ def load_minimax_h3_latent_upscaler(
     dtype: torch.dtype,
     latents_mean: Sequence[float],
     latents_std: Sequence[float],
-    chunk_frames: int = 32,
+    chunk_frames: int = 0,
     chunk_overlap: int | None = None,
     resident: bool = False,
 ) -> MiniMaxH3LatentUpscaler:
@@ -558,7 +564,7 @@ def resolve_minimax_h3_latent_upscaler(
         dtype=dtype,
         latents_mean=latents_mean,
         latents_std=latents_std,
-        chunk_frames=int(additional.get("latent_upscaler_chunk_frames", 32)),
+        chunk_frames=int(additional.get("latent_upscaler_chunk_frames", 0)),
         resident=bool(additional.get("latent_upscaler_resident", False)),
     )
 
