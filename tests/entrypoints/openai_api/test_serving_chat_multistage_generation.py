@@ -123,6 +123,57 @@ def test_build_multistage_generation_inputs_leaves_mm_uuids_to_content_hash(serv
         assert "multi_modal_uuids" not in engine_prompt
 
 
+def test_sequential_image_requests_do_not_reuse_other_image_cache(serving_chat):
+    """Different images miss the real vLLM cache; repeating one still hits."""
+    import torch
+    from vllm.config.multimodal import MultiModalConfig, _get_mm_hasher_algorithm
+    from vllm.multimodal.cache import MultiModalProcessorOnlyCache
+    from vllm.multimodal.inputs import MultiModalBatchedField, MultiModalFieldElem, MultiModalKwargsItem
+    from vllm.multimodal.parse import MultiModalDataParser, parse_mm_uuids
+    from vllm.multimodal.processing import ProcessorInputs
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[SamplingParams(temperature=0.0), OmniDiffusionSamplingParams()],
+    )
+    config = SimpleNamespace(get_multimodal_config=lambda: MultiModalConfig(mm_processor_cache_gb=0.01))
+    cache = MultiModalProcessorOnlyCache(config)
+    parser = MultiModalDataParser()
+    hits = []
+    returned_pixels = []
+    expected_pixels = []
+    for color in ("red", "blue", "red"):
+        image = Image.new("RGB", (32, 32), color)
+        prompt, _ = serving_chat._build_multistage_generation_inputs(
+            engine=engine,
+            prompt="Change the animal's fur color while preserving its identity.",
+            extra_body={"bot_task": "think"},
+            reference_images=[image],
+            gen_params=OmniDiffusionSamplingParams(height=1024, width=1024, seed=42),
+        )
+        inputs = ProcessorInputs(
+            prompt=[],
+            mm_data_items=parser.parse_mm_data(prompt["multi_modal_data"]),
+            mm_uuid_items=parse_mm_uuids(prompt.get("multi_modal_uuids")),
+            hf_processor_mm_kwargs=prompt["mm_processor_kwargs"],
+        )
+        image_hash = inputs.get_mm_hashes("test-model", _get_mm_hasher_algorithm())["image"][0]
+        hit = cache.is_cached_item(image_hash)
+        hits.append(hit)
+        pixels = torch.tensor(list(image.getpixel((0, 0))), dtype=torch.uint8)
+        expected_pixels.append(pixels)
+        item = MultiModalKwargsItem(pixel_values=MultiModalFieldElem(data=pixels, field=MultiModalBatchedField()))
+        cached_item, _ = cache.get_and_update_item(None if hit else (item, []), image_hash)
+        returned_pixels.append(cached_item["pixel_values"].data)
+
+    for actual, expected in zip(returned_pixels, expected_pixels):
+        torch.testing.assert_close(actual, expected)
+    assert hits == [False, False, True]
+
+
 def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(serving_chat):
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
