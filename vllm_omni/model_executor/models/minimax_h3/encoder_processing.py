@@ -218,7 +218,10 @@ def _resolve_task(
     requested = extra_args.get("task")
     if requested is not None:
         return str(requested).lower()
-    if multi_modal_data.get("video") is not None or multi_modal_data.get("audio") is not None:
+    has_reference_audio = (
+        multi_modal_data.get("audio") is not None and extra_args.get("audio_mode", "native") != "lock_source"
+    )
+    if multi_modal_data.get("video") is not None or has_reference_audio:
         return "ref2va"
     if multi_modal_data.get("image") is not None:
         return "fl2va"

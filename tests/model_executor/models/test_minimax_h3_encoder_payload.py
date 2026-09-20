@@ -538,7 +538,6 @@ def test_driving_audio_is_not_a_short_reference_and_survives_stage_transport():
         height=64,
         fps=24,
         extra_args={
-            "task": "t2va",
             "aspect_ratio": "1:1",
             "duration": 20,
             "long_video": True,
@@ -549,6 +548,7 @@ def test_driving_audio_is_not_a_short_reference_and_survives_stage_transport():
         {"prompt": "A singer", "multi_modal_data": {"audio": (torch.zeros(75 * 800), 800)}}, sampling
     )
     media = MiniMaxH3EncoderMediaInput.from_mm_tensors(prepared.media.to_mm_tensors(), prepared.media.to_metadata())
+    assert media.task == "t2va"
     assert media.audio_mode == "lock_source"
     assert prepared.condition_labels == []
 
@@ -560,3 +560,32 @@ def test_driving_audio_is_not_a_short_reference_and_survives_stage_transport():
     conditioning = processing.encode_media(media, video_vae=None, audio_vae=audio_vae, emit_conditioning=True)
     assert conditioning.audio_condition_lengths == (3000,)
     assert conditioning.ref_blocks == ()
+
+
+def test_driving_audio_does_not_override_fl2va_task_inference():
+    from PIL import Image
+
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_executor.models.minimax_h3 import encoder_processing as processing
+
+    sampling = OmniDiffusionSamplingParams(
+        width=64,
+        height=64,
+        fps=24,
+        num_frames=124,
+        extra_args={"audio_mode": "lock_source"},
+    )
+    prepared = processing.prepare_encoder_inputs(
+        {
+            "prompt": "A singer",
+            "multi_modal_data": {
+                "image": Image.new("RGB", (256, 256)),
+                "audio": (torch.zeros(5 * 800), 800),
+            },
+        },
+        sampling,
+    )
+
+    assert prepared.media.task == "fl2va"
+    assert prepared.media.audio_mode == "lock_source"
+    assert prepared.condition_labels == [("image", 1)]

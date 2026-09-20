@@ -282,15 +282,44 @@ def test_encoder_task_validation_and_transformer_routing():
     assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
     assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
     assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "t2va"
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"image": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "fl2va"
+    )
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"video": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "ref2va"
+    )
     fl2v_spec = _turbo_spec("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors")
     ref2v_spec = _turbo_spec("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors")
     assert pipeline._resolve_task("fl2va", {"image": object()}, turbo_spec=fl2v_spec) == "fl2va"
     with pytest.raises(OmniClientError, match="serves"):
         pipeline._resolve_task("ref2va", {}, turbo_spec=fl2v_spec)
     assert pipeline._resolve_task("ref2va", {"image": object()}, turbo_spec=ref2v_spec) == "ref2va"
+    pipeline.partition = "fl2va"
+    pipeline.supported_tasks = frozenset({"t2va", "fl2va"})
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "t2va"
+    assert (
+        pipeline._resolve_task(
+            None,
+            {"image": object(), "audio": object()},
+            audio_mode="lock_source",
+        )
+        == "fl2va"
+    )
     pipeline.partition = "ref2va"
     pipeline.supported_tasks = frozenset({"ref2va"})
     assert pipeline._resolve_task("ref2va") == "ref2va"
+    assert pipeline._resolve_task(None, {"audio": object()}, audio_mode="lock_source") == "ref2va"
 
     pipeline.partition = "combined"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})

@@ -1180,6 +1180,7 @@ class MiniMaxH3Pipeline(
         requested: str | None,
         multi_modal_data: dict[str, Any] | None = None,
         *,
+        audio_mode: str = "native",
         turbo_spec: TurboSpec | None = None,
         has_native_lora: bool = False,
     ) -> str:
@@ -1189,7 +1190,9 @@ class MiniMaxH3Pipeline(
             # historical implicit default even for image-only references.
             if self.partition == "ref2va":
                 requested = "ref2va"
-            elif multi_modal_data.get("video") is not None or multi_modal_data.get("audio") is not None:
+            elif multi_modal_data.get("video") is not None or (
+                multi_modal_data.get("audio") is not None and audio_mode != "lock_source"
+            ):
                 requested = "ref2va"
             elif multi_modal_data.get("image") is not None:
                 requested = "fl2va"
@@ -2199,6 +2202,7 @@ class MiniMaxH3Pipeline(
                 task = self._resolve_task(
                     (sampling.extra_args or {}).get("task"),
                     multi_modal_data,
+                    audio_mode=(sampling.extra_args or {}).get("audio_mode", "native"),
                     turbo_spec=turbo_spec,
                     has_native_lora=has_native_lora,
                 )
