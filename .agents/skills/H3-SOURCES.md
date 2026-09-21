@@ -20,9 +20,10 @@ workflows and templates belongs to MiniMax-AI and the upstream contributors.
   the upstream workflows. Their reference documents retain the relevant creative
   methods while removing host-specific execution assumptions.
 - The two `co-op-game-intro-generator/references/` templates retain the upstream
-  creative templates with an added portable contract and explicit user overrides.
-  The video template also removes an unrequested gender restriction and a fixed
-  yellow/black environment transformation.
+  creative structure with an added portable contract and explicit user overrides.
+  Their instructions are normalized to English while exact visible UI strings
+  remain unchanged. The video template also removes an unrequested gender
+  restriction and a fixed yellow/black environment transformation.
 - The five 3D animation references are condensed adaptations of their upstream
   counterparts: shot table, storyboards, model selection, fallback, and review.
 - Product, papercraft, collage, and music references extract reusable direction

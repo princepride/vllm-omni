@@ -34,112 +34,185 @@ The video prompt must not blindly preserve the source prompt's default style. It
 - {height_ref}: body comparison anchor. Lock the visible contrast between the two players and prevent identical body proportions.
 
 ## Global style baseline
-整体画风必须优先服从用户选择：{visual_style}。
-保留固定基准：游戏主菜单 UI、高品质游戏宣传片质感、UI 与角色深度融合、现代商业游戏 UI 设计、极强视觉冲击力、画面简洁干净、避免过度装饰。
-其余视觉层面根据 {visual_style} 动态拓展：角色画风、表情气质、服装语言、色彩系统、灯光冷暖、UI材质、按钮图标、字体质感、城市加载后的世界风格。
+The overall art direction must prioritize the user's selected {visual_style}.
+Preserve these fixed qualities: a game main-menu interface, premium game-trailer
+finish, deep integration between the UI and characters, modern commercial game
+UI design, strong visual impact, clean composition, and restrained decoration.
+Derive the remaining visual treatment from {visual_style}: character rendering,
+expressions, costume language, color system, lighting temperature, UI materials,
+button icons, typography texture, and the world revealed after loading.
 
 ## Palette system
-根据 {visual_style} 推导视频全程色彩，但必须保持 UI 色彩联动：
-- xx 色作为主体背景 / 世界主色
-- xx 色作为 UI 主体颜色
-- xx 色作为文字颜色
-- xx 色作为功能强调色
-- 红色作为危险/退出/警示提示色
-- 整体颜色控制在 5 种以内
-- 高对比撞色、鲜明现代、符合 {visual_style} 的色彩语言
+Derive the complete video palette from {visual_style}, with linked UI colors:
 
-视频中的菜单、装备面板、玩家卡、按钮、HUD、加载条、图标和文字都必须沿用同一色彩系统，不得随机新增无关颜色。
+- Use xx as the primary background and world color.
+- Use xx as the main UI color.
+- Use xx as the text color.
+- Use xx as the functional accent color.
+- Reserve red for danger, exit, and warning states.
+- Limit the complete palette to five colors.
+- Use a vivid, modern, high-contrast color language consistent with
+  {visual_style}.
+
+Menus, equipment panels, player cards, buttons, the HUD, loading bars, icons,
+and text must share this color system. Do not introduce unrelated colors.
 
 ## Character identity and style lock
-PLAYER 1：五官信息参考 {player1_ref}，必须保留脸、人脸比例、发型、眼镜（如有）、个人身份和 {player1_name} 昵称对应关系。表情、画风、服装和机械装备的视觉处理根据 {visual_style} 动态优化。PLAYER 1 始终位于左侧，偏高挑/修长/敏捷，装备色为功能强调色，机械爪轻量、纤细、灵活。
+PLAYER 1 follows the facial identity in {player1_ref}. Preserve the face,
+facial proportions, hairstyle, glasses when present, personal identity, and the
+mapping to the nickname {player1_name}. Adapt expression, rendering, clothing,
+and mechanical equipment to {visual_style}. PLAYER 1 always stays on the left,
+with a taller, slender, agile build. Equipment uses the functional accent color,
+and the mechanical claw is light, narrow, and flexible.
 
-PLAYER 2：五官信息参考 {player2_ref}，必须保留脸、人脸比例、发型、个人身份和 {player2_name} 昵称对应关系。表情、画风、服装和机械装备的视觉处理根据 {visual_style} 动态优化。PLAYER 2 始终位于右侧，偏矮壮/宽厚/力量型，装备色为琥珀红或与危险/力量提示一致的暖色，机械拳厚重、宽大、有重量。
+PLAYER 2 follows the facial identity in {player2_ref}. Preserve the face,
+facial proportions, hairstyle, personal identity, and the mapping to the
+nickname {player2_name}. Adapt expression, rendering, clothing, and mechanical
+equipment to {visual_style}. PLAYER 2 always stays on the right, with a shorter,
+broader, power-oriented build. Equipment uses amber-red or another warm color
+consistent with danger and strength cues, and the mechanical fist is broad,
+heavy, and visibly weighty.
 
-禁止角色身份交换、脸部互相融合、昵称交换、两人体型趋同。
+Do not swap character identities, merge faces, swap nicknames, or converge the
+two body types.
 
 ## Fixed timeline framework
 
-### [0秒–2秒] — 双人主菜单
-景别/机位：高角度俯拍大全景，延续 {ui_ref} 的构图逻辑。镜头从上方轻微下压并缓慢推进。
+### [0-2 seconds] - Two-player main menu
 
-画面内容：PLAYER 1（{player1_name}）和 PLAYER 2（{player2_name}）并排坐在画面中央，PLAYER 1 在左，PLAYER 2 在右，抬头看向摄像机。两人只有自然呼吸、眨眼和轻微身体动作。
+Composition and camera: A high-angle extreme wide shot follows the composition
+logic of {ui_ref}. The camera tilts slightly downward and slowly pushes in.
 
-UI结构：左上角玩家资料卡准确显示：
-“PLAYER 1”
-“{player1_name}”
-“READY”
-顶部中央或左上双卡系统中的第二张资料卡准确显示：
-“PLAYER 2”
-“{player2_name}”
-“READY”
-右侧纵向菜单准确显示：
-“START NEW GAME”
-“CONTINUE”
-“SETTINGS”
-“EXIT GAME”
-“CONTINUE”是视觉中心和主高亮按钮。
+Visuals: PLAYER 1 ({player1_name}) and PLAYER 2 ({player2_name}) sit side by
+side at the center. PLAYER 1 remains on the left and PLAYER 2 on the right. They
+look up toward the camera with only natural breathing, blinking, and subtle body
+movement.
 
-动态风格填充：主菜单背景、地面纹理、按钮形态、图标、字体、边框、辉光和贴纸质感全部根据 {visual_style} 优化，但保留 {ui_ref} 的布局和层级。
+UI: The upper-left player card displays exactly `PLAYER 1`, `{player1_name}`,
+and `READY`. The second card in the upper-center or upper-left two-card system
+displays exactly `PLAYER 2`, `{player2_name}`, and `READY`. The vertical menu on
+the right displays exactly `START NEW GAME`, `CONTINUE`, `SETTINGS`, and
+`EXIT GAME`. `CONTINUE` is the visual center and primary highlighted button.
 
-声音：菜单环境音、轻微 UI hover 声、点击前的低频电子氛围。若生成无音频，则忽略声音执行。
+Dynamic style fill: Adapt the menu background, ground texture, button shapes,
+icons, typography, borders, glow, and sticker treatment to {visual_style}, while
+preserving the layout and hierarchy in {ui_ref}.
 
-### [2秒–4秒] — PLAYER 1 右臂配置
-景别/机位：中景，镜头从主菜单平滑推近 PLAYER 1 的右臂，PLAYER 2 仍在背景中可见，不消失、不变形。
+Sound: Menu ambience, subtle UI-hover sounds, and a low electronic atmosphere
+before the click. Ignore this direction when generating silent video.
 
-UI结构：右侧主菜单收缩滑出；带功能强调色识别线的 UI 面板从左侧滑入，准确显示：“PLAYER 1”“RIGHT ARM EQUIPMENT”。装备列表中先高亮“PHANTOM GRIP”，随后选区移动至“CHRONOS CLAW”。
+### [2-4 seconds] - PLAYER 1 right-arm configuration
 
-动作：PLAYER 1 的右袖口自动打开，轻量机械结构从前臂下方展开。手指分开，修长爪状指节滑入并逐一锁定，内部短暂露出精细线路、微型活塞和金属连接件。配置完成后，功能强调色 LED 依次亮起。
+Composition and camera: In a medium shot, the camera pushes smoothly from the
+main menu toward PLAYER 1's right arm. PLAYER 2 remains visible and stable in the
+background.
 
-动态风格填充：机械结构、UI面板材质、图标、线条、锁定动画和光效根据 {visual_style} 优化，但必须轻量、精密、灵活，符合 PLAYER 1 身形，不改变脸、发型和服装主体。
+UI: The right-side menu contracts and slides away. A panel with functional-accent
+guide lines slides in from the left and displays exactly `PLAYER 1` and
+`RIGHT ARM EQUIPMENT`. The equipment list first highlights `PHANTOM GRIP`, then
+moves the selection to `CHRONOS CLAW`.
 
-声音：精密机械展开声、轻快 UI 切换音、细小锁定声。
+Action: PLAYER 1's right cuff opens automatically and a lightweight mechanism
+unfolds beneath the forearm. The fingers spread as long claw-like joints slide
+into position and lock one by one, briefly revealing fine wiring, miniature
+pistons, and metal connectors. Functional-accent LEDs illuminate sequentially
+when configuration completes.
 
-### [4秒–7秒] — PLAYER 2 重型手臂配置
-景别/机位：中景，摄影机沿两人之间平滑横移并绕向 PLAYER 2 左侧。PLAYER 1 留在背景中，轻轻观察自己完成配置的机械手。
+Dynamic style fill: Adapt the mechanism, panel material, icons, lines, locking
+animation, and light effects to {visual_style}. Keep the result light, precise,
+and flexible, proportioned to PLAYER 1 without changing the face, hairstyle, or
+main clothing design.
 
-UI结构：新的暖色/琥珀红识别 UI 滑入，准确显示：“PLAYER 2”“ARMAMENT CUSTOMIZATION”。面板以网格形式展示：
-“HAND”
-“FOREARM”
-“ELBOW”
-“UPPER ARM”
-选区快速但清晰地在四个组件之间切换。
+Sound: Precise mechanical unfolding, light UI switching tones, and small locking
+clicks.
 
-动作：PLAYER 2 左臂外套袖口分段打开，厚重前臂护板向外弹开，旧组件脱离，新型装甲沿导轨滑入；肘关节替换为厚实机械轴承，宽大的机械手重新组合并锁定。更换过程中短暂露出粗壮线路、液压活塞和深色金属骨架。每个部件锁定时亮起低调暖色指示灯。
+### [4-7 seconds] - PLAYER 2 heavy-arm configuration
 
-动态风格填充：重型机械臂、UI面板、组件图标、材质、光效根据 {visual_style} 优化，但必须厚重、宽大、有力量感，与 PLAYER 1 的轻量机械爪形成清晰对比。
+Composition and camera: A medium shot tracks smoothly between the players and
+arcs toward PLAYER 2's left side. PLAYER 1 remains in the background, quietly
+examining the configured mechanical hand.
 
-声音：低沉电机声、重型机械扣合声、厚重锁定反馈。
+UI: A warm or amber-red panel slides in and displays exactly `PLAYER 2` and
+`ARMAMENT CUSTOMIZATION`. Its grid contains `HAND`, `FOREARM`, `ELBOW`, and
+`UPPER ARM`, with the selection moving quickly but legibly through all four.
 
-### [7秒–8.5秒] — 双人确认配置
-景别/机位：中景拉回，镜头平滑回到双人构图，PLAYER 1 左侧，PLAYER 2 右侧。
+Action: PLAYER 2's left sleeve opens in sections. Heavy forearm plates spring
+outward, the previous components detach, and new armor slides into place along
+guide rails. A thick mechanical bearing replaces the elbow joint, and the broad
+mechanical hand reassembles and locks. Thick wiring, hydraulic pistons, and a
+dark metal skeleton appear briefly during the replacement. A restrained warm
+indicator illuminates as each component locks.
 
-UI结构：两组装备面板向画面中央汇合，形成共享按钮，准确显示：“CONFIRM CONFIG”。按钮边框、辉光、图标和贴纸质感根据 {visual_style} 优化，但层级清晰、文字可读。
+Dynamic style fill: Adapt the heavy arm, UI panel, component icons, materials,
+and light effects to {visual_style}. Keep it broad, weighty, and powerful, in
+clear contrast with PLAYER 1's lightweight claw.
 
-动作：光标点击按钮，功能强调色能量脉冲流过 PLAYER 1 的机械爪，暖色/琥珀红能量脉冲流过 PLAYER 2 的机械拳。所有 UI 面板快速向内收缩并消失。两人同时解开交叉的双腿并调整坐姿：PLAYER 1 轻盈抬起单膝，修长机械爪依次活动手指；PLAYER 2 一只脚稳稳踩地，厚重机械拳缓慢握紧。
+Sound: Low motor movement, heavy mechanical engagement, and weighty locking
+feedback.
 
-声音：确认提示音、双色能量脉冲、UI 收缩声。
+### [7-8.5 seconds] - Shared configuration confirmation
 
-### [8.5秒–10秒] — 双人世界加载
-景别/机位：全景，底部共享加载条出现。
+Composition and camera: Pull back smoothly to a medium two-player composition,
+with PLAYER 1 on the left and PLAYER 2 on the right.
 
-UI结构：加载条准确显示：“LOADING”。进度从 0% 快速填充至 100%。左半段使用 PLAYER 1 的功能强调色，右半段使用 PLAYER 2 的暖色/力量色。HUD 和加载条的形态、边框、纹理、字体根据 {visual_style} 优化，但必须清晰可读。
+UI: The two equipment panels converge at center to form a shared button that
+displays exactly `CONFIRM CONFIG`. Adapt its border, glow, icon, and sticker
+treatment to {visual_style}, while keeping the hierarchy and text legible.
 
-环境转化：从已确认的 {visual_style} 菜单背景连续转化为同风格的游戏世界。把菜单的装饰条、色块和图案转化为场景中对应的道路、结构或环境元素；配色沿用已确认的色彩系统，不固定使用黄色、黑色或赛博朋克城市。
+Action: The cursor clicks the button. A functional-accent energy pulse travels
+through PLAYER 1's mechanical claw, while a warm or amber-red pulse travels
+through PLAYER 2's fist. All UI panels contract inward and disappear. Both
+players uncross their legs and adjust their posture: PLAYER 1 lifts one knee
+lightly and articulates the claw fingers in sequence; PLAYER 2 plants one foot
+firmly and slowly closes the heavy fist.
 
-关键约束：转化必须连续自然，不使用硬切，不用烟雾遮挡，不改变两位角色身份。
+Sound: Confirmation tone, two-color energy pulses, and UI contraction.
 
-声音：加载上升音、环境从菜单氛围过渡到城市氛围。
+### [8.5-10 seconds] - Shared world loading
 
-### [10秒–15秒] — 双人进入游戏世界
-景别/机位：大全景转第三人称跟拍。加载 100% 的瞬间，两名角色同时起身。摄影机平滑下降并绕到两人身后，变成稳定第三人称双人合作视角。
+Composition and camera: A wide shot reveals a shared loading bar at the bottom.
 
-世界风格：完整游戏世界根据 {visual_style} 动态生成。保留游戏开场进入世界的结构：密集建筑、道路、标志灯、招牌、人群或动态背景、快速经过的载具、电线、工业管道、远处城市天际线。具体世界材质、建筑形态、招牌设计、光影和动效必须服从 {visual_style}，不要让源默认赛博朋克风格压过用户选择，除非用户选择的是赛博朋克。
+UI: The loading bar displays exactly `LOADING` and fills rapidly from 0% to 100%.
+Its left half uses PLAYER 1's functional accent and its right half uses PLAYER
+2's warm power color. Adapt the HUD and loading-bar shape, border, texture, and
+typography to {visual_style}, while keeping them legible.
 
-角色关系：清楚展示两人的背影和体型差异：PLAYER 1 左侧，高挑修长，轻量机械爪自然垂下；PLAYER 2 右侧，矮壮宽厚，重型机械拳微微抬起。PLAYER 1 率先迈步，PLAYER 2 紧随其后，两人并肩进入街道。
+Environment transformation: Continuously transform the confirmed
+{visual_style} menu background into a game world in the same style. Menu strips,
+color blocks, and patterns become corresponding roads, structures, and world
+elements. Preserve the confirmed palette rather than forcing a yellow-and-black
+or cyberpunk city.
 
-HUD结构：HUD 淡入。右上角出现小地图；左下角出现两组独立状态栏：“{player1_name}”“{player2_name}”。{player1_name} 状态栏使用 PLAYER 1 功能强调色，{player2_name} 状态栏使用 PLAYER 2 暖色/力量色。前方街道中央出现共享任务标记。
+Key constraint: The transformation remains continuous and natural, with no hard
+cut, smoke occlusion, or identity change.
 
-声音：城市环境氛围、远处载具声、脚步声、HUD 淡入提示音。
+Sound: Rising loading tone and an ambience transition from menu to game world.
+
+### [10-15 seconds] - Two-player world entry
+
+Composition and camera: Move from an extreme wide shot into a third-person
+tracking view. At 100% loading, both characters stand simultaneously. The camera
+descends smoothly and arcs behind them into a stable two-player cooperative view.
+
+World style: Generate the complete world from {visual_style}. Preserve the game
+opening structure: dense buildings, roads, signal lights, signs, crowds or other
+moving background elements, passing vehicles, overhead wires, industrial pipes,
+and a distant skyline. Materials, architecture, signage, lighting, and motion
+must follow {visual_style}. Do not let the source template's cyberpunk default
+override the user unless the selected style is cyberpunk.
+
+Character relationship: Clearly show the players from behind and preserve their
+body contrast. PLAYER 1 is on the left, tall and slender, with the lightweight
+claw hanging naturally. PLAYER 2 is on the right, shorter and broader, with the
+heavy fist slightly raised. PLAYER 1 steps forward first, PLAYER 2 follows, and
+they enter the street side by side.
+
+HUD: The HUD fades in. A mini-map appears in the upper right. Separate status
+bars labeled `{player1_name}` and `{player2_name}` appear in the lower left.
+The first uses PLAYER 1's functional accent; the second uses PLAYER 2's warm
+power color. A shared objective marker appears in the street ahead.
+
+Sound: City ambience, distant vehicles, footsteps, and a HUD fade-in cue.
 
 ## Negative constraints
 No extra player, duplicated character, identity or username swapping, merged bodies, unintended face/hair changes, missing player, unrequested split screen or cuts, random camera shake, floating body parts, gruesome dismemberment, unwanted weapons, style-incompatible neon, unreadable UI, random letters, misspelled usernames, extra menu options, copied game logo, or watermark. Preserve the user's chosen character designs and palette.
