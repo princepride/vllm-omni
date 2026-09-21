@@ -12,6 +12,33 @@ format before rendering; preserve exact visible UI strings in the user's languag
 Use available tools and the actual backend's parameter schema. Audio directions
 describe desired content rather than asserting that a particular API supports it.
 
+## Template completion
+
+Resolve the palette variables `{background_color}`, `{ui_color}`, `{text_color}`,
+`{functional_accent_color}`, and `{power_accent_color}` from the selected style.
+Keep the five values distinct enough for readable UI contrast. Use the power
+accent for danger, exit, and warning states unless the user supplies a separate
+semantic-color requirement.
+
+Fill visible copy in the user's requested language. The following English values
+are defaults only, not mandatory output:
+
+- `{player1_label}` / `{player2_label}`: `PLAYER 1` / `PLAYER 2`
+- `{ready_label}`: `READY`
+- `{start_label}`, `{continue_label}`, `{settings_label}`, `{exit_label}`:
+  `START NEW GAME`, `CONTINUE`, `SETTINGS`, `EXIT GAME`
+- `{player1_equipment_label}`: `RIGHT ARM EQUIPMENT`
+- `{player1_option_a}` / `{player1_option_b}`: `PHANTOM GRIP` / `CHRONOS CLAW`
+- `{player2_equipment_label}`: `ARMAMENT CUSTOMIZATION`
+- `{hand_label}`, `{forearm_label}`, `{elbow_label}`, `{upper_arm_label}`:
+  `HAND`, `FOREARM`, `ELBOW`, `UPPER ARM`
+- `{confirm_label}` / `{loading_label}`: `CONFIRM CONFIG` / `LOADING`
+
+Before compiling the rendering prompt, search the filled template for every
+remaining token enclosed in braces. Replace required values. For an absent optional
+reference, remove its binding and rewrite every dependent clause as a text-only
+constraint. Do not dispatch a prompt while any template token remains.
+
 ## Prompt principle
 Use the same method as the GPT confirmation-image prompt:
 
@@ -45,11 +72,12 @@ button icons, typography texture, and the world revealed after loading.
 ## Palette system
 Derive the complete video palette from {visual_style}, with linked UI colors:
 
-- Use xx as the primary background and world color.
-- Use xx as the main UI color.
-- Use xx as the text color.
-- Use xx as the functional accent color.
-- Reserve red for danger, exit, and warning states.
+- Use {background_color} as the primary background and world color.
+- Use {ui_color} as the main UI color.
+- Use {text_color} as the text color.
+- Use {functional_accent_color} as PLAYER 1's functional accent color.
+- Use {power_accent_color} as PLAYER 2's power accent and for danger, exit,
+  and warning states.
 - Limit the complete palette to five colors.
 - Use a vivid, modern, high-contrast color language consistent with
   {visual_style}.
@@ -69,9 +97,8 @@ PLAYER 2 follows the facial identity in {player2_ref}. Preserve the face,
 facial proportions, hairstyle, personal identity, and the mapping to the
 nickname {player2_name}. Adapt expression, rendering, clothing, and mechanical
 equipment to {visual_style}. PLAYER 2 always stays on the right, with a shorter,
-broader, power-oriented build. Equipment uses amber-red or another warm color
-consistent with danger and strength cues, and the mechanical fist is broad,
-heavy, and visibly weighty.
+broader, power-oriented build. Equipment uses {power_accent_color}, and the
+mechanical fist is broad, heavy, and visibly weighty.
 
 Do not swap character identities, merge faces, swap nicknames, or converge the
 two body types.
@@ -88,11 +115,13 @@ side at the center. PLAYER 1 remains on the left and PLAYER 2 on the right. They
 look up toward the camera with only natural breathing, blinking, and subtle body
 movement.
 
-UI: The upper-left player card displays exactly `PLAYER 1`, `{player1_name}`,
-and `READY`. The second card in the upper-center or upper-left two-card system
-displays exactly `PLAYER 2`, `{player2_name}`, and `READY`. The vertical menu on
-the right displays exactly `START NEW GAME`, `CONTINUE`, `SETTINGS`, and
-`EXIT GAME`. `CONTINUE` is the visual center and primary highlighted button.
+UI: The upper-left player card displays `{player1_label}`, `{player1_name}`, and
+`{ready_label}` exactly as filled. The second card in the upper-center or
+upper-left two-card system displays `{player2_label}`, `{player2_name}`, and
+`{ready_label}` exactly as filled. The vertical menu on the right displays
+`{start_label}`, `{continue_label}`, `{settings_label}`, and `{exit_label}`
+exactly as filled. `{continue_label}` is the visual center and primary
+highlighted button.
 
 Dynamic style fill: Adapt the menu background, ground texture, button shapes,
 icons, typography, borders, glow, and sticker treatment to {visual_style}, while
@@ -108,9 +137,10 @@ main menu toward PLAYER 1's right arm. PLAYER 2 remains visible and stable in th
 background.
 
 UI: The right-side menu contracts and slides away. A panel with functional-accent
-guide lines slides in from the left and displays exactly `PLAYER 1` and
-`RIGHT ARM EQUIPMENT`. The equipment list first highlights `PHANTOM GRIP`, then
-moves the selection to `CHRONOS CLAW`.
+guide lines slides in from the left and displays `{player1_label}` and
+`{player1_equipment_label}` exactly as filled. The equipment list first
+highlights `{player1_option_a}`, then moves the selection to
+`{player1_option_b}`.
 
 Action: PLAYER 1's right cuff opens automatically and a lightweight mechanism
 unfolds beneath the forearm. The fingers spread as long claw-like joints slide
@@ -132,9 +162,10 @@ Composition and camera: A medium shot tracks smoothly between the players and
 arcs toward PLAYER 2's left side. PLAYER 1 remains in the background, quietly
 examining the configured mechanical hand.
 
-UI: A warm or amber-red panel slides in and displays exactly `PLAYER 2` and
-`ARMAMENT CUSTOMIZATION`. Its grid contains `HAND`, `FOREARM`, `ELBOW`, and
-`UPPER ARM`, with the selection moving quickly but legibly through all four.
+UI: A {power_accent_color} panel slides in and displays `{player2_label}` and
+`{player2_equipment_label}` exactly as filled. Its grid contains `{hand_label}`,
+`{forearm_label}`, `{elbow_label}`, and `{upper_arm_label}`, with the selection
+moving quickly but legibly through all four.
 
 Action: PLAYER 2's left sleeve opens in sections. Heavy forearm plates spring
 outward, the previous components detach, and new armor slides into place along
@@ -156,11 +187,11 @@ Composition and camera: Pull back smoothly to a medium two-player composition,
 with PLAYER 1 on the left and PLAYER 2 on the right.
 
 UI: The two equipment panels converge at center to form a shared button that
-displays exactly `CONFIRM CONFIG`. Adapt its border, glow, icon, and sticker
-treatment to {visual_style}, while keeping the hierarchy and text legible.
+displays `{confirm_label}` exactly as filled. Adapt its border, glow, icon, and
+sticker treatment to {visual_style}, while keeping the hierarchy and text legible.
 
 Action: The cursor clicks the button. A functional-accent energy pulse travels
-through PLAYER 1's mechanical claw, while a warm or amber-red pulse travels
+through PLAYER 1's mechanical claw, while a {power_accent_color} pulse travels
 through PLAYER 2's fist. All UI panels contract inward and disappear. Both
 players uncross their legs and adjust their posture: PLAYER 1 lifts one knee
 lightly and articulates the claw fingers in sequence; PLAYER 2 plants one foot
@@ -172,10 +203,10 @@ Sound: Confirmation tone, two-color energy pulses, and UI contraction.
 
 Composition and camera: A wide shot reveals a shared loading bar at the bottom.
 
-UI: The loading bar displays exactly `LOADING` and fills rapidly from 0% to 100%.
-Its left half uses PLAYER 1's functional accent and its right half uses PLAYER
-2's warm power color. Adapt the HUD and loading-bar shape, border, texture, and
-typography to {visual_style}, while keeping them legible.
+UI: The loading bar displays `{loading_label}` exactly as filled and fills
+rapidly from 0% to 100%. Its left half uses {functional_accent_color} and its
+right half uses {power_accent_color}. Adapt the HUD and loading-bar shape,
+border, texture, and typography to {visual_style}, while keeping them legible.
 
 Environment transformation: Continuously transform the confirmed
 {visual_style} menu background into a game world in the same style. Menu strips,
@@ -209,8 +240,8 @@ they enter the street side by side.
 
 HUD: The HUD fades in. A mini-map appears in the upper right. Separate status
 bars labeled `{player1_name}` and `{player2_name}` appear in the lower left.
-The first uses PLAYER 1's functional accent; the second uses PLAYER 2's warm
-power color. A shared objective marker appears in the street ahead.
+The first uses {functional_accent_color}; the second uses {power_accent_color}.
+A shared objective marker appears in the street ahead.
 
 Sound: City ambience, distant vehicles, footsteps, and a HUD fade-in cue.
 

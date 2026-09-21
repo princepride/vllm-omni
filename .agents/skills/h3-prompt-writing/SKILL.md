@@ -11,8 +11,8 @@ metadata:
 
 0. Read [portable-workflow.md](references/portable-workflow.md) for scope, available tools, durable artifacts, and generation handoff. For prompt-only work, no generation tools are required.
 1. Identify the input mode: T2VA, I2VA, FL2VA, L2VA, or full-reference Ref2VA.
-2. For base text/keyframe modes, read `references/base-en.txt` and follow its final prompt structure.
-3. For full-reference mode, read `references/ref-en.txt` and follow its six-section rewrite format.
+2. For base text/keyframe modes, read `references/base-format.md` and follow its final prompt structure.
+3. For full-reference mode, read `references/ref-format.md` and follow its six-section rewrite format.
 4. Preserve the exact field names, section order, labels, and timing notation from the selected guide.
 
 ## Base Modes
@@ -22,13 +22,13 @@ metadata:
 - FL2VA: describe the continuous path between the first and last frames.
 - L2VA: infer a plausible opening and converge to the supplied last frame.
 
-Use `integrated_multimodal_description`, `overall_soundscape`, and `non_diegetic_music` in the order shown in `references/base-en.txt`.
+Use `integrated_multimodal_description`, `overall_soundscape`, and `non_diegetic_music` in the order shown in `references/base-format.md`.
 
 ## Full-Reference Mode
 
 Ref2VA rewrites use `subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, and `non_diegetic_music` in that order. Reference labels stay consistent across all sections.
 
-Read `references/ref-en.txt` for label rules, retention analysis, and complete examples.
+Read `references/ref-format.md` for label rules and retention analysis.
 
 ## Output Rules
 

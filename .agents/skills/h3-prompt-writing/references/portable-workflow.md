@@ -46,8 +46,8 @@ tools; no proprietary canvas, choice-card widget, planner, or executor is requir
 
 ## Compile the creative plan into H3 prompts
 
-Read [base-en.txt](base-en.txt) for T2VA / I2VA / FL2VA / L2VA, or
-[ref-en.txt](ref-en.txt) for Ref2VA. These are writing modes, not guaranteed API
+Read [base-format.md](base-format.md) for T2VA / I2VA / FL2VA / L2VA, or
+[ref-format.md](ref-format.md) for Ref2VA. These are writing modes, not guaranteed API
 task names. Check the selected backend's input mapping before sending a request.
 
 - Base prompts use `integrated_multimodal_description`, `overall_soundscape`,
@@ -78,10 +78,13 @@ branch's long-video extension exists on main or on a hosted service.
 
 For a verified vLLM-Omni Ref2VA continuation backend, `long_video=true` with
 `long_video_mode=continuation` can accept one `continuation_prompts` entry per
-planned window. Compute the window count from the aligned total frames, window
-size, and overlap. Each prompt uses local window time; track global shot/music
-time separately. Repeated overlap is guidance, not additional output duration.
-Do not use this mode on a task/partition that does not support it.
+planned window only when the Ref2VA request is executed with its local text
+encoder. Step execution and stages that use an external text encoder reject
+`continuation_prompts`; omit the field and use the supported per-step inputs in
+those configurations. Compute the window count from the aligned total frames,
+window size, and overlap. Each prompt uses local window time; track global
+shot/music time separately. Repeated overlap is guidance, not additional output
+duration. Do not use this mode on a task/partition that does not support it.
 
 Otherwise split into supported clips and assemble them. Same-scene clips may use
 tail/head keyframe continuity when supported. Scene changes should have explicit

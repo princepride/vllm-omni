@@ -3,8 +3,8 @@
 This directory contains one general prompt-writing skill and eight creative
 skills adapted from
 [MiniMax-AI/MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills).
-See [H3-SOURCES.md](H3-SOURCES.md) for the source revision, preserved files,
-and adaptation scope.
+See [H3-SOURCES.md](H3-SOURCES.md) for the source revision, attribution, and
+adaptation scope.
 
 ## Skill catalog
 

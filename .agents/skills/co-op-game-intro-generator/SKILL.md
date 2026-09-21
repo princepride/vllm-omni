@@ -31,9 +31,9 @@ label. Maintain player-to-name mapping across all references and frames.
 
 Fill the template's style, palette, characters, title, and name variables. Keep
 the two characters central, player cards toward the upper left, menu on the right,
-and Continue as the main interaction focus. The title establishes identity without
-competing with that focus. Buttons, icons, typography, and all player/equipment
-panels share one palette and style. Keep menu labels on one line.
+and the continue action as the main interaction focus. The title establishes
+identity without competing with that focus. Buttons, icons, typography, and all
+player/equipment panels share one palette and style. Keep menu labels on one line.
 
 The style changes material, shapes, fonts, and decoration; it should not randomly
 rearrange the menu hierarchy. User-requested layout or ratio changes take priority
