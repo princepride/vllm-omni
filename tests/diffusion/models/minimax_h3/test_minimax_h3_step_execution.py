@@ -555,7 +555,7 @@ def test_prepare_encode_rejects_refine_from_request_or_default(monkeypatch):
     pipeline = _step_pipeline(_SegmentMeanModel())
     pipeline.od_config = SimpleNamespace(additional_config={"latent_refine": 0.4})
 
-    def reached_request_preparation(self, **kwargs):
+    def reached_request_preparation(self, *args, **kwargs):
         raise RuntimeError("request preparation reached")
 
     monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_prepare_request_inputs", reached_request_preparation)

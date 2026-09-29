@@ -739,7 +739,7 @@ def test_the_hi_res_route_runs_a_shortened_pass_at_the_new_size(resize):
         "text_tags": torch.zeros(9, dtype=torch.int64),
         "seed": 8,
         "num_frames": 5,
-        "num_steps": 11,
+        "num_steps": 10,
         "video_shift": 12.0,
         "audio_shift": 3.0,
         "base_schedule": None,

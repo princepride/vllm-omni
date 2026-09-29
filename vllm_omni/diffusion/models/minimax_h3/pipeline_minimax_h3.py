@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from PIL import Image
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -87,7 +88,10 @@ from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     prepare_encoder_inputs,
 )
 from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encoded_frame_limit
-from vllm_omni.model_executor.models.minimax_h3.preprocessing import build_minimax_h3_presentation
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    build_minimax_h3_presentation,
+    load_minimax_h3_images,
+)
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
     deserialize_prepared_reference_videos,
@@ -164,8 +168,6 @@ from .time_request import (
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _VideoVAEPartProxy
 
 if TYPE_CHECKING:
-    from PIL import Image
-
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -1176,7 +1178,7 @@ class MiniMaxH3Pipeline(
         # loader so online quantization and offload processing follow the same
         # path as the DiT.
         for component_name in ("video_vae", "audio_vae", "latent_upscaler"):
-            component = getattr(self, component_name)
+            component = getattr(self, component_name, None)
             if component is None:
                 continue
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
@@ -1520,7 +1522,7 @@ class MiniMaxH3Pipeline(
                 "offload_dit_modules": dits if DIT_COMPONENT in offload_components else (),
                 "offload_encoder_modules": selected_explicit_stages,
             }
-        else:
+        elif upscaler is not None:
             selection_options["offload_encoder_modules"] = selected_stages
         apply_sequential_offload(
             dit_modules=dits,
@@ -2702,6 +2704,19 @@ class MiniMaxH3Pipeline(
         else:
             conditioning = self._extract_encoder_conditioning(raw_prompt)
         context = self._prepare_encoder_conditioning_inputs(conditioning, sampling)
+        if (
+            context.get("latent_refine") is not None
+            and context.get("latent_upscale") is not None
+            and context["task"] == "fl2va"
+        ):
+            if not self.load_vae_encoder:
+                raise OmniClientError("MiniMax H3 FL2VA latent_refine with upscale requires a local VAE encoder")
+            _, media = self._extract_prompt(raw_prompt)
+            images = media.get("image")
+            images = list(images) if isinstance(images, (list, tuple)) else [images] if images is not None else []
+            context["keyframe_images"] = load_minimax_h3_images(images)
+            if len(context["keyframe_images"]) != len(context["keyframe_frame_indices"] or ()):
+                raise OmniClientError("MiniMax H3 latent_refine requires the original FL2VA keyframe images")
         if window_text is not None:
             context["continuation_text_conditioning"] = window_text
         return context
@@ -2875,16 +2890,20 @@ class MiniMaxH3Pipeline(
         )
         latent_refine = self._resolve_latent_refine(extra)
         if latent_refine is not None:
+            if continuation is not None:
+                raise OmniClientError("MiniMax H3 latent_refine does not support latent-tail continuation")
+            if conditioning.video_edit_clean_rows is not None or conditioning.audio_edit_clean_rows is not None:
+                raise OmniClientError("MiniMax H3 latent_refine does not support latent-mask editing")
             self._validate_refine_token_budget(
                 task=task,
                 target=upscale_target,
-                latent_t=latent_t,
-                latent_h=height // 16,
-                latent_w=width // 16,
-                audio_t=audio_t,
-                text_len=int(text_embeddings.shape[0]),
-                keyframe_count=len(keyframe_frame_indices or ()),
-                ref_blocks=ref_blocks,
+                latent_t=conditioning.latent_t,
+                latent_h=conditioning.height // 16,
+                latent_w=conditioning.width // 16,
+                audio_t=conditioning.audio_t,
+                text_len=int(conditioning.hidden_states.shape[0]),
+                keyframe_count=len(conditioning.keyframe_frame_indices),
+                ref_blocks=list(conditioning.ref_blocks) or None,
             )
         return {
             "continuation": continuation,
