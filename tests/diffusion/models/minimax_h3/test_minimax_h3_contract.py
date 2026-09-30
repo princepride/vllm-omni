@@ -847,7 +847,6 @@ def test_combined_weight_loader_routes_each_contiguous_partition():
     pipeline.transformers_ref = FakeTransformer()
     pipeline.video_vae = torch.nn.Identity()
     pipeline.audio_vae = torch.nn.Identity()
-    pipeline.latent_upscaler = None
     loaded = pipeline.load_weights(
         iter(
             [
