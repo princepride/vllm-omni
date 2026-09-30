@@ -1608,22 +1608,26 @@ class MiniMaxH3Pipeline(
         rows: list[torch.Tensor] = []
         shapes: list[tuple[int, int, int]] = []
         _, rank, _ = _dit_rank_world()
+        # encode_image retains parallel tiling when there are enough tiles.
+        # Every VAE rank must finish its codec collectives before the latent
+        # broadcast, including when refinement enlarges the keyframe images.
+        encode_images = bool(images) and (rank == 0 or self.video_vae.is_distributed_enabled())
         # Keep image and video references in one residency window when both
         # appear in a request; otherwise the video branch would reload the VAE.
         # Encoding touches only the CNN encoder half, so the 9GB ViT decoder
         # stays off the device for the whole window.
-        needs_video_vae = video_count > 0 or (rank == 0 and bool(images))
+        needs_video_vae = video_count > 0 or encode_images
         video_vae_context = (
             self._component_on_device(self.video_vae.encoder_component) if needs_video_vae else nullcontext()
         )
         with video_vae_context:
             if images:
                 image_rows = None
-                if rank == 0:
+                if encode_images:
                     image_rows = torch.cat([self.video_vae.encode_image(image) for image in images])
                 rows.append(
                     _broadcast_tensor(
-                        image_rows,
+                        image_rows if rank == 0 else None,
                         dtype=torch.float32,
                         device=self.device,
                     )

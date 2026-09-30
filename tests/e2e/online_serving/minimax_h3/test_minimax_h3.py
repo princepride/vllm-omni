@@ -15,6 +15,7 @@ import pytest
 
 from tests.helpers.assertions import assert_video_first_frames_differ, assert_video_valid
 from tests.helpers.mark import hardware_marks
+from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 MODEL = os.environ.get("VLLM_TEST_MINIMAX_H3_MODEL", "MiniMaxAI/MiniMax-H3")
@@ -63,14 +64,22 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
     ],
     indirect=True,
 )
+@pytest.mark.parametrize("task", ["t2va", "fl2va"])
 def test_latent_upscale_and_refine(
     omni_server: OmniServer,
     online_client: OnlineOmniClient,
     tmp_path: Path,
+    task: str,
 ) -> None:
     """Exercise upscale, refinement, and request-local opt-out on one live server."""
     videos = []
     frame_counts = []
+    image_reference = None
+    if task == "fl2va":
+        image = generate_synthetic_image(512, 288, seed=42)
+        image_reference = f"data:image/jpeg;base64,{image['base64']}"
+    # The 1024x576 refine keyframe spans multiple 256px VAE encoder tiles:
+    # both VAE ranks must encode it before broadcasting the condition latents.
     # Four base steps and the minimum four-second clip keep real-weight CI affordable.
     # Use size rather than width/height: upscale intentionally changes output dimensions.
     for name, upscale, refine, width, height in [
@@ -82,6 +91,7 @@ def test_latent_upscale_and_refine(
         responses = online_client.send_video_diffusion_request(
             {
                 "model": omni_server.model,
+                "image_reference": image_reference,
                 "form_data": {
                     "model": omni_server.model,
                     "prompt": "A woman in a sunlit room turns toward the camera, cinematic lighting.",
@@ -92,7 +102,7 @@ def test_latent_upscale_and_refine(
                     "seed": 1101,
                     "extra_params": json.dumps(
                         {
-                            "task": "t2va",
+                            "task": task,
                             "duration": 4.0,
                             "aspect_ratio": "16:9",
                             "audio_flow_shift": 3.0,
