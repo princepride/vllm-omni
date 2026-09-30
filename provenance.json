@@ -1,0 +1,70 @@
+{
+  "omni_commit": "348b3e4ce5a989a996b5c68fd95e870627605ad7",
+  "prompt_sha256": "b29b453f5e390c83a1980e8dc23bf1b88f7a9b0027618d6c1f766b649f39cc7c",
+  "generated_media": true,
+  "input_note": "Original and latent-refine are separate vLLM-Omni requests with the same prompt, seed and base schedule. SeedVR2 reads this exact original.mp4; its input is an encoded RGB-decoded video, not the latent.",
+  "base_steps": 50,
+  "refine_steps": 18,
+  "refine_strength": 0.35,
+  "seed": 20260928,
+  "base_size": [
+    1344,
+    768
+  ],
+  "target_size": [
+    2688,
+    1536
+  ],
+  "video_shift": 12,
+  "audio_shift": 3,
+  "seedvr2": {
+    "model": "SeedVR2-3B",
+    "dtype": "float16",
+    "num_inference_steps": 1,
+    "color_correction_method": "lab",
+    "gpu_count": 4,
+    "window_frames": 121,
+    "overlap_frames": 4
+  },
+  "validation": {
+    "original": {
+      "width": 1344,
+      "height": 768,
+      "frames": 362,
+      "fps": 24,
+      "video_duration_seconds": 15.083333333333334,
+      "audio": {
+        "sample_rate": 32000,
+        "channels": 2,
+        "decoded_samples": 483328
+      },
+      "sha256": "2c452568cfad0d2d2e7e1ee9f3ed28ae4743252dafaabf0ac0fa02bdff2eea83"
+    },
+    "latent_refine_2x": {
+      "width": 2688,
+      "height": 1536,
+      "frames": 362,
+      "fps": 24,
+      "video_duration_seconds": 15.083333333333334,
+      "audio": {
+        "sample_rate": 32000,
+        "channels": 2,
+        "decoded_samples": 483328
+      },
+      "sha256": "b30551b54ed1a220a82cc48c58d8707cb4e7b0fb24aeeb179c8d3da01731944d"
+    },
+    "seedvr2_2x": {
+      "width": 2688,
+      "height": 1536,
+      "frames": 362,
+      "fps": 24,
+      "video_duration_seconds": 15.083333333333334,
+      "audio": {
+        "sample_rate": 32000,
+        "channels": 2,
+        "decoded_samples": 482304
+      },
+      "sha256": "a37239c5214c055b8c94d462ac74b1b974831ef03bff6364992614b8b61ef10b"
+    }
+  }
+}
