@@ -7,6 +7,7 @@
 - Task: recording → ABC score, MIDI and timed music annotations
 - Mode: standalone official Transformers inference; optional YuE2 request export
 - Hardware: one NVIDIA H200 (141 GB)
+- Maintainer: [@princepride](https://github.com/princepride)
 
 ## When to use this recipe
 
@@ -14,11 +15,11 @@ Use a recording as the musical score for a YuE2 cover, or inspect its melodies,
 chords and structure. The tool calls SheetSage2's official `transcribe()` API.
 It does not register SheetSage2 as a native vLLM model or start an Omni server.
 
-The transcription tool works independently of YuE2. Sending its generated
-request requires the YuE2 adapter from
-[PR #7886](https://github.com/vllm-project/vllm-omni/pull/7886), which is not
-part of this change. Until that PR is merged, use a separate serving checkout
-containing it. An unmodified main checkout cannot serve YuE2 yet.
+The transcription tool works independently of YuE2. For score-conditioned
+generation, use an Omni checkout containing the merged
+[PR #7886](https://github.com/vllm-project/vllm-omni/pull/7886)
+(`423f34326ed420e5acf0b1fb862a1b5ffb7e0fa7` or later). See the
+[YuE2 recipe](YuE2-3B.md) for the generation model's runtime contract.
 
 ## Supported model contract
 
@@ -42,15 +43,18 @@ does not guarantee an exact reproduction of the recording.
 
 - [Official SheetSage2 model card](https://huggingface.co/m-a-p/SheetSage2)
 - [Pinned SheetSage2 source](https://huggingface.co/m-a-p/SheetSage2/tree/cafc0df1021e14f49e928c4b345f5959d414ef64)
-- [Official YuE2 cover documentation](https://huggingface.co/m-a-p/YuE2-3B#%EF%B8%8F-cover)
+- [Official YuE2 model card and cover documentation](https://huggingface.co/m-a-p/YuE2-3B)
 - Tool: [`tools/sheetsage2_transcribe.py`](../../tools/sheetsage2_transcribe.py)
+- Offline generation: [`examples/offline_inference/yue2/end2end.py`](../../examples/offline_inference/yue2/end2end.py)
+- [Supported generation models](../../docs/models/supported_models.md)
 
 ## Hardware
 
 - Accelerator: one NVIDIA H200, 141 GB; no multi-device interconnect required.
-- Qualification: local M4A transcription, melody-only prefix and full-score
-  whole-song export. Other devices, CPU inference and performance scaling are
-  not qualified by this recipe.
+- Qualification: local M4A transcription, melody-only prefix, full-score
+  whole-song export and one offline YuE2 cover. Run transcription and generation
+  sequentially in separate processes. Other devices, CPU inference and
+  performance scaling are not qualified by this recipe.
 
 ## Software environment
 
@@ -59,8 +63,13 @@ does not guarantee an exact reproduction of the recording.
 - FFmpeg 4.4.2 was used for the local M4A check; upstream recommends FFmpeg 6.1.
 - vLLM: not required in the preprocessing environment.
 - vLLM-Omni: tool developed against main `a038b38179e9c788d3af6a8e73f94652afb247e4`.
+- YuE2 qualification: vLLM 0.30.0, PyTorch 2.13.0+cu130, Transformers 5.14.1;
+  #7886 at `5cc8acc942e76fa6f12f8b2f2558c2663abc2aa5` with the FP32 VAE-loading
+  and scalar `truncated` fixes subsequently included in the merged integration.
 
 ## Command
+
+### Set up transcription
 
 Run from this repository's root. Create a **separate environment**: the
 official transcriber's Transformers version differs from Omni's serving
@@ -92,29 +101,63 @@ JSON and safetensors files, before disconnecting:
 .venv-sheetsage2/bin/hf download m-a-p/MERT-v2-FullSong \
   --revision d8ba1c745e733b3908ce6ad16ebeb17ac7600a42 \
   --local-dir models/MERT-v2-FullSong
+```
 
+### Transcribe a full recording for a cover
+
+Supply target lyrics in `lyrics.txt`, including YuE2 section tags such as
+`[Verse]` and `[Chorus]`. Match the lyric phrasing to the reference melody.
+This example retains the melody and chords of the whole recording:
+
+```bash
 .venv-sheetsage2/bin/python tools/sheetsage2_transcribe.py reference.wav \
   --model models/SheetSage2 --base-model-path models/MERT-v2-FullSong \
   --local-files-only --trust-remote-code --device cuda:0 \
-  --melody-only --max-seconds 45 \
   --lyrics-file lyrics.txt --style 'Chinese folk, guzheng, gentle vocals' \
   --seed 831001 --output-dir outputs/cover-score
 ```
 
-Supply target lyrics in `lyrics.txt`, including YuE2 section tags such as
-`[Verse]` and `[Chorus]`. Match the lyric phrasing to the reference melody.
-Remove `--max-seconds 45` for the whole recording. Remove `--melody-only` to
-retain chords and export a `cot=full` request. Use a fresh output directory
-for each run.
+Add `--melody-only` for a new arrangement without the original chords;
+this also changes the exported request from `cot=full` to `cot=melody`.
+For a short transcription smoke test, add `--max-seconds 45` and use lyrics
+appropriate to that excerpt. Use a fresh output directory for each run.
 
-Start YuE2 in its **own Omni environment**, with a checkout containing #7886:
+### Generate offline
+
+Switch to your **Omni environment** for generation. Download `m-a-p/YuE2-3B`
+and `m-a-p/YuE2-Vae` to `models/YuE2-3B` and `models/YuE2-Vae`, respectively.
+The offline entrypoint needs a local YuE2 directory containing `qwen.tiktoken`.
+From the repository root, pass the exported ABC to the existing entrypoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/offline_inference/yue2/end2end.py \
+  --model models/YuE2-3B --vae models/YuE2-Vae \
+  --lyrics "$(cat lyrics.txt)" \
+  --style 'Chinese folk, guzheng, gentle vocals' \
+  --abc-file outputs/cover-score/score.abc --cot full \
+  --seed 831001 --max-frames 9000 --gpu-memory-utilization 0.25 \
+  --output cover.wav
+```
+
+Use `--cot melody` if the score was transcribed with `--melody-only`.
+Changing `--cot` alone does not remove chords from an existing score.
+The 9,000-frame budget permits up to 360 seconds at 25 frames/s; it does
+not force that duration. The entrypoint's default 200-frame budget caps
+audio at 8 seconds. Check that the final report says `truncated=False`.
+The memory fraction above was used on one H200; it is not a measured
+minimum memory requirement.
+
+### Submit over HTTP (configuration-only)
+
+The exported JSON can also be submitted to YuE2's speech endpoint. These
+commands have not been qualified with an HTTP synthesis run in this recipe.
+Start YuE2 in its **Omni environment**:
 
 ```bash
 vllm serve m-a-p/YuE2-3B --omni --port 8091
 ```
 
-Submit the file from the preprocessing checkout (adjust its path if the
-serving checkout is elsewhere):
+Submit the exported file:
 
 ```bash
 curl --fail-with-body http://localhost:8091/v1/audio/speech \
@@ -142,15 +185,16 @@ import mido
 output = Path("outputs/cover-score")
 abc = (output / "score.abc").read_text(encoding="utf-8")
 request = json.loads((output / "yue2_request.json").read_text(encoding="utf-8"))
+manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
 assert abc.strip() and request["extra_params"]["abc"] == abc
-assert request["extra_params"]["cot"] == "melody"
+assert request["extra_params"]["cot"] == ("melody" if manifest["melody_only"] else "full")
 midi = mido.MidiFile(output / "transcription.mid")
 assert any(msg.type == "note_on" and msg.velocity for track in midi.tracks for msg in track)
 print("ABC, MIDI and YuE2 request verified")
 PY
 ```
 
-Run the dependency-free CLI contract tests in the repository's normal test
+Run the CPU CLI contract tests in the repository's normal test
 environment (with pytest and pytest-mock installed):
 
 ```bash
@@ -170,11 +214,15 @@ Local H200 checks with the pinned backend:
 | Default Hub ID, 10 s prefix | Successful ABC and MIDI export |
 | Local snapshots, fresh Transformers module cache | Successful offline full-score export |
 | Both generated JSON requests, #7886 adapter at `5cc8acc942e76fa6f12f8b2f2558c2663abc2aa5` | Validation and prompt construction passed (919 / 2,821 prompt tokens) |
+| Full score + new Mandarin lyrics, offline YuE2, `cot=full`, seed 831001, 9,000-frame budget | 241.319 s, 48 kHz stereo WAV; 6,034 generated tokens; `truncated=False` |
 
-The adapter check used vLLM 0.30.0 in a separate serving environment. It
-checked the real request schema, tokenizer and context budget; it did not
-run HTTP synthesis or evaluate the resulting cover's audio quality. The
-local recording and generated scores are not included in the repository.
+The offline cover used a 108 BPM Chinese traditional pop style and one H200
+with `--gpu-memory-utilization 0.25`. The saved waveform contained finite
+samples, peak amplitude 0.9501, RMS 0.1232 and no full-scale samples. This is
+one functional run, not an accuracy or performance benchmark. It does not
+establish perceptual equivalence to the recording. HTTP synthesis and
+recordings longer than 300 seconds were not exercised. The local recording,
+lyrics, generated scores and cover audio are not included in the repository.
 
 ## Notes
 
@@ -195,6 +243,6 @@ local recording and generated scores are not included in the repository.
 | Feature | Status |
 | --- | --- |
 | Audio-to-score preprocessing | Official backend; local file input |
-| YuE2 score-conditioned generation | Exported request; serving requires #7886 |
+| YuE2 score-conditioned generation | Offline ABC handoff qualified on H200; HTTP request export validated, HTTP synthesis configuration-only |
 | Native Omni inference, continuous batching, TP/PP/SP | Not implemented for SheetSage2 |
 | Streaming transcription or cover audio | Not supported by this tool |
