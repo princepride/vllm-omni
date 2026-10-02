@@ -4,6 +4,7 @@
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -77,12 +78,35 @@ def test_default_model_pins_code_and_loads_adapters_in_fp32(arguments, backend):
     assert not (output / "yue2_request.json").exists()
 
 
-def test_local_offline_checkpoint_forwards_parent_without_default_hub_revision(arguments, backend, tmp_path):
+def test_local_offline_checkpoint_forwards_parent_without_default_hub_revision(arguments, backend, tmp_path, mocker):
     arguments.model = str(tmp_path / "SheetSage2")
+    snapshot = Path(arguments.model)
+    snapshot.mkdir()
+    source = snapshot / "modeling_sheetsage2.py"
+    direct = snapshot / "exports_sheetsage2.py"
+    transitive = snapshot / "chord_spelling_sheetsage2.py"
+    source.write_text("from .exports_sheetsage2 import export\n")
+    direct.write_text("from .chord_spelling_sheetsage2 import chord\n")
+    transitive.write_text("chord = 'C'\n")
+    dynamic_modules = mocker.Mock()
+    dynamic_modules.get_relative_import_files.return_value = [str(direct), str(transitive)]
+    mocker.patch.dict(sys.modules, {"transformers.dynamic_module_utils": dynamic_modules})
+    calls = mocker.Mock()
+    calls.attach_mock(dynamic_modules.get_cached_module_file, "prime")
+    calls.attach_mock(backend.loader, "load")
     arguments.base_model_path = tmp_path / "MERT"
     arguments.base_model_path.mkdir()
     arguments.local_files_only = True
     cli.transcribe(arguments)
+    dynamic_modules.get_relative_import_files.assert_called_once_with(str(source))
+    dynamic_modules.get_cached_module_file.assert_has_calls(
+        [
+            mocker.call(arguments.model, direct.name, local_files_only=True),
+            mocker.call(arguments.model, transitive.name, local_files_only=True),
+        ]
+    )
+    assert [call[0] for call in calls.mock_calls] == ["prime", "prime", "load"]
+    backend.model.transcribe.assert_called_once()
     options = backend.loader.call_args.kwargs
     assert options["revision"] is None
     assert options["local_files_only"] is True
@@ -139,6 +163,26 @@ def test_style_requires_lyrics_before_loading(arguments, backend):
     with pytest.raises(ValueError, match="supplied together"):
         cli.transcribe(arguments)
     backend.loader.assert_not_called()
+
+
+def test_seed_requires_request_context_before_loading(arguments, backend):
+    arguments.seed = 123
+    with pytest.raises(ValueError, match="supply --lyrics-file and --style"):
+        cli.transcribe(arguments)
+    backend.loader.assert_not_called()
+    assert not arguments.output_dir.exists()
+
+
+@pytest.mark.parametrize("seed", [-1, 2**63])
+def test_out_of_range_seed_fails_before_loading(arguments, backend, seed):
+    arguments.lyrics_file = arguments.audio.with_suffix(".txt")
+    arguments.lyrics_file.write_text("lyrics", encoding="utf-8")
+    arguments.style = "folk"
+    arguments.seed = seed
+    with pytest.raises(ValueError, match="between 0 and"):
+        cli.transcribe(arguments)
+    backend.loader.assert_not_called()
+    assert not arguments.output_dir.exists()
 
 
 def test_cli_reports_export_failure_as_nonzero(arguments, backend, capsys):

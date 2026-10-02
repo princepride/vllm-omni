@@ -91,6 +91,11 @@ parent to `d8ba1c745e733b3908ce6ad16ebeb17ac7600a42`. Review that code before
 passing `--trust-remote-code`. `--revision` can override the default pin;
 custom Hub IDs use their default revision unless one is supplied.
 
+Local snapshots must preserve this pinned source layout: `modeling_sheetsage2.py`
+and its transitive relative-import dependencies are sibling `.py` files in the
+snapshot root. The local module-cache workaround targets that flat layout;
+reorganized snapshots with nested Python packages are not supported by it.
+
 For offline use, download **both** model snapshots, including their Python,
 JSON and safetensors files, before disconnecting:
 
@@ -174,7 +179,9 @@ duration and context limits apply.
 
 ## Verification
 
-After a successful transcription:
+After a successful transcription, set `output` below to its output directory
+(`outputs/reference-score` for the transcription-only example). The YuE2
+request is checked when exported with `--lyrics-file` and `--style`:
 
 ```bash
 .venv-sheetsage2/bin/python - <<'PY'
@@ -184,13 +191,17 @@ import mido
 
 output = Path("outputs/cover-score")
 abc = (output / "score.abc").read_text(encoding="utf-8")
-request = json.loads((output / "yue2_request.json").read_text(encoding="utf-8"))
 manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-assert abc.strip() and request["extra_params"]["abc"] == abc
-assert request["extra_params"]["cot"] == ("melody" if manifest["melody_only"] else "full")
+assert abc.strip()
+request_path = output / "yue2_request.json"
+if request_path.exists():
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request["extra_params"]["abc"] == abc
+    assert request["extra_params"]["cot"] == ("melody" if manifest["melody_only"] else "full")
+    print("YuE2 request verified")
 midi = mido.MidiFile(output / "transcription.mid")
 assert any(msg.type == "note_on" and msg.velocity for track in midi.tracks for msg in track)
-print("ABC, MIDI and YuE2 request verified")
+print("ABC, MIDI and manifest verified")
 PY
 ```
 

@@ -97,6 +97,8 @@ def transcribe(args: argparse.Namespace) -> Path:
         # Transformers 4.45 only copies direct imports for local snapshots.
         # Prime transitive dependencies too (e.g. chord_spelling_sheetsage2),
         # using its cache API without modifying the upstream source files.
+        # The pinned snapshot keeps the entry point and all relative imports
+        # as sibling .py files; local snapshots must preserve that flat layout.
         from transformers.dynamic_module_utils import get_cached_module_file, get_relative_import_files
 
         source = Path(args.model) / "modeling_sheetsage2.py"
