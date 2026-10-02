@@ -376,7 +376,6 @@ class StageDiffusionProc:
         # "DiffusionExecutor is closed" on every subsequent request.
         fatal_event = asyncio.Event()
         self._fatal_event = fatal_event
-        self._watch_executor_failure(asyncio.get_running_loop())
 
         async def _dispatch_request(
             request_id: str,
@@ -456,6 +455,7 @@ class StageDiffusionProc:
                 tasks.pop(request_id, None)
 
         try:
+            self._watch_executor_failure(asyncio.get_running_loop())
             while True:
                 # Await recv and fatal_event concurrently so the loop wakes
                 # up immediately when a per-request handler signals a fatal

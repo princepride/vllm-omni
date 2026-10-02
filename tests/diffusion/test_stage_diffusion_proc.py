@@ -3,6 +3,7 @@
 
 import asyncio
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
 import pytest
@@ -196,10 +197,45 @@ async def test_proc_process_request_with_batching_async_output():
 class _FailingExecutor:
     def __init__(self, is_dead: bool = False) -> None:
         self.is_dead = is_dead
-        self.callbacks = []
+        self.callbacks: list[Callable[[], None]] = []
 
     def register_failure_callback(self, callback) -> None:
         self.callbacks.append(callback)
+
+
+@pytest.mark.asyncio
+async def test_run_loop_cleans_up_when_executor_watch_setup_fails(mocker):
+    """Startup failure must notify the client and release the ZMQ context."""
+    import zmq
+    import zmq.asyncio
+
+    client_ctx = zmq.asyncio.Context()
+    request_socket = client_ctx.socket(zmq.PUSH)
+    response_socket = client_ctx.socket(zmq.PULL)
+    request_port = request_socket.bind_to_random_port("tcp://127.0.0.1")
+    response_port = response_socket.bind_to_random_port("tcp://127.0.0.1")
+    proc_ctx = zmq.asyncio.Context()
+    mocker.patch.object(stage_diffusion_proc.zmq.asyncio, "Context", return_value=proc_ctx)
+    executor = _FailingExecutor()
+    mocker.patch.object(executor, "register_failure_callback", side_effect=RuntimeError("watch setup failed"))
+    stage_proc = StageDiffusionProc.__new__(StageDiffusionProc)
+    stage_proc._engine = mocker.Mock(executor=executor)
+    try:
+        with pytest.raises(RuntimeError, match="watch setup failed"):
+            await asyncio.wait_for(
+                stage_proc.run_loop(f"tcp://127.0.0.1:{request_port}", f"tcp://127.0.0.1:{response_port}"),
+                timeout=5,
+            )
+        assert proc_ctx.closed
+        assert stage_proc._active_tasks is None
+        assert stage_proc._fatal_event is None
+        assert await asyncio.wait_for(response_socket.recv(), timeout=5) == StageDiffusionProc.DIFFUSION_PROC_DEAD
+    finally:
+        # Also release leaked sockets when this regression runs against the old code.
+        proc_ctx.destroy(linger=0)
+        request_socket.close(linger=0)
+        response_socket.close(linger=0)
+        client_ctx.term()
 
 
 @pytest.mark.asyncio
