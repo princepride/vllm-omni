@@ -63,6 +63,34 @@ async def test_run_loop_cleans_up_when_initialization_fails(mocker, codec):
         client_ctx.term()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_side", ["request", "response"])
+async def test_run_loop_cleans_up_when_connect_fails(mocker, bad_side):
+    """Connect errors must not block on an unconnected PUSH socket."""
+    import zmq
+    import zmq.asyncio
+
+    client_ctx = zmq.asyncio.Context()
+    response_socket = client_ctx.socket(zmq.PULL)
+    response_port = response_socket.bind_to_random_port("tcp://127.0.0.1")
+    request_address = "not-a-zmq-endpoint" if bad_side == "request" else "tcp://127.0.0.1:1"
+    response_address = "not-a-zmq-endpoint" if bad_side == "response" else f"tcp://127.0.0.1:{response_port}"
+    proc_ctx = zmq.asyncio.Context()
+    mocker.patch.object(stage_diffusion_proc.zmq.asyncio, "Context", return_value=proc_ctx)
+    stage_proc = StageDiffusionProc.__new__(StageDiffusionProc)
+    try:
+        with pytest.raises(zmq.ZMQError):
+            await asyncio.wait_for(stage_proc.run_loop(request_address, response_address), timeout=10)
+        assert proc_ctx.closed
+        if bad_side == "request":
+            # The response side is connected first, so the client is still notified.
+            assert await asyncio.wait_for(response_socket.recv(), timeout=5) == StageDiffusionProc.DIFFUSION_PROC_DEAD
+    finally:
+        proc_ctx.destroy(linger=0)
+        response_socket.close(linger=0)
+        client_ctx.term()
+
+
 def test_run_diffusion_proc_sets_lifecycle_before_loading_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
 
