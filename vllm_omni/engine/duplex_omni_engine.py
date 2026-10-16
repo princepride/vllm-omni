@@ -37,6 +37,7 @@ from vllm_omni.engine.orchestrator import OrchestratorBase
 
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.commands import DuplexCommand
+    from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 
 logger = init_logger(__name__)
 
@@ -81,14 +82,18 @@ class DuplexOmniEngine(AsyncOmniEngine):
             )
         self.duplex_session_config = deploy_config.duplex_session
         self.plugin = load_duplex_plugin(plugin_path, self._audio_encoder)
+        self.plugin.configure_pipeline(pipeline_config)
 
     # Any: signature of the ``OmniEngineBase._create_orchestrator`` seam it overrides.
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
         from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 
         assert self.plugin is not None, "_validate_deployment() must run before the orchestrator is created"
-        stage0_vllm_config = self.stage_pools[0].stage_vllm_config if self.stage_pools else None
-        model_config = getattr(stage0_vllm_config, "model_config", None)
+        # Match the frontend's comprehension-stage selection. An optional ASR
+        # stage does not own the served model's tokenizer or prompt policy.
+        model_stage_id = next((stage.stage_id for stage in self.pipeline_config.stages if stage.owns_tokenizer), 0)
+        stage_vllm_config = self.stage_pools[model_stage_id].stage_vllm_config if self.stage_pools else None
+        model_config = getattr(stage_vllm_config, "model_config", None)
         return DuplexOrchestrator(
             plugin=self.plugin,
             duplex_session_config=self.duplex_session_config,
@@ -151,6 +156,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         session_id: str,
         session_config: DuplexSessionConfig,
         *,
+        output_buffer: DuplexOutputBuffer,
         timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
     ) -> DuplexControlResultMessage:
         control_id = uuid.uuid4().hex
@@ -159,6 +165,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
                 control_id=control_id,
                 session_id=session_id,
                 session_config=session_config,
+                output_buffer=output_buffer,
             ),
             control_id=control_id,
             operation="open",
@@ -171,10 +178,14 @@ class DuplexOmniEngine(AsyncOmniEngine):
         session_id: str,
         session_config: DuplexSessionConfig,
         *,
+        output_buffer: DuplexOutputBuffer,
         timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
     ) -> DuplexControlResultMessage:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: self._open_session(session_id, session_config, timeout=timeout))
+        return await loop.run_in_executor(
+            None,
+            lambda: self._open_session(session_id, session_config, output_buffer=output_buffer, timeout=timeout),
+        )
 
     def _close_session(
         self,

@@ -769,6 +769,7 @@ def test_qwen3_tts_code2wav_forward_decodes_connector_payload() -> None:
 
     from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
         Qwen3TTSCode2Wav,
+        _SegmentRhoTracker,
     )
 
     class _Decoder:
@@ -800,6 +801,7 @@ def test_qwen3_tts_code2wav_forward_decodes_connector_payload() -> None:
     model._logged_codec_stats = True
     model._logged_malformed_codec_lengths = set()
     model._batch_stats_enabled = False
+    model._rho_stats = _SegmentRhoTracker(enabled=False)
     model._batch_stats_log_every = 0
     model._batch_stats_forwards = 0
     model._batch_stats_groups = 0
@@ -971,12 +973,14 @@ def test_cosyvoice3_text2flow_full_payload_nested_fallback() -> None:
 
 
 def test_cosyvoice3_full_payload_replace_keys_present() -> None:
-    """Confirm _FULL_PAYLOAD_REPLACE_KEYS lists the three embed.* keys."""
+    """Reference tensors and their length travel as complete snapshots."""
     from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
         _FULL_PAYLOAD_REPLACE_KEYS,
     )
 
-    assert _FULL_PAYLOAD_REPLACE_KEYS == frozenset({"embed.speech_token", "embed.speech_feat", "embed.embedding"})
+    assert _FULL_PAYLOAD_REPLACE_KEYS == frozenset(
+        {"embed.speech_token", "embed.speech_token_len", "embed.speech_feat", "embed.embedding"}
+    )
 
 
 def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
