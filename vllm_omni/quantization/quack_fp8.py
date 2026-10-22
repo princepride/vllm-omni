@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """FP8 scaled-MM with a fused bias epilogue, backed by quack's CuteDSL GEMM."""
 
 from __future__ import annotations
@@ -179,7 +179,9 @@ def _quack_fp8_scaled_mm(
             if out is not None:
                 return out
         except Exception as exc:  # noqa: BLE001
-            logger.warning_once("Quack FP8 GEMM failed (%s); using FlashInfer.", exc)
+            # warning_once caches its arguments. An exception retains traceback
+            # frames, including the failed GEMM's input and output tensors.
+            logger.warning_once("Quack FP8 GEMM failed (%s); using FlashInfer.", str(exc))
 
     # Use the same fallback as FlashInferFP8ScaledMMLinearKernel, without
     # passing its Python instance through the custom-op schema. Unpopulated
