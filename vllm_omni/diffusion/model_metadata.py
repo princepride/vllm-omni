@@ -24,6 +24,10 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos`` accepts the ``timeline_guides`` manifest plus
     # ``guide_files`` uploads, forwarded as ``multi_modal_data["timeline_guides"]``.
     supports_timeline_guides: bool = False
+    # Whether the pipeline keeps finished clips' latents under
+    # ``extra_args["latent_cache_key"]`` and accepts ``extra_args["continue_from"]``
+    # to continue one; the video API tags requests with their job id.
+    supports_latent_continuation: bool = False
 
 
 # FLUX.2 Klein supports up to four reference images.
@@ -75,6 +79,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_mixed_reference_inputs=True,
         supports_latent_mask_editing=True,
         supports_timeline_guides=True,
+        supports_latent_continuation=True,
         final_output_type="video",
         # H3 represents alignment padding as a second packed sequence.  The
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
@@ -91,6 +96,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_mixed_reference_inputs=True,
         supports_latent_mask_editing=True,
         supports_timeline_guides=True,
+        supports_latent_continuation=True,
         final_output_type="video",
         attention_mask_free=True,
     ),

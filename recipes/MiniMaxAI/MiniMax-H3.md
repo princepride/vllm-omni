@@ -901,6 +901,9 @@ not supplied by this feature.
 
 ### Latent-tail continuation with global temporal positions (A+B)
 
+To continue a finished job in a separate request, see
+[MiniMax H3 Continuation Across Requests](../../docs/serving/videos_api.md#minimax-h3-continuation-across-requests).
+
 `long_video=true` selects this mode by default for Ref2VA. It can also be selected
 explicitly with `long_video_mode=continuation`. This experimental mode supports
 Ref2VA request execution with uncached denoising (`quality=lossless`); step

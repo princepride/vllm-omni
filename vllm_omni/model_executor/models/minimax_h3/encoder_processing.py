@@ -129,10 +129,18 @@ def _resolve_fl2va_keyframe_indices(extra: Mapping[str, Any], image_count: int) 
     return raw_indices
 
 
-def _validate_ref2va_reference_counts(image_count: int, video_count: int, audio_count: int) -> None:
+def _validate_ref2va_reference_counts(
+    image_count: int,
+    video_count: int,
+    audio_count: int,
+    *,
+    latent_continuation: bool = False,
+) -> None:
     if min(image_count, video_count, audio_count) < 0:
         raise OmniClientError("MiniMax H3 reference counts must be non-negative")
-    if image_count + video_count == 0:
+    # A cross-request continuation is guided by cached latents of the clip it
+    # continues, so it needs no image or video reference of its own.
+    if image_count + video_count == 0 and not latent_continuation:
         raise OmniClientError("ref2va requires at least one image or video reference")
     if image_count > 9:
         raise OmniClientError("ref2va accepts at most 9 image references")
@@ -229,6 +237,9 @@ def _resolve_task(
     requested = extra_args.get("task")
     if requested is not None:
         return str(requested).lower()
+    # Cached latent tails ride as Ref2VA latent_guide rows.
+    if extra_args.get("continue_from") is not None:
+        return "ref2va"
     has_reference_audio = (
         multi_modal_data.get("audio") is not None and extra_args.get("audio_mode", "native") != "lock_source"
     )
@@ -521,11 +532,16 @@ def prepare_encoder_inputs(
         for image in raw_images:
             _validate_reference_image(image)
     elif task == "ref2va":
-        _validate_ref2va_reference_counts(len(raw_images), len(videos), len(audio_values))
-        if not raw_images and not videos:
+        latent_continuation = extra_args.get("continue_from") is not None
+        _validate_ref2va_reference_counts(
+            len(raw_images), len(videos), len(audio_values), latent_continuation=latent_continuation
+        )
+        if not raw_images and not videos and not latent_continuation:
             raise OmniClientError("ref2va requires an image or video condition")
     else:
         raise OmniClientError(f"unsupported MiniMax H3 task {task!r}")
+    if extra_args.get("continue_from") is not None and task != "ref2va":
+        raise OmniClientError("MiniMax H3 continue_from requires the Ref2VA task")
 
     height, width, num_frames, latent_t, audio_t = resolve_minimax_h3_shape(
         task,
@@ -563,6 +579,8 @@ def prepare_encoder_inputs(
         video_edit_mask is not None or audio_edit_mask is not None
     ):
         raise OmniClientError("MiniMax H3 continuation does not support latent-mask editing; use long_video_mode=full")
+    if extra_args.get("continue_from") is not None and (video_edit_mask is not None or audio_edit_mask is not None):
+        raise OmniClientError("MiniMax H3 continue_from does not support latent-mask editing")
     if lock_audio and audio_edit_mask is not None:
         raise OmniClientError("MiniMax H3 audio_mode=lock_source cannot be combined with audio latent-mask editing")
     if video_edit_mask is not None and source_video is None:
@@ -576,6 +594,8 @@ def prepare_encoder_inputs(
         # extends that layout is rejected before any media is decoded.
         if resolve_long_video_mode(extra_args, task) == "continuation":
             raise OmniClientError("MiniMax H3 timeline guides do not support continuation; use long_video_mode=full")
+        if extra_args.get("continue_from") is not None:
+            raise OmniClientError("MiniMax H3 timeline guides cannot be combined with continue_from")
         if video_edit_mask is not None or audio_edit_mask is not None:
             raise OmniClientError("MiniMax H3 timeline guides cannot be combined with latent-mask editing")
         if lock_audio:

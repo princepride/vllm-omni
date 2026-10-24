@@ -328,6 +328,51 @@ Guide uploads use the same request-scoped temporary storage and cleanup as
 latent-mask editing sources. Models that do not declare timeline-guide support
 reject these fields.
 
+### MiniMax H3 Continuation Across Requests
+
+A MiniMax H3 job can continue a previous job's clip without decoding and
+re-encoding it. The server keeps each finished H3 job's denoised video and audio
+latents, keyed by its job id, in the DiT worker. A request that sets
+`continue_from` to that id samples a new Ref2VA window whose first
+`continue_overlap_frames` frames are guided by the tail of those latents, using
+the same `latent_guide` rows as in-request
+[latent-tail continuation](../../recipes/MiniMaxAI/MiniMax-H3.md#latent-tail-continuation-with-global-temporal-positions-ab).
+The window continues the chain's global AV timeline, so picture and sound carry
+across the cut.
+
+```bash
+first=$(curl -s http://localhost:8091/v1/videos \
+  -F 'prompt=A lighthouse keeper climbs the stairs at dusk.' \
+  -F 'input_reference=@keeper.png;type=image/png' \
+  -F 'num_frames=124' -F 'quality=lossless' | jq -r .id)
+# ...poll until completed...
+curl -s http://localhost:8091/v1/videos \
+  -F 'prompt=At the top, the keeper lights the lamp and the beam sweeps the sea.' \
+  -F 'num_frames=141' -F 'quality=lossless' \
+  -F "extra_params={\"continue_from\":\"$first\",\"continue_overlap_frames\":22}"
+```
+
+- `num_frames` is the new window, overlap included, on the `17n+5` grid. The
+  response contains only the new frames (`num_frames - continue_overlap_frames`)
+  and the matching audio, so consecutive clips can be concatenated as-is. Above,
+  the second clip adds 119 frames.
+- `continue_overlap_frames` defaults to `22` and must be on the `17n+5` grid,
+  smaller than `num_frames`, and no longer than the source clip.
+- The request runs as Ref2VA. Image, video, and audio references are optional;
+  the cached tail is its visual condition. Use the source clip's canvas: a
+  different `size` is rejected.
+- The source must be a completed job of this server. `/v1/videos/sync` can
+  continue such a job, but its own output is not addressable.
+- Each request in a chain can be continued, up to 300 seconds of global timeline.
+- Requires request execution with uncached denoising (`quality=lossless`) and a
+  local VAE decoder. It cannot be combined with `long_video_mode=continuation`,
+  latent-mask editing, timeline guides, `audio_mode=lock_source`, latent
+  upscale or refine, `preencode_mp4`, or `num_outputs_per_prompt > 1`.
+- Latents live in each DiT worker process, in an LRU of
+  `VLLM_OMNI_H3_LATENT_CACHE_CLIPS` clips (default 16; `0` disables it). They
+  are lost on restart and not shared across data-parallel replicas. A missing
+  or evicted source returns 400; regenerate it or start a new chain.
+
 ### Speech-to-Video
 
 For models that support audio-driven generation (e.g., Wan2.2-S2V), pass both

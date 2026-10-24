@@ -115,7 +115,7 @@ from .condition_noise import (
     minimax_h3_imgvid_cond_noise_aug_rows,
     minimax_h3_imgvid_cond_noise_rows,
 )
-from .continuation import diffuse_continuation, plan_continuation_windows, resolve_continuation
+from .continuation import diffuse_continuation, latent_guide_args, plan_continuation_windows, resolve_continuation
 from .denoise_loop import (
     MiniMaxH3DenoiseBranch,
     minimax_h3_denoise_loop,
@@ -125,6 +125,15 @@ from .denoise_loop import (
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
 from .fasth3_checkpoint import FastH3CheckpointSpec, FastH3OmniCheckpointSpec
+from .latent_cache import (
+    LATENT_CACHE_KEY,
+    CachedClip,
+    LatentClipCache,
+    LatentContinuation,
+    plan_latent_continuation,
+    resolve_latent_continuation,
+    trim_decoded_overlap,
+)
 from .latent_mask import (
     MiniMaxH3LatentEdit,
     minimax_h3_audio_edit_masks,
@@ -1237,6 +1246,7 @@ class MiniMaxH3Pipeline(
 
         self._quality_policy = MiniMaxH3QualityPolicy(od_config)
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
+        self._latent_clip_cache = LatentClipCache()
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
@@ -3168,8 +3178,33 @@ class MiniMaxH3Pipeline(
                     conditioning, visual_condition, visual_shapes, audio_condition, audio_lengths
                 )
             )
+        num_outputs = _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt)
+        latent_continuation = self._resolve_latent_continuation(
+            extra,
+            task=task,
+            num_frames=conditioning.num_frames,
+            latent_h=conditioning.height // 16,
+            latent_w=conditioning.width // 16,
+            rejected={
+                "long_video_mode=continuation": continuation is not None,
+                "latent-mask editing": (
+                    conditioning.video_edit_clean_rows is not None or conditioning.audio_edit_clean_rows is not None
+                ),
+                "audio_mode=lock_source": locked_audio_rows is not None,
+                "timeline guides": guide_blocks is not None,
+                "latent upscale/refine": upscale_target is not None or latent_refine is not None,
+                "multiple outputs": num_outputs != 1,
+                "preencode_mp4": bool(extra.get("preencode_mp4", False)),
+                "cached denoising (use quality=lossless)": quality_plan.cache_dit is not None,
+            },
+        )
+        cache_key = extra.get(LATENT_CACHE_KEY)
+        # Upscaled/refined latents leave the canvas a follow-up request samples on.
+        cacheable = isinstance(cache_key, str) and num_outputs == 1 and upscale_target is None and latent_refine is None
         return {
             "continuation": continuation,
+            "latent_continuation": latent_continuation,
+            "latent_cache_key": cache_key if cacheable else None,
             "task": task,
             "latent_upscale": upscale_target,
             "latent_refine": latent_refine,
@@ -3200,7 +3235,7 @@ class MiniMaxH3Pipeline(
             "video_shift": float(extra.get("flow_shift", self.default_video_shift)),
             "audio_shift": float(extra.get("audio_flow_shift", self.default_audio_shift)),
             "base_schedule": base_schedule,
-            "num_outputs": _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt),
+            "num_outputs": num_outputs,
             "preencode_mp4": bool(extra.get("preencode_mp4", False)),
             "preencode_batch_frames": (
                 normalize_preencode_batch_frames(extra.get("preencode_batch_frames", 17))
@@ -3214,6 +3249,43 @@ class MiniMaxH3Pipeline(
             ),
             **latent_edit,
         }
+
+    def _resolve_latent_continuation(
+        self,
+        extra: Mapping[str, Any],
+        *,
+        task: str,
+        num_frames: int,
+        latent_h: int,
+        latent_w: int,
+        rejected: Mapping[str, bool],
+    ) -> LatentContinuation | None:
+        """Plan a window guided by the cached tail of ``extra['continue_from']``."""
+        request = resolve_latent_continuation(extra)
+        if request is None:
+            return None
+        if task != "ref2va":
+            raise OmniClientError("MiniMax H3 continue_from requires the Ref2VA task")
+        if getattr(self.od_config, "step_execution", False):
+            raise OmniClientError("MiniMax H3 continue_from requires request execution (not step execution)")
+        if not self.load_vae_decoder:
+            raise OmniClientError("MiniMax H3 continue_from requires a local VAE decoder in the DiT stage")
+        for feature, active in rejected.items():
+            if active:
+                raise OmniClientError(f"MiniMax H3 continue_from cannot be combined with {feature}")
+        clip = self._latent_clip_cache.get(request.source)
+        if clip is None:
+            raise OmniClientError(
+                f"MiniMax H3 has no cached latents for continue_from={request.source!r}; "
+                "the video is unknown, was not generated by this server, or was evicted"
+            )
+        return plan_latent_continuation(
+            clip,
+            request,
+            num_frames=num_frames,
+            latent_h=latent_h,
+            latent_w=latent_w,
+        )
 
     def _validate_timeline_guide_sampling(
         self,
@@ -3326,7 +3398,13 @@ class MiniMaxH3Pipeline(
         for output_seed in _minimax_h3_output_seeds(context["seed"], num_outputs):
             check_request_cancellation()
             output_kwargs = {**denoise_kwargs, "seed": output_seed}
-            if context.get("continuation") is None:
+            latent_continuation = context.get("latent_continuation")
+            if latent_continuation is not None:
+                video_latent, audio_latent = self.diffuse(
+                    **self._latent_continuation_kwargs(output_kwargs, latent_continuation),
+                    request_context=context,
+                )
+            elif context.get("continuation") is None:
                 video_latent, audio_latent = self.diffuse(
                     **output_kwargs,
                     request_context=context,
@@ -3341,6 +3419,8 @@ class MiniMaxH3Pipeline(
                     text_conditioning=context.get("continuation_text_conditioning"),
                 )
             check_request_cancellation()
+            if context.get("latent_cache_key") is not None:
+                self._cache_clip_latents(context, video_latent, audio_latent)
             if upscale_target is not None:
                 video_latent = self._upscaled_latent(video_latent, upscale_target)
             if latent_refine is not None:
@@ -3373,6 +3453,9 @@ class MiniMaxH3Pipeline(
                     height=height,
                     width=width,
                 )
+                if latent_continuation is not None:
+                    # The window repeats the source tail; return only new frames.
+                    video, audio = trim_decoded_overlap(video, audio, latent_continuation)
                 # Rebind rather than append the expression: the local would
                 # otherwise keep the decoded frames' device storage alive for the
                 # rest of the iteration, and the next seed's diffuse() -- the DiT
@@ -3399,6 +3482,58 @@ class MiniMaxH3Pipeline(
             video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
+        )
+
+    def _latent_continuation_kwargs(
+        self,
+        kwargs: dict[str, Any],
+        continuation: LatentContinuation,
+    ) -> dict[str, Any]:
+        """Denoise arguments for a window guided by a cached clip tail on the global timeline."""
+        window = continuation.window
+        args = {
+            **kwargs,
+            # Audio boundaries follow the chain's cumulative frame timeline, as
+            # in-request continuation does, so per-clip rounding cannot drift.
+            "audio_t": window.audio_end - window.audio_start,
+            "temporal_offset": window.start * (40.0 / 24.0),
+        }
+        args.update(
+            latent_guide_args(
+                args,
+                continuation.video_tail.to(device=self.device),
+                continuation.audio_tail.to(device=self.device),
+            )
+        )
+        logger.info(
+            "MiniMax H3 latent continuation: frames [%d, %d), hidden overlap %d, temporal offset %.6f",
+            window.start,
+            window.end,
+            window.overlap,
+            args["temporal_offset"],
+        )
+        return args
+
+    def _cache_clip_latents(
+        self,
+        context: Mapping[str, Any],
+        video_latent: torch.Tensor,
+        audio_latent: torch.Tensor,
+    ) -> None:
+        continuation = context.get("latent_continuation")
+        start, frames = (
+            (continuation.window.start, continuation.window.end - continuation.window.start)
+            if continuation is not None
+            else (0, context["num_frames"])
+        )
+        self._latent_clip_cache.put(
+            context["latent_cache_key"],
+            CachedClip(
+                video=video_latent.detach().to("cpu", copy=True),
+                audio=audio_latent.detach().to("cpu", copy=True),
+                start_frame=start,
+                num_frames=frames,
+            ),
         )
 
     def _decoder_stage_output(

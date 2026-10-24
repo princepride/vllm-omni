@@ -80,6 +80,44 @@ def plan_continuation_windows(total_frames: int, window_frames: int, overlap_fra
     return windows
 
 
+def latent_guide_args(
+    kwargs: Mapping[str, Any],
+    video_tail: torch.Tensor,
+    audio_tail: torch.Tensor,
+) -> dict[str, Any]:
+    """Append clean video/audio tail latents as the final ``latent_guide`` ref block.
+
+    ``video_tail`` is ``[1, C, overlap_v, H, W]`` on the target canvas and
+    ``audio_tail`` is ``[2, C, overlap_audio_t]``; both share the new target's
+    temporal origin, so the guide covers the window's first overlap frames.
+    """
+    overlap_v, overlap_audio_t = int(video_tail.shape[2]), int(audio_tail.shape[-1])
+    if tuple(video_tail.shape[-2:]) != (kwargs["latent_h"], kwargs["latent_w"]):
+        raise OmniClientError("MiniMax H3 latent guide must match the target canvas")
+    args: dict[str, Any] = {}
+    guide_video = minimax_h3_patchify_video_latent(video_tail, patch_size=(1, 2, 2))
+    guide_audio = minimax_h3_pack_audio_latent(audio_tail)
+    for name, guide in (("visual_condition", guide_video), ("audio_condition", guide_audio)):
+        existing = kwargs.get(name)
+        args[name] = guide if existing is None else torch.cat((existing, guide), dim=0)
+    args["visual_condition_shapes"] = [
+        *(kwargs.get("visual_condition_shapes") or []),
+        (overlap_v, kwargs["latent_h"], kwargs["latent_w"]),
+    ]
+    args["audio_condition_lengths"] = [*(kwargs.get("audio_condition_lengths") or []), overlap_audio_t]
+    args["ref_blocks"] = [
+        *(kwargs.get("ref_blocks") or []),
+        {
+            "kind": "latent_guide",
+            "latent_t": overlap_v,
+            "latent_h": kwargs["latent_h"],
+            "latent_w": kwargs["latent_w"],
+            "ref_audio_t": overlap_audio_t,
+        },
+    ]
+    return args
+
+
 def diffuse_continuation(
     diffuse: Callable[..., tuple[torch.Tensor, torch.Tensor]],
     kwargs: dict[str, Any],
@@ -122,26 +160,7 @@ def diffuse_continuation(
             args["locked_audio_rows"] = source[:, window.audio_start : window.audio_end].reshape(-1, 32)
         overlap_v = _video_t(window.overlap) if window.overlap else 0
         if video is not None and audio is not None:
-            guide_video = minimax_h3_patchify_video_latent(video[:, :, -overlap_v:], patch_size=(1, 2, 2))
-            guide_audio = minimax_h3_pack_audio_latent(audio[..., -window.overlap_audio_t :])
-            for name, guide in (("visual_condition", guide_video), ("audio_condition", guide_audio)):
-                existing = kwargs.get(name)
-                args[name] = guide if existing is None else torch.cat((existing, guide), dim=0)
-            args["visual_condition_shapes"] = [
-                *(kwargs.get("visual_condition_shapes") or []),
-                (overlap_v, kwargs["latent_h"], kwargs["latent_w"]),
-            ]
-            args["audio_condition_lengths"] = [*(kwargs.get("audio_condition_lengths") or []), window.overlap_audio_t]
-            args["ref_blocks"] = [
-                *(kwargs.get("ref_blocks") or []),
-                {
-                    "kind": "latent_guide",
-                    "latent_t": overlap_v,
-                    "latent_h": kwargs["latent_h"],
-                    "latent_w": kwargs["latent_w"],
-                    "ref_audio_t": window.overlap_audio_t,
-                },
-            ]
+            args.update(latent_guide_args(kwargs, video[:, :, -overlap_v:], audio[..., -window.overlap_audio_t :]))
         logger.info(
             "MiniMax H3 continuation window %d/%d: frames [%d, %d), hidden overlap %d, temporal offset %.6f",
             index + 1,
