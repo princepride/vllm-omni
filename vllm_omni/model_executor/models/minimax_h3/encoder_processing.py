@@ -24,6 +24,11 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderMediaInput,
     MiniMaxH3TimelineGuide,
 )
+from vllm_omni.model_executor.models.minimax_h3.continuation_request import (
+    continuation_output_frames,
+    resolve_continuation_request,
+    window_frame_index,
+)
 from vllm_omni.model_executor.models.minimax_h3.long_video import max_output_seconds, resolve_long_video_mode
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     MINIMAX_H3_OUTPUT_SHORT_EDGE,
@@ -160,7 +165,14 @@ def resolve_minimax_h3_shape(
     task: str,
     sampling: Any,
     image: Image.Image | None,
+    *,
+    continuation_window: bool = True,
 ) -> tuple[int, int, int, int, int]:
+    """Resolve the sampled canvas and length.
+
+    A ``continue_from`` request describes the clip it returns; its sampled
+    window prepends the hidden overlap unless ``continuation_window`` is off.
+    """
     # The diffusion package exports a pipeline that imports this shared module.
     from vllm_omni.diffusion.models.minimax_h3.time_request import (
         MINIMAX_H3_SHAPE_PLANNER,
@@ -200,14 +212,23 @@ def resolve_minimax_h3_shape(
             f"got {requested_frames / fps:.3f}"
         )
     num_frames = minimax_h3_align_frame_count(requested_frames)
+    continuation = resolve_continuation_request(extra) if continuation_window else None
+    if continuation is not None:
+        num_frames = continuation.overlap_frames + continuation_output_frames(num_frames)
+        if num_frames > max_frames:
+            raise OmniClientError(
+                f"MiniMax H3 continuation output must be at most {max_frames - continuation.overlap_frames} frames, "
+                f"got {requested_frames / fps:.3f} seconds"
+            )
 
     height = getattr(sampling, "height", None)
     width = getattr(sampling, "width", None)
-    aspect_ratio = resolve_minimax_h3_aspect_ratio(
-        task,
-        target.get("aspect_ratio", extra.get("aspect_ratio")),
-        image,
-    )
+    requested_aspect_ratio = target.get("aspect_ratio", extra.get("aspect_ratio"))
+    if task == "t2va" and requested_aspect_ratio is None and resolve_continuation_request(extra) is not None:
+        # A continuation keeps its source's canvas, so T2VA needs no aspect ratio
+        # of its own: an explicit size wins below, otherwise the H3 default.
+        requested_aspect_ratio = "16:9"
+    aspect_ratio = resolve_minimax_h3_aspect_ratio(task, requested_aspect_ratio, image)
     raw_short_edge = target.get("short_edge", extra.get("short_edge", MINIMAX_H3_OUTPUT_SHORT_EDGE))
     if isinstance(raw_short_edge, bool) or not isinstance(raw_short_edge, (int, np.integer)):
         raise OmniClientError(
@@ -237,9 +258,6 @@ def _resolve_task(
     requested = extra_args.get("task")
     if requested is not None:
         return str(requested).lower()
-    # Cached latent tails ride as Ref2VA latent_guide rows.
-    if extra_args.get("continue_from") is not None:
-        return "ref2va"
     has_reference_audio = (
         multi_modal_data.get("audio") is not None and extra_args.get("audio_mode", "native") != "lock_source"
     )
@@ -400,6 +418,54 @@ def _temporal_group_max_pool(mask: torch.Tensor, *, latent_t: int) -> torch.Tens
     return result
 
 
+def _frames_to_audio_t(frames: int) -> int:
+    return round(frames * 5 / 3)
+
+
+def _frame_latents(num_frames: int) -> torch.Tensor:
+    """The causal-VAE latent each pixel frame of a ``17n+5`` clip encodes into."""
+    frames = torch.arange(num_frames)
+    return 5 * (frames // 17) + (frames % 17 + 3) // 4
+
+
+def _continuation_video_edit_mask(
+    value: Any,
+    *,
+    requested_frames: int,
+    output_frames: int,
+    overlap: int,
+    latent_h: int,
+    latent_w: int,
+) -> torch.Tensor:
+    """Map a mask written for the requested clip onto a window that hides ``overlap`` frames first.
+
+    The mask is read in the geometry the request describes, expanded to its
+    pixel frames, stretched onto the returned frames, and pooled with a
+    regenerated (1) overlap in front, so every accepted shape keeps its meaning.
+    """
+    requested_latent_t = (requested_frames - 5) // 17 * 5 + 2
+    latents = _canonical_video_edit_mask(
+        value, latent_t=requested_latent_t, latent_h=latent_h, latent_w=latent_w, num_frames=requested_frames
+    )
+    frames = latents[_frame_latents(requested_frames)]
+    frames = frames[(torch.arange(output_frames) * requested_frames) // output_frames]
+    window = torch.cat((frames.new_ones((overlap, latent_h, latent_w)), frames))
+    return _temporal_group_max_pool(window, latent_t=(overlap + output_frames - 5) // 17 * 5 + 2)
+
+
+def _continuation_audio_edit_mask(
+    value: Any,
+    *,
+    requested_audio_t: int,
+    output_audio_t: int,
+    overlap_audio_t: int,
+) -> torch.Tensor:
+    """Audio counterpart of :func:`_continuation_video_edit_mask` on the 40-Hz latent grid."""
+    mask = _canonical_audio_edit_mask(value, audio_t=requested_audio_t)
+    mask = mask[:, (torch.arange(output_audio_t) * requested_audio_t) // output_audio_t]
+    return torch.cat((mask.new_ones((2, overlap_audio_t)), mask), dim=1)
+
+
 def _canonical_audio_edit_mask(value: Any, *, audio_t: int) -> torch.Tensor:
     """Normalize every accepted request shape to a channel-major grid."""
     mask = _edit_mask(value, name="audio_noise_mask")
@@ -540,8 +606,6 @@ def prepare_encoder_inputs(
             raise OmniClientError("ref2va requires an image or video condition")
     else:
         raise OmniClientError(f"unsupported MiniMax H3 task {task!r}")
-    if extra_args.get("continue_from") is not None and task != "ref2va":
-        raise OmniClientError("MiniMax H3 continue_from requires the Ref2VA task")
 
     height, width, num_frames, latent_t, audio_t = resolve_minimax_h3_shape(
         task,
@@ -556,20 +620,50 @@ def prepare_encoder_inputs(
         raw_video_edit_mask is None and raw_audio_edit_mask is None
     ):
         raise OmniClientError("MiniMax H3 edit sources require video_noise_mask or audio_noise_mask")
-    video_edit_mask = (
-        _canonical_video_edit_mask(
-            raw_video_edit_mask,
-            latent_t=latent_t,
-            latent_h=height // 16,
-            latent_w=width // 16,
-            num_frames=num_frames,
+    # A continuation samples a window whose first ``overlap`` frames are hidden;
+    # every frame-addressed input below refers to the returned frames after it.
+    continuation = resolve_continuation_request(extra_args)
+    overlap = continuation.overlap_frames if continuation is not None else 0
+    output_frames = num_frames - overlap
+    requested_frames = (
+        resolve_minimax_h3_shape(
+            task, diffusion_sampling_params, raw_images[0] if raw_images else None, continuation_window=False
+        )[2]
+        if continuation is not None
+        else num_frames
+    )
+    video_edit_mask = None
+    if raw_video_edit_mask is not None:
+        video_edit_mask = (
+            _continuation_video_edit_mask(
+                raw_video_edit_mask,
+                requested_frames=requested_frames,
+                output_frames=output_frames,
+                overlap=overlap,
+                latent_h=height // 16,
+                latent_w=width // 16,
+            )
+            if continuation is not None
+            else _canonical_video_edit_mask(
+                raw_video_edit_mask,
+                latent_t=latent_t,
+                latent_h=height // 16,
+                latent_w=width // 16,
+                num_frames=num_frames,
+            )
         )
-        if raw_video_edit_mask is not None
-        else None
-    )
-    audio_edit_mask = (
-        _canonical_audio_edit_mask(raw_audio_edit_mask, audio_t=audio_t) if raw_audio_edit_mask is not None else None
-    )
+    audio_edit_mask = None
+    if raw_audio_edit_mask is not None:
+        audio_edit_mask = (
+            _continuation_audio_edit_mask(
+                raw_audio_edit_mask,
+                requested_audio_t=_frames_to_audio_t(requested_frames),
+                output_audio_t=audio_t - _frames_to_audio_t(overlap),
+                overlap_audio_t=_frames_to_audio_t(overlap),
+            )
+            if continuation is not None
+            else _canonical_audio_edit_mask(raw_audio_edit_mask, audio_t=audio_t)
+        )
     # An all-generate mask has no clean source dependency and remains a no-op.
     if video_edit_mask is not None and bool(torch.all(video_edit_mask == 1.0).item()):
         video_edit_mask = None
@@ -579,8 +673,6 @@ def prepare_encoder_inputs(
         video_edit_mask is not None or audio_edit_mask is not None
     ):
         raise OmniClientError("MiniMax H3 continuation does not support latent-mask editing; use long_video_mode=full")
-    if extra_args.get("continue_from") is not None and (video_edit_mask is not None or audio_edit_mask is not None):
-        raise OmniClientError("MiniMax H3 continue_from does not support latent-mask editing")
     if lock_audio and audio_edit_mask is not None:
         raise OmniClientError("MiniMax H3 audio_mode=lock_source cannot be combined with audio latent-mask editing")
     if video_edit_mask is not None and source_video is None:
@@ -594,12 +686,17 @@ def prepare_encoder_inputs(
         # extends that layout is rejected before any media is decoded.
         if resolve_long_video_mode(extra_args, task) == "continuation":
             raise OmniClientError("MiniMax H3 timeline guides do not support continuation; use long_video_mode=full")
-        if extra_args.get("continue_from") is not None:
-            raise OmniClientError("MiniMax H3 timeline guides cannot be combined with continue_from")
         if video_edit_mask is not None or audio_edit_mask is not None:
             raise OmniClientError("MiniMax H3 timeline guides cannot be combined with latent-mask editing")
         if lock_audio:
             raise OmniClientError("MiniMax H3 timeline guides cannot be combined with audio_mode=lock_source")
+    if continuation is not None and isinstance(raw_guides, Sequence) and not isinstance(raw_guides, (str, bytes)):
+        raw_guides = [
+            {**guide, "frame_index": window_frame_index(guide["frame_index"], overlap)}
+            if isinstance(guide, Mapping) and type(guide.get("frame_index")) is int
+            else guide
+            for guide in raw_guides
+        ]
     timeline_guides = prepare_timeline_guides(raw_guides, width=width, height=height, num_frames=num_frames)
 
     images = _prepare_encoder_images(
@@ -698,13 +795,16 @@ def prepare_encoder_inputs(
                     source_video,
                     target_width=width,
                     target_height=height,
-                    target_frame_count=num_frames,
+                    target_frame_count=output_frames,
                     workdir=workdir,
                 )
                 edit_video_frames = load_video_frames(edit_video_metadata["prepared_path"])
             except subprocess.CalledProcessError as exc:
                 raise OmniClientError("MiniMax H3 could not decode source_video for editing") from exc
             video_edit = _frames_to_tensor(edit_video_frames)
+            if overlap:
+                # The hidden overlap is regenerated (mask 1); its source frames are placeholders.
+                video_edit = torch.cat((video_edit[:1].expand(overlap, *video_edit.shape[1:]), video_edit))
 
     audio_edit: tuple[torch.Tensor, int] | None = None
     if audio_edit_mask is not None:
@@ -719,16 +819,20 @@ def prepare_encoder_inputs(
             try:
                 waveform, sample_rate = load_video_audio(
                     str(source_video),
-                    duration_seconds=float(num_frames) / MINIMAX_H3_FPS,
+                    duration_seconds=float(output_frames) / MINIMAX_H3_FPS,
                 )
             except subprocess.CalledProcessError as exc:
                 raise OmniClientError("MiniMax H3 could not decode source_video audio for editing") from exc
         if waveform.ndim not in (1, 2) or int(sample_rate) <= 0:
             raise OmniClientError("MiniMax H3 edit audio requires a waveform and positive sample rate")
-        max_samples = max(1, int(round(float(num_frames) / MINIMAX_H3_FPS * int(sample_rate))))
+        max_samples = max(1, int(round(float(output_frames) / MINIMAX_H3_FPS * int(sample_rate))))
         waveform = waveform[..., :max_samples].float().contiguous()
         if waveform.shape[-1] == 0:
             raise OmniClientError("MiniMax H3 edit audio must not be empty")
+        if overlap:
+            # Silence under the hidden overlap, which the audio mask regenerates.
+            silence = waveform.new_zeros((*waveform.shape[:-1], int(round(overlap / MINIMAX_H3_FPS * sample_rate))))
+            waveform = torch.cat((silence, waveform), dim=-1)
         audio_edit = (waveform, int(sample_rate))
 
     if raw_audio is not None and not lock_audio:

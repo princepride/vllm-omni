@@ -5,9 +5,11 @@
 The video server tags each H3 request with ``extra_args["latent_cache_key"]``
 (its job id). A finished request stores its denoised video/audio latents here,
 on CPU. A later request naming that key in ``extra_args["continue_from"]``
-samples a fresh window whose first ``continue_overlap_frames`` frames are
-guided by the cached tail -- the ``latent_guide`` rows that in-request
-continuation uses -- so no clip is decoded and re-encoded between requests.
+samples a window whose hidden first frames repeat the cached tail, carried as a
+frame-0 timeline guide, so no clip is decoded and re-encoded.
+Everything else in that request -- references, timeline guides, latent edits,
+driving audio, long-video windows -- addresses the returned frames only; the
+encoder maps it past the hidden overlap and the decoder trims the overlap.
 
 Every DiT rank runs the same forward on identical inputs, so each rank stores
 an identical copy and nothing is broadcast. The cache is per worker process:
@@ -19,21 +21,17 @@ from __future__ import annotations
 import os
 import threading
 from collections import OrderedDict
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 
 from vllm_omni.errors import OmniClientError
+from vllm_omni.model_executor.models.minimax_h3.continuation_request import ContinuationRequest
 from vllm_omni.model_executor.models.minimax_h3.long_video import MINIMAX_H3_MAX_CONTINUATION_SECONDS
 
-from .continuation import ContinuationWindow, _video_t
+from .continuation import LatentPrefix, _audio_t, _video_t
 
 LATENT_CACHE_KEY = "latent_cache_key"
-CONTINUE_FROM = "continue_from"
-CONTINUE_OVERLAP_FRAMES = "continue_overlap_frames"
-DEFAULT_CONTINUE_OVERLAP_FRAMES = 22
 LATENT_CACHE_CLIPS_ENV = "VLLM_OMNI_H3_LATENT_CACHE_CLIPS"
 DEFAULT_LATENT_CACHE_CLIPS = 16
 _FPS = 24
@@ -92,45 +90,31 @@ class LatentClipCache:
 
 
 @dataclass(frozen=True)
-class LatentContinuationRequest:
-    source: str
-    overlap_frames: int
-
-
-def resolve_latent_continuation(extra: Mapping[str, Any]) -> LatentContinuationRequest | None:
-    source = extra.get(CONTINUE_FROM)
-    if source is None:
-        return None
-    if not isinstance(source, str) or not source:
-        raise OmniClientError("MiniMax H3 continue_from must be a non-empty video id")
-    overlap = extra.get(CONTINUE_OVERLAP_FRAMES, DEFAULT_CONTINUE_OVERLAP_FRAMES)
-    if isinstance(overlap, bool) or not isinstance(overlap, int) or overlap < 5 or overlap % 17 != 5:
-        raise OmniClientError("MiniMax H3 continue_overlap_frames must be an integer on the 17n+5 frame grid")
-    return LatentContinuationRequest(source, overlap)
-
-
-@dataclass(frozen=True)
 class LatentContinuation:
-    """A new window guided by the cached tail of the clip it continues."""
+    """The hidden prefix of one request and the global AV span it samples."""
 
-    window: ContinuationWindow
-    video_tail: torch.Tensor
-    audio_tail: torch.Tensor
+    prefix: LatentPrefix
+    num_frames: int  # window frames, overlap included
 
     @property
-    def overlap_v(self) -> int:
-        return _video_t(self.window.overlap)
+    def audio_t(self) -> int:
+        start = self.prefix.start_frame
+        return _audio_t(start + self.num_frames) - _audio_t(start)
+
+    @property
+    def overlap_audio_t(self) -> int:
+        return int(self.prefix.audio.shape[-1])
 
 
 def plan_latent_continuation(
     clip: CachedClip,
-    request: LatentContinuationRequest,
+    request: ContinuationRequest,
     *,
     num_frames: int,
     latent_h: int,
     latent_w: int,
 ) -> LatentContinuation:
-    """Place ``num_frames`` new window frames so its first ``overlap`` frames repeat the clip tail."""
+    """Place a ``num_frames`` window so its first ``overlap`` frames repeat the clip tail."""
     overlap = request.overlap_frames
     if tuple(clip.video.shape[-2:]) != (latent_h, latent_w):
         raise OmniClientError(
@@ -146,28 +130,30 @@ def plan_latent_continuation(
             f"MiniMax H3 continuation window ({num_frames} frames) must exceed continue_overlap_frames ({overlap})"
         )
     start = clip.end_frame - overlap
-    window = ContinuationWindow(start, start + num_frames, overlap)
-    if window.end > _MAX_TIMELINE_FRAMES:
+    if start + num_frames > _MAX_TIMELINE_FRAMES:
         raise OmniClientError(
             f"MiniMax H3 continuation chains are limited to {MINIMAX_H3_MAX_CONTINUATION_SECONDS:g} seconds"
         )
-    overlap_audio_t = window.overlap_audio_t
+    overlap_audio_t = _audio_t(clip.end_frame) - _audio_t(start)
     if overlap_audio_t > clip.audio.shape[-1]:
         raise OmniClientError("MiniMax H3 cached source audio is shorter than the requested overlap")
-    return LatentContinuation(
-        window=window,
-        video_tail=clip.video[:, :, -_video_t(overlap) :],
-        audio_tail=clip.audio[..., -overlap_audio_t:],
+    prefix = LatentPrefix(
+        video=clip.video[:, :, -_video_t(overlap) :],
+        audio=clip.audio[..., -overlap_audio_t:],
+        start_frame=start,
+        overlap_frames=overlap,
     )
+    return LatentContinuation(prefix=prefix, num_frames=num_frames)
 
 
 def trim_decoded_overlap(
     video: torch.Tensor,
-    audio: torch.Tensor,
-    continuation: LatentContinuation,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    audio: torch.Tensor | None,
+    *,
+    frames: int,
+    audio_fraction: float,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Drop the hidden overlap from decoded ``[B, C, F, H, W]`` frames and ``[..., S]`` audio."""
-    window = continuation.window
-    window_audio_t = window.audio_end - window.audio_start
-    drop_samples = round(audio.shape[-1] * window.overlap_audio_t / window_audio_t)
-    return video[:, :, window.overlap :], audio[..., drop_samples:]
+    if audio is not None:
+        audio = audio[..., round(audio.shape[-1] * audio_fraction) :]
+    return video[:, :, frames:], audio
