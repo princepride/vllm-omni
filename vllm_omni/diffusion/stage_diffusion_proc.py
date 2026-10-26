@@ -373,6 +373,26 @@ class StageDiffusionProc:
         request_socket: zmq.asyncio.Socket | None = None
         response_socket: zmq.asyncio.Socket | None = None
         response_connected = False
+        dead_notified = False
+
+        async def notify_client_dead() -> None:
+            # Send the death sentinel so the client can detect the fatal
+            # failure promptly (mirrors EngineCoreProc._send_engine_dead).
+            # A PUSH socket without a connected peer blocks on send, so skip
+            # the sentinel in that case and bound the send so a stuck client
+            # cannot hang teardown.
+            nonlocal dead_notified
+            if dead_notified or not response_connected or response_socket is None:
+                return
+            dead_notified = True
+            try:
+                response_socket.setsockopt(zmq.LINGER, 4000)
+                await asyncio.wait_for(
+                    response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD),
+                    timeout=5.0,
+                )
+            except Exception:
+                logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
 
         try:
             request_socket = ctx.socket(zmq.PULL)
@@ -382,22 +402,11 @@ class StageDiffusionProc:
             response_socket.connect(response_address)
             response_connected = True
             request_socket.connect(request_address)
-            await self._run_loop(request_socket, response_socket)
+            await self._run_loop(request_socket, response_socket, notify_client_dead)
         except Exception:
-            # Send the death sentinel so the client can detect the fatal
-            # failure promptly, including failures while the loop initializes
-            # (mirrors EngineCoreProc._send_engine_dead). A PUSH socket without
-            # a connected peer blocks on send, so skip the sentinel in that
-            # case and bound the send so a stuck client cannot hang teardown.
-            if response_connected and response_socket is not None:
-                try:
-                    response_socket.setsockopt(zmq.LINGER, 4000)
-                    await asyncio.wait_for(
-                        response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD),
-                        timeout=5.0,
-                    )
-                except Exception:
-                    logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
+            # Covers connect and loop initialization failures; dispatch
+            # failures have already notified the client inside _run_loop.
+            await notify_client_dead()
             raise
         finally:
             self._active_tasks = None
@@ -412,6 +421,7 @@ class StageDiffusionProc:
         self,
         request_socket: zmq.asyncio.Socket,
         response_socket: zmq.asyncio.Socket,
+        notify_client_dead: Callable[[], Awaitable[None]],
     ) -> None:
         """Initialize and dispatch requests within the transport lifetime."""
 
@@ -621,6 +631,12 @@ class StageDiffusionProc:
 
                 elif msg_type == "shutdown":
                     break
+
+        except Exception:
+            # Notify before draining rpc_task: cancelling it waits for any
+            # in-flight executor RPC thread, which may block for a long time.
+            await notify_client_dead()
+            raise
 
         finally:
             rpc_task.cancel()

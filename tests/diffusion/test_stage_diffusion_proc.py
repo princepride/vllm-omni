@@ -553,3 +553,39 @@ async def test_proc_rpc_engine_death_wakes_recv_without_new_messages(proc_contro
         release.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_proc_loop_failure_notifies_client_before_draining_blocked_rpc(proc_control_loop):
+    proc, submit, outgoing, request_socket, response_socket, context = proc_control_loop
+    entered = threading.Event()
+    release = threading.Event()
+
+    def collective_rpc(*_args):
+        entered.set()
+        assert release.wait(timeout=5)
+
+    proc._engine.collective_rpc.side_effect = collective_rpc
+    task = asyncio.create_task(proc.run_loop("request", "response"))
+    try:
+        submit({"type": "collective_rpc", "rpc_id": "interaction", "method": "submit_interaction"})
+        assert await asyncio.to_thread(entered.wait, 1)
+        # A malformed request fails the recv loop while the RPC thread is blocked.
+        submit({"type": "add_request"})
+        assert await asyncio.wait_for(outgoing.get(), 1) == StageDiffusionProc.DIFFUSION_PROC_DEAD
+        assert not task.done(), "teardown must still wait for the executor thread"
+        response_socket.close.assert_not_called()
+
+        release.set()
+        with pytest.raises(KeyError, match="request_id"):
+            await asyncio.wait_for(task, 1)
+        assert outgoing.empty(), "the death sentinel must be sent only once"
+        request_socket.close.assert_called_once()
+        response_socket.close.assert_called_once()
+        context.term.assert_called_once()
+        assert proc._active_tasks is None
+        assert proc._fatal_event is None
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
