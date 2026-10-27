@@ -44,9 +44,9 @@ def _image_result():
     )
 
 
-def _serving_chat(result) -> tuple[OmniOpenAIServingChat, _FakeDiffusionEngine]:
+def _serving_chat(result, **kwargs) -> tuple[OmniOpenAIServingChat, _FakeDiffusionEngine]:
     engine = _FakeDiffusionEngine(result)
-    serving_chat = OmniOpenAIServingChat.for_diffusion(diffusion_engine=engine, model_name="sensenova")
+    serving_chat = OmniOpenAIServingChat.for_diffusion(diffusion_engine=engine, model_name="sensenova", **kwargs)
     serving_chat._diffusion_extra_body_params = frozenset()
     serving_chat._diffusion_extra_output_params = frozenset({"think_text"})
     return serving_chat, engine
@@ -64,6 +64,7 @@ def _request(modalities: list[str], **kwargs) -> ChatCompletionRequest:
 async def _collect(generator) -> list:
     events = [event async for event in generator]
     assert events[-1] == "data: [DONE]\n\n"
+    assert events.count("data: [DONE]\n\n") == 1
     return [json.loads(event.removeprefix("data: ")) for event in events[:-1]]
 
 
@@ -82,8 +83,35 @@ def test_text_output_streams_sse_chunks():
     assert content_chunk["choices"][0]["finish_reason"] is None
     assert finish_chunk["choices"][0]["finish_reason"] == "stop"
     assert finish_chunk["metrics"] == {"think_text": "hmm"}
+    assert "usage" not in content_chunk and "usage" not in finish_chunk
     assert usage_chunk["choices"] == []
     assert usage_chunk["usage"]["completion_tokens"] == 5
+
+
+def test_continuous_usage_is_attached_to_every_chunk():
+    serving_chat, _ = _serving_chat(_text_result("A cat on a mat."))
+    request = _request(["text"], stream=True, stream_options={"include_usage": True, "continuous_usage_stats": True})
+
+    generator = asyncio.run(serving_chat._create_chat_completion(request))
+    chunks = asyncio.run(_collect(generator))
+
+    content_chunk, finish_chunk, usage_chunk = chunks
+    expected_usage = {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
+    for chunk in (content_chunk, finish_chunk):
+        assert {k: chunk["usage"][k] for k in expected_usage} == expected_usage
+    assert [chunk for chunk in chunks if chunk["choices"] == []] == [usage_chunk]
+    assert {k: usage_chunk["usage"][k] for k in expected_usage} == expected_usage
+
+
+def test_server_forced_usage_without_stream_options():
+    serving_chat, _ = _serving_chat(_text_result("A cat on a mat."), enable_force_include_usage=True)
+
+    generator = asyncio.run(serving_chat._create_chat_completion(_request(["text"], stream=True)))
+    chunks = asyncio.run(_collect(generator))
+
+    assert len(chunks) == 3
+    assert chunks[-1]["choices"] == []
+    assert chunks[-1]["usage"]["completion_tokens"] == 5
 
 
 def test_usage_chunk_omitted_without_include_usage():

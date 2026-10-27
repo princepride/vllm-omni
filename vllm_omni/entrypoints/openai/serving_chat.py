@@ -421,12 +421,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         cls,
         diffusion_engine: AsyncOmni,
         model_name: str,
+        enable_force_include_usage: bool = False,
     ) -> "OmniOpenAIServingChat":
         """Create a chat serving instance for diffusion models.
 
         Args:
             diffusion_engine: The async diffusion engine
             model_name: Name of the model being served
+            enable_force_include_usage: Always send a usage chunk on streams
 
         Returns:
             OmniOpenAIServingChat instance configured for diffusion mode
@@ -441,6 +443,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_model_name = model_name
         instance._diffusion_extra_body_params = None
         instance._diffusion_extra_output_params = None
+        instance.enable_force_include_usage = enable_force_include_usage
         instance.engine_client = None
         instance.has_kv_connector = False
         # Extra body/output params are resolved lazily on first use; see
@@ -4378,9 +4381,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 metrics=getattr(response, "metrics", None),
             ),
         ]
-        include_usage, _ = should_include_usage(
-            request.stream_options, getattr(self, "enable_force_include_usage", False)
+        include_usage, include_continuous_usage = should_include_usage(
+            request.stream_options, self.enable_force_include_usage
         )
+        if include_continuous_usage and response.usage is not None:
+            # The output is already complete, so every replayed chunk carries
+            # the final cumulative usage.
+            for chunk in chunks:
+                chunk.usage = response.usage
         if include_usage and response.usage is not None:
             chunks.append(
                 OmniChatCompletionStreamResponse(
