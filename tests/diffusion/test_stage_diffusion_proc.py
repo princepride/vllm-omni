@@ -96,6 +96,56 @@ async def test_run_loop_cleans_up_when_connect_fails(mocker, bad_side):
         client_ctx.term()
 
 
+@pytest.mark.asyncio
+async def test_run_loop_teardown_is_bounded_when_client_stops_draining(mocker):
+    """A client that stops reading must not stretch teardown past the sentinel timeout."""
+    import zmq
+    import zmq.asyncio
+
+    client_ctx = zmq.asyncio.Context()
+    request_socket = client_ctx.socket(zmq.PUSH)
+    response_socket = client_ctx.socket(zmq.PULL)
+    response_socket.setsockopt(zmq.RCVHWM, 1)
+    request_port = request_socket.bind_to_random_port("tcp://127.0.0.1")
+    response_port = response_socket.bind_to_random_port("tcp://127.0.0.1")
+    proc_ctx = zmq.asyncio.Context()
+    mocker.patch.object(stage_diffusion_proc.zmq.asyncio, "Context", return_value=proc_ctx)
+    mocker.patch.object(StageDiffusionProc, "_DEAD_SENTINEL_SEND_TIMEOUT_S", 0.5)
+
+    async def fill_responses_then_fail(_self, _request_socket, proc_response_socket, _notify_client_dead):
+        # Queue undelivered responses until the PUSH pipe is full, as when the
+        # client stops draining, then fail the loop.
+        sync_socket = zmq.Socket.shadow(proc_response_socket.underlying)
+        payload = b"x" * 65536
+        for _ in range(100_000):
+            try:
+                sync_socket.send(payload, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("response pipe never filled")
+        raise RuntimeError("loop failed")
+
+    mocker.patch.object(StageDiffusionProc, "_run_loop", side_effect=fill_responses_then_fail, autospec=True)
+    stage_proc = StageDiffusionProc.__new__(StageDiffusionProc)
+    try:
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match="loop failed"):
+            await asyncio.wait_for(
+                stage_proc.run_loop(f"tcp://127.0.0.1:{request_port}", f"tcp://127.0.0.1:{response_port}"),
+                timeout=10,
+            )
+        # 0.5s send timeout plus close(); the 4s linger must not apply.
+        assert time.monotonic() - start < 3.0
+        assert proc_ctx.closed
+    finally:
+        proc_ctx.destroy(linger=0)
+        request_socket.close(linger=0)
+        response_socket.close(linger=0)
+        client_ctx.term()
+
+
 def test_run_diffusion_proc_sets_lifecycle_before_loading_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
 

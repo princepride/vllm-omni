@@ -74,6 +74,7 @@ class StageDiffusionProc:
     """
 
     DIFFUSION_PROC_DEAD = b"DIFFUSION_PROC_DEAD"
+    _DEAD_SENTINEL_SEND_TIMEOUT_S = 5.0
 
     def __init__(self, model: str, od_config: OmniDiffusionConfig) -> None:
         self._model = model
@@ -87,9 +88,11 @@ class StageDiffusionProc:
         self._active_tasks: dict[str, asyncio.Task] | None = None
         # Set when a request-handler detects that the engine's multiproc
         # executor has died (e.g. a worker process crashed and the executor's
-        # monitor thread closed it). Once set, ``run_loop`` breaks out so the
-        # outer ``except``/``finally`` can send ``DIFFUSION_PROC_DEAD`` and
-        # ``ReplicaStatus.DOWN``, then the subprocess exits non-zero. Without
+        # monitor thread closed it). Once set, ``_run_loop`` raises and its
+        # ``except`` sends ``DIFFUSION_PROC_DEAD`` *before* its ``finally``
+        # drains ``rpc_task`` (which may wait on a blocked executor RPC
+        # thread); ``run_loop`` then releases the sockets and the subprocess
+        # exits non-zero. Keep that notify-before-drain order. Without
         # this, the run_loop would swallow per-request errors and keep
         # serving 500s indefinitely while heartbeats still report UP.
         self._fatal_event: asyncio.Event | None = None
@@ -389,10 +392,13 @@ class StageDiffusionProc:
                 response_socket.setsockopt(zmq.LINGER, 4000)
                 await asyncio.wait_for(
                     response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD),
-                    timeout=5.0,
+                    timeout=StageDiffusionProc._DEAD_SENTINEL_SEND_TIMEOUT_S,
                 )
             except Exception:
                 logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
+                # The client is not draining responses; do not let close()
+                # linger flushing queued messages past the send timeout.
+                response_socket.setsockopt(zmq.LINGER, 0)
 
         try:
             request_socket = ctx.socket(zmq.PULL)
