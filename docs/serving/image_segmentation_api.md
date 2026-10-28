@@ -7,7 +7,7 @@ when the served model declares segmentation support; other models answer 400.
 
 Supported models: [SAM 3 / SAM 3.1](../models/supported_models.md)
 (`facebook/sam3.1`, `facebook/sam3`), from Meta's native checkpoint or a
-Transformers export. See the [SAM 3.1 recipe](../../recipes/facebook/SAM3.1-H200.md).
+Transformers export. See the [SAM 3.1 recipe](gh-file:recipes/facebook/SAM3.1-H200.md).
 
 ## Quick Start
 
