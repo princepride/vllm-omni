@@ -22,7 +22,7 @@ class _FakeDiffusionEngine:
         self.result = result
         self.prompts = []
 
-    async def generate(self, prompt, sampling_params_list, request_id):
+    async def generate(self, prompt, sampling_params_list, request_id, **kwargs):
         self.prompts.append(prompt)
         yield self.result
 
