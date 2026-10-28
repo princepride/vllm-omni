@@ -59,8 +59,7 @@ Multipart form fields:
 
 | Field | Type | Default | Description |
 | ----- | ---- | ------- | ----------- |
-| `image` | file | — | Input image. Provide exactly one of `image` or `url`. |
-| `url` | string | — | Image URL or data URL instead of an upload. |
+| `image` | file | — | Input image upload (required). The endpoint does not fetch remote URLs. |
 | `prompt` | string | `""` | Concept to segment, e.g. `"red car"`. May be empty when `boxes` are given. |
 | `boxes` | JSON string | — | Exemplar boxes `[[x0, y0, x1, y1], ...]` in pixels, at most 64. |
 | `box_labels` | JSON string | all `1` | One label per box: `1` positive, `0` negative. |

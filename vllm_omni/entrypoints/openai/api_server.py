@@ -2770,7 +2770,6 @@ async def edit_images(
 async def segment_image(
     raw_request: Request,
     image: UploadFile | None = File(None),
-    url: str | None = Form(None),
     prompt: str = Form(""),
     boxes: str | None = Form(None),  # JSON [[x0, y0, x1, y1], ...] in pixels
     box_labels: str | None = Form(None),  # JSON [1 | 0, ...]: positive or negative exemplar
@@ -2791,8 +2790,8 @@ async def segment_image(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"Model '{model_name}' does not support image segmentation.",
         )
-    if (image is None) == (url is None):
-        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Provide exactly one of 'image' or 'url'.")
+    if image is None:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Upload the input 'image'.")
     box_list = _parse_json_list_form(boxes, "boxes")
     label_list = _parse_json_list_form(box_labels, "box_labels")
     if not prompt.strip() and not box_list:
@@ -2802,7 +2801,7 @@ async def segment_image(
     try:
         request_id = f"img_seg-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
-        pil_images = await _load_input_images([image if image is not None else url], normalize_rgb=True)
+        pil_images = await _load_input_images([image], normalize_rgb=True)
         omni_prompt = OmniTextPrompt(prompt=prompt.strip(), multi_modal_data={"image": pil_images[0]})
         extra_args: dict[str, Any] = {}
         for key, value in (

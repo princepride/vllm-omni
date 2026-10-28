@@ -135,15 +135,10 @@ def test_segmentation_rejects_bad_prompts(data, message):
     assert message in response.text
 
 
-def test_segmentation_requires_exactly_one_image_source():
-    client = _client(FakeSegmentationEngine())
-    assert client.post("/v1/images/segmentations", data={"prompt": "x"}).status_code == HTTPStatus.BAD_REQUEST
-    both = client.post(
-        "/v1/images/segmentations",
-        files={"image": _image_file()},
-        data={"prompt": "x", "url": "https://example.com/a.png"},
-    )
-    assert both.status_code == HTTPStatus.BAD_REQUEST
+def test_segmentation_requires_an_uploaded_image():
+    response = _client(FakeSegmentationEngine()).post("/v1/images/segmentations", data={"prompt": "x"})
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert "Upload the input 'image'" in response.text
 
 
 def test_segmentation_is_rejected_for_models_without_support():

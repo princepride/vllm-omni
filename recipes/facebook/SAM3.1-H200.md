@@ -20,7 +20,7 @@ layers before image or video editing with other vLLM-Omni models.
 | Item | Contract |
 | ---- | -------- |
 | Endpoint | `POST /v1/images/segmentations` ([Image Segmentation API](../../docs/serving/image_segmentation_api.md)) |
-| Input | One image per request (upload or URL), any size; resized internally to 1008x1008 |
+| Input | One uploaded image per request, any size; resized internally to 1008x1008 |
 | Prompts | Text concept, up to 64 exemplar boxes with positive (`1`) / negative (`0`) labels, or both |
 | Output | Instances above `score_threshold` (default 0.5): mask (PNG or COCO RLE), `[x0, y0, x1, y1]` box and score, all at the input resolution |
 | Checkpoints | Meta's native `sam3*.safetensors` layout and Transformers exports (`Sam3Model`, `Sam3VideoModel`) |
