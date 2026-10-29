@@ -169,7 +169,8 @@ def continuation_inherits_source_canvas(task: str, sampling: Any) -> bool:
         task == "t2va"
         and resolve_continuation_request(extra) is not None
         and target.get("aspect_ratio", extra.get("aspect_ratio")) is None
-        and (getattr(sampling, "height", None) is None or getattr(sampling, "width", None) is None)
+        and getattr(sampling, "height", None) is None
+        and getattr(sampling, "width", None) is None
     )
 
 
@@ -235,6 +236,9 @@ def resolve_minimax_h3_shape(
 
     height = getattr(sampling, "height", None)
     width = getattr(sampling, "width", None)
+    if (height is None) != (width is None) and resolve_continuation_request(extra) is not None:
+        # A lone dimension would otherwise be replaced by the planned canvas.
+        raise OmniClientError("MiniMax H3 continue_from needs both height and width, or neither")
     requested_aspect_ratio = target.get("aspect_ratio", extra.get("aspect_ratio"))
     if task == "t2va" and requested_aspect_ratio is None and resolve_continuation_request(extra) is not None:
         # A continuation needs no aspect ratio of its own: an explicit size wins

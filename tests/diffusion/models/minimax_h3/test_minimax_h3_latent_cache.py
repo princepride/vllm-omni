@@ -284,6 +284,7 @@ def test_hidden_prefix_packs_with_references_user_guides_and_keyframes(task):
 def test_encoder_samples_the_returned_clip_behind_the_hidden_overlap():
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
         _resolve_task,
+        continuation_inherits_source_canvas,
         resolve_minimax_h3_shape,
     )
 
@@ -300,6 +301,12 @@ def test_encoder_samples_the_returned_clip_behind_the_hidden_overlap():
         resolve_minimax_h3_shape(
             "t2va", SimpleNamespace(extra_args={}, num_frames=124, fps=24, height=None, width=None), None
         )
+    # A lone dimension is neither a size nor an inherited canvas.
+    for height, width in ((768, None), (None, 1344)):
+        half = SimpleNamespace(extra_args={"continue_from": "v"}, num_frames=124, fps=24, height=height, width=width)
+        assert not continuation_inherits_source_canvas("t2va", half)
+        with pytest.raises(OmniClientError, match="both height and width"):
+            resolve_minimax_h3_shape("t2va", half, None)
 
 
 def test_edit_masks_written_for_the_returned_clip_map_onto_the_window():
@@ -510,6 +517,16 @@ def test_unsized_t2va_continuation_keeps_a_portrait_source_canvas():
     # An explicit aspect ratio is the caller's canvas: it must match the source like any request.
     with pytest.raises(OmniClientError, match="same canvas"):
         _run(pipeline, _conditioning("t2va", 141), {"continue_from": "portrait", "aspect_ratio": "16:9"})
+    # Guide frames were encoded on the provisional canvas, so they cannot follow the swap.
+    guided = _conditioning(
+        "t2va",
+        141,
+        guide_blocks=({"kind": "image", "frame_index": 30, "latent_h": LATENT_H, "latent_w": LATENT_W},),
+        guide_visual_condition=torch.zeros((LATENT_H // 2) * (LATENT_W // 2), 96),
+    )
+    with pytest.raises(OmniClientError, match="timeline guides with continue_from"):
+        _run(pipeline, guided, {"continue_from": "portrait"})
+    assert len(calls) == 1
 
 
 def test_unknown_source_is_a_client_error():
