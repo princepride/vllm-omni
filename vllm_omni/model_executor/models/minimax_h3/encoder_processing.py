@@ -161,6 +161,18 @@ def _validate_reference_image(image: Image.Image) -> None:
     resolve_minimax_h3_reference_image_shape(image)
 
 
+def continuation_inherits_source_canvas(task: str, sampling: Any) -> bool:
+    """Whether a T2VA ``continue_from`` request names no canvas and so keeps its source clip's."""
+    extra = sampling.extra_args or {}
+    target = extra.get("target") if isinstance(extra.get("target"), Mapping) else {}
+    return (
+        task == "t2va"
+        and resolve_continuation_request(extra) is not None
+        and target.get("aspect_ratio", extra.get("aspect_ratio")) is None
+        and (getattr(sampling, "height", None) is None or getattr(sampling, "width", None) is None)
+    )
+
+
 def resolve_minimax_h3_shape(
     task: str,
     sampling: Any,
@@ -225,8 +237,10 @@ def resolve_minimax_h3_shape(
     width = getattr(sampling, "width", None)
     requested_aspect_ratio = target.get("aspect_ratio", extra.get("aspect_ratio"))
     if task == "t2va" and requested_aspect_ratio is None and resolve_continuation_request(extra) is not None:
-        # A continuation keeps its source's canvas, so T2VA needs no aspect ratio
-        # of its own: an explicit size wins below, otherwise the H3 default.
+        # A continuation needs no aspect ratio of its own: an explicit size wins
+        # below. Without one this canvas is provisional; only the diffusion worker
+        # holds the source clip, and it substitutes the source's canvas
+        # (see continuation_inherits_source_canvas).
         requested_aspect_ratio = "16:9"
     aspect_ratio = resolve_minimax_h3_aspect_ratio(task, requested_aspect_ratio, image)
     raw_short_edge = target.get("short_edge", extra.get("short_edge", MINIMAX_H3_OUTPUT_SHORT_EDGE))

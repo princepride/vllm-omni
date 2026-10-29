@@ -344,9 +344,15 @@ Everything else in the request describes only the clip it returns, exactly as
 without `continue_from`:
 
 - Task inference, references, `<Picture N>` labels, LoRA, sampling, quality,
-  `num_outputs_per_prompt`, `preencode_mp4`, latent upscale/refine, long-video
-  windows and step execution work unchanged. A T2VA continuation needs no
-  `aspect_ratio`: it keeps the source canvas.
+  `num_outputs_per_prompt`, `preencode_mp4`, latent upscale, long-video
+  windows and step execution work unchanged. `latent_refine` is rejected with
+  `continue_from`, because the refine pass would re-denoise the window without
+  the hidden tail.
+- Continuations run on the base canvas: a job is cached as the latents it
+  decodes (after `latent_refine`), or, when it was upscaled, as its latents
+  before the upscale. A T2VA continuation that sets neither a size nor an
+  `aspect_ratio` keeps the source canvas; an explicit size or aspect ratio
+  must match it.
 - Timeline guide `frame_index`, FL2VA `frame_indices`, latent-edit masks and
   source media, and `audio_mode=lock_source` driving audio refer to the returned
   clip: frame 0 is its first new frame, and negative indices count from its end.

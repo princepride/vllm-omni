@@ -89,6 +89,7 @@ from vllm_omni.model_executor.models.minimax_h3.continuation_request import (
 )
 from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     PreparedEncoderInputs,
+    continuation_inherits_source_canvas,
     encode_media,
     prepare_encoder_inputs,
 )
@@ -3137,6 +3138,8 @@ class MiniMaxH3Pipeline(
                 f"({expected_latent_t}, {expected_audio_t})"
             )
 
+        if continuation_inherits_source_canvas(conditioning.task, sampling):
+            conditioning = self._with_source_canvas(extra, conditioning)
         latent_continuation = self._resolve_latent_continuation(extra, conditioning)
         # A continuation samples audio on the chain's global timeline, which may
         # differ by a rounding step from the encoder's standalone length.
@@ -3253,6 +3256,10 @@ class MiniMaxH3Pipeline(
         if latent_refine is not None:
             if continuation is not None:
                 raise OmniClientError("MiniMax H3 latent_refine does not support latent-tail continuation")
+            if latent_continuation is not None:
+                # The refine pass re-denoises the whole window from the original
+                # request, without the hidden prefix guide or its global offset.
+                raise OmniClientError("MiniMax H3 latent_refine does not support continue_from")
             if conditioning.video_edit_clean_rows is not None or conditioning.audio_edit_clean_rows is not None:
                 raise OmniClientError("MiniMax H3 latent_refine does not support latent-mask editing")
             self._validate_refine_token_budget(
@@ -3347,6 +3354,19 @@ class MiniMaxH3Pipeline(
             ),
             **latent_edit,
         }
+
+    def _with_source_canvas(
+        self,
+        extra: Mapping[str, Any],
+        conditioning: MiniMaxH3EncoderConditioning,
+    ) -> MiniMaxH3EncoderConditioning:
+        """Give an unsized T2VA continuation its cached source's canvas (T2VA carries no image rows)."""
+        request = resolve_continuation_request(extra)
+        clip = self._latent_clip_cache.get(request.source) if request is not None else None
+        if clip is None:
+            return conditioning  # _resolve_latent_continuation reports the missing source
+        latent_h, latent_w = (int(size) for size in clip.video.shape[-2:])
+        return replace(conditioning, height=latent_h * 16, width=latent_w * 16)
 
     def _resolve_latent_continuation(
         self,
@@ -3514,7 +3534,10 @@ class MiniMaxH3Pipeline(
                     prefix=prefix,
                 )
             check_request_cancellation()
-            if output_index == 0 and context.get("latent_cache_key") is not None:
+            # Continuations stay on the base canvas, so an upscaled clip is cached
+            # before the upscale; otherwise cache what the client receives.
+            cache_clip = output_index == 0 and context.get("latent_cache_key") is not None
+            if cache_clip and upscale_target is not None:
                 self._cache_clip_latents(context, video_latent, audio_latent)
             if upscale_target is not None:
                 video_latent = self._upscaled_latent(video_latent, upscale_target)
@@ -3525,6 +3548,8 @@ class MiniMaxH3Pipeline(
                     context=context,
                     seed=output_seed,
                 )
+            if cache_clip and upscale_target is None:
+                self._cache_clip_latents(context, video_latent, audio_latent)
             if not self.load_vae_decoder:
                 videos.append(video_latent)
                 audios.append(audio_latent)

@@ -388,7 +388,7 @@ def _pipeline(*, load_vae_decoder=True):
         video = 100.0 * len(calls) + torch.arange(kwargs["latent_t"], dtype=torch.float32).view(1, 1, -1, 1, 1)
         audio = 100.0 * len(calls) + torch.arange(kwargs["audio_t"], dtype=torch.float32).view(1, 1, -1)
         return (
-            video.expand(1, 24, kwargs["latent_t"], LATENT_H, LATENT_W).contiguous(),
+            video.expand(1, 24, kwargs["latent_t"], kwargs["latent_h"], kwargs["latent_w"]).contiguous(),
             audio.expand(2, 32, kwargs["audio_t"]).contiguous(),
         )
 
@@ -467,6 +467,49 @@ def test_chained_requests_combine_continuation_with_every_task_and_lock_source()
         ("video_audio", 0),
         ("image", 22),
     ]
+
+
+def test_continuation_rejects_latent_refine():
+    pipeline, calls, _ = _pipeline()
+    _run(pipeline, _conditioning("t2va", 124), {"latent_cache_key": "a"})
+    with pytest.raises(OmniClientError, match="latent_refine does not support continue_from"):
+        _run(pipeline, _conditioning("ref2va", 141), {"continue_from": "a", "latent_refine": 0.4})
+    assert len(calls) == 1  # rejected before any denoising
+
+
+def test_refined_source_caches_the_latents_it_decodes():
+    pipeline, calls, _ = _pipeline()
+    decoded = []
+    decode = pipeline.decode
+
+    def capture(video_latent, audio_latent, **kwargs):
+        decoded.append((video_latent.clone(), audio_latent.clone()))
+        return decode(video_latent, audio_latent, **kwargs)
+
+    pipeline.decode = capture
+    _run(pipeline, _conditioning("t2va", 124), {"latent_cache_key": "a", "latent_refine": 0.4})
+    assert len(calls) == 2 and calls[1]["refine"] is not None  # base pass, then the refine pass
+    cached = pipeline._latent_clip_cache.get("a")
+    torch.testing.assert_close(cached.video, decoded[0][0].cpu())
+    torch.testing.assert_close(cached.audio, decoded[0][1].cpu())
+
+
+def test_unsized_t2va_continuation_keeps_a_portrait_source_canvas():
+    pipeline, calls, _ = _pipeline()
+    # A portrait source: its latent canvas is the transpose of the encoder's provisional 16:9 one.
+    portrait = CachedClip(
+        video=torch.zeros(1, 24, _video_t(124), LATENT_W, LATENT_H),
+        audio=torch.zeros(2, 32, _audio_t(124)),
+        start_frame=0,
+        num_frames=124,
+    )
+    pipeline._latent_clip_cache.put("portrait", portrait)
+    video, _ = _run(pipeline, _conditioning("t2va", 141), {"continue_from": "portrait"})
+    assert (calls[0]["latent_h"], calls[0]["latent_w"]) == (LATENT_W, LATENT_H)
+    assert video.shape[-3:-1] == (LATENT_W * 16, LATENT_H * 16)  # [batch, frames, height, width, channels]
+    # An explicit aspect ratio is the caller's canvas: it must match the source like any request.
+    with pytest.raises(OmniClientError, match="same canvas"):
+        _run(pipeline, _conditioning("t2va", 141), {"continue_from": "portrait", "aspect_ratio": "16:9"})
 
 
 def test_unknown_source_is_a_client_error():
