@@ -176,7 +176,7 @@ class Sam3Pipeline(nn.Module, SupportImageInput):
         super().__init__()
         self.od_config = od_config
         model = od_config.model
-        config = get_hf_file_to_dict("config.json", model)
+        config = get_hf_file_to_dict("config.json", model, revision=od_config.revision)
         if not config:
             raise ValueError(f"SAM3 checkpoint {model!r} has no config.json")
         self.config = Sam3DetectorConfig.from_dict(config)

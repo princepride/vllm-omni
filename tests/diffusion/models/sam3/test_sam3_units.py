@@ -11,11 +11,14 @@ outputs must match exactly in float32.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import PIL.Image
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.sam3 import pipeline_sam3
 from vllm_omni.diffusion.models.sam3.pipeline_sam3 import Sam3Pipeline, parse_prompt_boxes
 from vllm_omni.diffusion.models.sam3.sam3_model import Sam3Detector, Sam3DetectorConfig, load_sam3_weights
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -120,6 +123,20 @@ def test_config_accepts_combined_video_checkpoint_layout():
     assert nested == flat
     assert flat.vision_config.backbone_config.global_attn_indexes == [1]
     assert Sam3DetectorConfig.from_dict({}).vision_config.backbone_config.global_attn_indexes == [7, 15, 23, 31]
+
+
+def test_pipeline_reads_config_at_the_requested_revision(monkeypatch):
+    # config.json must come from the same revision as the tokenizer and the weights.
+    calls = []
+
+    def fake_get_hf_file_to_dict(file_name, model, revision="main"):
+        calls.append((file_name, model, revision))
+        return {}
+
+    monkeypatch.setattr(pipeline_sam3, "get_hf_file_to_dict", fake_get_hf_file_to_dict)
+    with pytest.raises(ValueError, match="has no config.json"):
+        Sam3Pipeline(od_config=SimpleNamespace(model="facebook/sam3", revision="abc123"))
+    assert calls == [("config.json", "facebook/sam3", "abc123")]
 
 
 def test_prompt_box_validation():
