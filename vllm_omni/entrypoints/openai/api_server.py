@@ -214,8 +214,8 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
 )
 from vllm_omni.entrypoints.openai.video.segmentation.helpers import (
     VIDEO_SEGMENTATION_MAX_BYTES,
-    build_video_segmentation_response,
     extract_video_segmentation,
+    render_video_segmentation_response,
     supports_video_segmentation,
 )
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
@@ -2870,7 +2870,7 @@ async def segment_video(
     prompts: str | None = Form(None),  # JSON ["other concept", ...], tracked alongside ``prompt``
     mask_video: bool = Form(False),
     model: str | None = Form(None),
-) -> VideoSegmentationResponse:
+) -> Response:
     """Track every instance of one or more text concepts through a video."""
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model not in (None, "auto", model_name):
@@ -2906,7 +2906,9 @@ async def segment_video(
             request_id=request_id,
         )
         payload = extract_video_segmentation(result)
-        return await asyncio.to_thread(build_video_segmentation_response, payload, model_name, mask_video)
+        # Build and serialize off the event loop: a long video's response can be tens of MB.
+        body = await asyncio.to_thread(render_video_segmentation_response, payload, model_name, mask_video)
+        return Response(content=body, media_type="application/json")
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:

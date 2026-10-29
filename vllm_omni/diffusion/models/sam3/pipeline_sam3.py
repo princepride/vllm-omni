@@ -59,6 +59,9 @@ DEFAULT_SCORE_THRESHOLD = 0.5
 DEFAULT_MASK_THRESHOLD = 0.5
 MAX_PROMPT_BOXES = 64
 MAX_VIDEO_PROMPTS = 16
+# One video runs inside a single uninterruptible forward, and the tracker keeps every re-anchored
+# frame's memory for the rest of the video, so cap the work (~68 s at 30 fps) a single request can take.
+MAX_VIDEO_FRAMES = 2048
 # The tracker's object-pointer window: a video shorter than this changes how pointers are weighted.
 _POINTER_LOOKAHEAD = 16
 
@@ -104,11 +107,23 @@ def parse_video_prompts(text: str, extra: dict[str, Any]) -> list[str]:
     return prompts
 
 
+def _too_many_frames() -> ValueError:
+    return ValueError(f"SAM3 video segmentation accepts at most {MAX_VIDEO_FRAMES} frames")
+
+
 def _video_frames(video: Any) -> tuple[Iterator[torch.Tensor], float | None]:
-    """RGB uint8 [3, H, W] frames from a video file path or already decoded frames, plus the frame rate."""
+    """RGB uint8 [3, H, W] frames from a video file path or already decoded frames, plus the frame rate.
+
+    Raises ``ValueError`` for an input without a video stream or with more than ``MAX_VIDEO_FRAMES``
+    frames: up front when the count is known, otherwise from the iterator once the cap is exceeded.
+    """
     if isinstance(video, np.ndarray) and video.ndim == 4:
+        if len(video) > MAX_VIDEO_FRAMES:
+            raise _too_many_frames()
         return (torch.from_numpy(np.ascontiguousarray(frame)).permute(2, 0, 1) for frame in video), None
     if isinstance(video, (list, tuple)):
+        if len(video) > MAX_VIDEO_FRAMES:
+            raise _too_many_frames()
         return (
             TF.pil_to_tensor(frame.convert("RGB"))
             if isinstance(frame, PIL.Image.Image)
@@ -118,12 +133,23 @@ def _video_frames(video: Any) -> tuple[Iterator[torch.Tensor], float | None]:
     if not isinstance(video, str):
         raise ValueError(f"SAM3 cannot read a video of type {type(video).__name__}")
     container = av.open(video)
-    stream = container.streams.video[0]
+    try:
+        if not container.streams.video:
+            raise ValueError("SAM3 video segmentation input has no video stream")
+        stream = container.streams.video[0]
+        # Containers such as MP4 report the frame count; Matroska/WebM report 0 and are capped while decoding.
+        if stream.frames > MAX_VIDEO_FRAMES:
+            raise _too_many_frames()
+    except BaseException:
+        container.close()
+        raise
     fps = float(stream.average_rate) if stream.average_rate else None
 
     def decode() -> Iterator[torch.Tensor]:
         with container:
-            for frame in container.decode(stream):
+            for index, frame in enumerate(container.decode(stream)):
+                if index >= MAX_VIDEO_FRAMES:
+                    raise _too_many_frames()
                 yield torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1)
 
     return decode(), fps

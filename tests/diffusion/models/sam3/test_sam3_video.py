@@ -13,11 +13,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+import av
 import numpy as np
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.sam3.pipeline_sam3 import parse_video_prompts, rle_counts
+from vllm_omni.diffusion.models.sam3 import pipeline_sam3
+from vllm_omni.diffusion.models.sam3.pipeline_sam3 import _video_frames, parse_video_prompts, rle_counts
 from vllm_omni.diffusion.models.sam3.sam3_tracker import Sam3Tracker, Sam3TrackerConfig
 from vllm_omni.diffusion.models.sam3.sam3_video import (
     Sam3VideoConfig,
@@ -201,6 +203,58 @@ def test_video_prompts_are_deduplicated_and_bounded():
         parse_video_prompts("x", {"prompts": "dog"})
     with pytest.raises(ValueError, match="at most"):
         parse_video_prompts("x", {"prompts": [f"p{i}" for i in range(20)]})
+
+
+def _write_video(path, container_format: str, num_frames: int) -> str:
+    with av.open(str(path), mode="w", format=container_format) as container:
+        stream = container.add_stream("libx264", rate=24)
+        stream.width, stream.height, stream.pix_fmt = 16, 16, "yuv420p"
+        for index in range(num_frames):
+            frame = av.VideoFrame.from_ndarray(np.full((16, 16, 3), index * 40, dtype=np.uint8), format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return str(path)
+
+
+def test_video_frames_decode_a_file_within_the_frame_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline_sam3, "MAX_VIDEO_FRAMES", 5)
+    frames, fps = _video_frames(_write_video(tmp_path / "clip.mp4", "mp4", 5))
+    decoded = list(frames)
+    assert fps == 24.0 and len(decoded) == 5
+    assert decoded[0].shape == (3, 16, 16) and decoded[0].dtype == torch.uint8
+
+
+@pytest.mark.parametrize(
+    ("name", "container_format"),
+    [
+        ("clip.mp4", "mp4"),  # frame count in the header: rejected before any frame is decoded
+        ("clip.mkv", "matroska"),  # no frame count: rejected once decoding passes the cap
+    ],
+)
+def test_video_frames_reject_videos_over_the_frame_cap(tmp_path, monkeypatch, name, container_format):
+    path = _write_video(tmp_path / name, container_format, 5)
+    monkeypatch.setattr(pipeline_sam3, "MAX_VIDEO_FRAMES", 4)
+    with pytest.raises(ValueError, match="at most 4 frames"):
+        frames, _ = _video_frames(path)
+        list(frames)
+    with pytest.raises(ValueError, match="at most 4 frames"):
+        _video_frames(np.zeros((5, 16, 16, 3), dtype=np.uint8))
+
+
+def test_video_frames_reject_files_without_a_video_stream(tmp_path):
+    path = str(tmp_path / "tone.wav")
+    with av.open(path, mode="w", format="wav") as container:
+        stream = container.add_stream("pcm_s16le", rate=8000)
+        frame = av.AudioFrame.from_ndarray(np.zeros((1, 800), dtype=np.int16), format="s16", layout="mono")
+        frame.sample_rate = 8000
+        for packet in stream.encode(frame):
+            container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    with pytest.raises(ValueError, match="no video stream"):
+        _video_frames(path)
 
 
 # ---------------------------------------------------------------------------

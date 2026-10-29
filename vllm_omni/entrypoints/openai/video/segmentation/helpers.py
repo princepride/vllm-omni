@@ -115,3 +115,10 @@ def build_video_segmentation_response(
             for index, frame in enumerate(frames)
         ],
     )
+
+
+def render_video_segmentation_response(
+    payload: dict[str, Any], model_name: str | None, include_mask_videos: bool
+) -> bytes:
+    """The response as JSON bytes, so a long video's per-frame RLE never serializes on the event loop."""
+    return build_video_segmentation_response(payload, model_name, include_mask_videos).model_dump_json().encode()

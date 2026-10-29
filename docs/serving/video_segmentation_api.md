@@ -81,7 +81,8 @@ Multipart form fields:
 | `model` | string | served model | Must match the served model when given. |
 
 At least one non-empty prompt is required. Every frame of the upload is
-processed in decode order.
+processed in decode order. A video may have at most 2048 frames (about 68 s at
+30 fps); longer videos answer 400, so split them into clips.
 
 ## Response
 

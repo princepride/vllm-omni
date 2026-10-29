@@ -98,5 +98,5 @@ around 0.9 and boxes in input pixels.
 - In BF16 the port stays within the reference's own FP32-vs-BF16 drift: mean
   mask IoU 0.993 against the BF16 reference, and 0.992 between the
   reference's two precisions.
-- Known limitations: one video per request; text prompts only; tracking starts
-  at the first frame.
+- Known limitations: one video per request, at most 2048 frames; text prompts
+  only; tracking starts at the first frame.
