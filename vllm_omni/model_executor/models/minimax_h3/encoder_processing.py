@@ -536,6 +536,18 @@ def prepare_encoder_inputs(
     source_audio = multi_modal_data.get("source_audio")
     raw_video_edit_mask = multi_modal_data.get("video_noise_mask")
     raw_audio_edit_mask = multi_modal_data.get("audio_noise_mask")
+    regenerate = extra_args.get("regenerate", False)
+    if not isinstance(regenerate, bool):
+        raise OmniClientError("MiniMax H3 regenerate must be a boolean")
+    if regenerate:
+        if task != "t2va" or source_video is None or source_audio is not None:
+            raise OmniClientError("MiniMax H3 regenerate takes a prompt and one source_video draft")
+        if raw_video_edit_mask is not None or raw_audio_edit_mask is not None:
+            raise OmniClientError("MiniMax H3 regenerate does not take noise masks")
+        # The draft travels as a latent-edit source with nothing to regenerate:
+        # both the local and the staged encoder layouts already carry clean
+        # source rows with their mask, and the DiT reads them as the draft.
+        raw_video_edit_mask = 0.0
     if (source_video is not None or source_audio is not None) and (
         raw_video_edit_mask is None and raw_audio_edit_mask is None
     ):
@@ -680,11 +692,15 @@ def prepare_encoder_inputs(
                     target_height=height,
                     target_frame_count=num_frames,
                     workdir=workdir,
+                    cover=regenerate,
                 )
                 edit_video_frames = load_video_frames(edit_video_metadata["prepared_path"])
             except subprocess.CalledProcessError as exc:
                 raise OmniClientError("MiniMax H3 could not decode source_video for editing") from exc
             video_edit = _frames_to_tensor(edit_video_frames)
+    if regenerate and edit_video_metadata is not None and edit_video_metadata["input_has_audio"]:
+        # Keep the draft's soundtrack for the output; the refiner never sees it.
+        audio_edit_mask = torch.zeros(2, audio_t)
 
     audio_edit: tuple[torch.Tensor, int] | None = None
     if audio_edit_mask is not None:
