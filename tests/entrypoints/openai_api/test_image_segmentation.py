@@ -141,6 +141,16 @@ def test_segmentation_requires_an_uploaded_image():
     assert "Upload the input 'image'" in response.text
 
 
+def test_segmentation_rejects_undecodable_upload():
+    engine = FakeSegmentationEngine()
+    response = _client(engine).post(
+        "/v1/images/segmentations", files={"image": ("image.png", b"not an image", "image/png")}, data={"prompt": "x"}
+    )
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert "Failed to open uploaded file" in response.text
+    assert engine.captured_prompt is None
+
+
 def test_segmentation_is_rejected_for_models_without_support():
     engine = FakeSegmentationEngine(model_class_name="QwenImagePipeline")
     response = _client(engine).post("/v1/images/segmentations", files={"image": _image_file()}, data={"prompt": "x"})

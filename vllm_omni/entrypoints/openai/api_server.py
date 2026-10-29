@@ -145,6 +145,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _generated_size_str,
     _get_max_edit_input_images,
     _load_input_images,
+    _load_uploaded_image,
     _parse_json_list_form,
     _supports_segmentation,
     _update_if_not_none,
@@ -2801,8 +2802,8 @@ async def segment_image(
     try:
         request_id = f"img_seg-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
-        pil_images = await _load_input_images([image], normalize_rgb=True)
-        omni_prompt = OmniTextPrompt(prompt=prompt.strip(), multi_modal_data={"image": pil_images[0]})
+        pil_image = await _load_uploaded_image(image)
+        omni_prompt = OmniTextPrompt(prompt=prompt.strip(), multi_modal_data={"image": pil_image})
         extra_args: dict[str, Any] = {}
         for key, value in (
             ("boxes", box_list),
@@ -2819,7 +2820,7 @@ async def segment_image(
             prompt=omni_prompt,
             request_id=request_id,
         )
-        width, height = pil_images[0].size
+        width, height = pil_image.size
         return ImageSegmentationResponse(
             created=int(time.time()),
             model=model_name,

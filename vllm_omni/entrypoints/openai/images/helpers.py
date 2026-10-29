@@ -30,7 +30,7 @@ from typing import Any
 import httpx
 import numpy as np
 import pybase64 as base64
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, UploadFile
 from PIL import Image
 from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
@@ -280,6 +280,14 @@ def _parse_json_list_form(value: str | None, field: str) -> list[Any] | None:
     if not isinstance(parsed, list):
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=f"'{field}' must be a JSON array")
     return parsed
+
+
+async def _load_uploaded_image(upload: UploadFile) -> Image.Image:
+    """Decode one uploaded image as RGB. Unlike ``_load_input_images`` it never fetches a URL."""
+    try:
+        return open_image(io.BytesIO(await upload.read())).convert("RGB")
+    except Exception as e:
+        raise ValueError(f"Failed to open uploaded file: {e}") from e
 
 
 def _coco_rle(mask: np.ndarray) -> SegmentationRLE:
