@@ -337,7 +337,7 @@ DiT worker, and samples the new request as a window whose first
 `continue_overlap_frames` frames repeat the end of the previous clip. Those
 frames are hidden: they are guided by the cached latents (no decode and
 re-encode, the same guides as in-request
-[latent-tail continuation](../../recipes/MiniMaxAI/MiniMax-H3.md#latent-tail-continuation-with-global-temporal-positions-ab))
+[latent-tail continuation](gh-file:recipes/MiniMaxAI/MiniMax-H3.md#latent-tail-continuation-with-global-temporal-positions-ab))
 and trimmed after decoding, on the chain's global AV timeline.
 
 Everything else in the request describes only the clip it returns, exactly as
