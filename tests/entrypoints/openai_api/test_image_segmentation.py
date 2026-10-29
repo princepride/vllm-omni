@@ -36,9 +36,20 @@ def _payload() -> dict:
     }
 
 
+def _empty_payload() -> dict:
+    """No instance cleared the threshold, packed the way ``Sam3Pipeline`` packs it."""
+    return {
+        "masks": np.packbits(np.zeros((0, HEIGHT * WIDTH), dtype=bool), axis=1),
+        "mask_shape": np.array([0, HEIGHT, WIDTH], dtype=np.int64),
+        "boxes": np.zeros((0, 4), dtype=np.float32),
+        "scores": np.zeros((0,), dtype=np.float32),
+    }
+
+
 class FakeSegmentationEngine:
-    def __init__(self, model_class_name: str = "Sam3VideoModel"):
+    def __init__(self, model_class_name: str = "Sam3VideoModel", payload=_payload):
         self.od_config = SimpleNamespace(model_class_name=model_class_name, supports_multimodal_inputs=True)
+        self.payload = payload
         self.captured_prompt: dict | None = None
         self.captured_sampling_params_list: list | None = None
 
@@ -48,7 +59,7 @@ class FakeSegmentationEngine:
     async def generate(self, prompt, request_id, sampling_params_list=None, **kwargs):
         self.captured_prompt = prompt
         self.captured_sampling_params_list = sampling_params_list
-        yield SimpleNamespace(multimodal_output={"segmentation": _payload()})
+        yield SimpleNamespace(multimodal_output={"segmentation": self.payload()})
 
 
 def _client(engine: FakeSegmentationEngine) -> TestClient:
@@ -117,6 +128,19 @@ def test_segmentation_rle_masks_round_trip():
     expected = np.zeros((HEIGHT, WIDTH), dtype=bool)
     expected[1:3, 1:3] = True
     np.testing.assert_array_equal(_decode_rle(square), expected)
+
+
+@pytest.mark.parametrize("mask_format", ["png", "rle"])
+def test_segmentation_without_matches_returns_empty_data(mask_format):
+    response = _client(FakeSegmentationEngine(payload=_empty_payload)).post(
+        "/v1/images/segmentations",
+        files={"image": _image_file()},
+        data={"prompt": "absent concept", "mask_format": mask_format},
+    )
+    assert response.status_code == HTTPStatus.OK, response.text
+    body = response.json()
+    assert body["data"] == []
+    assert (body["width"], body["height"], body["mask_format"]) == (WIDTH, HEIGHT, mask_format)
 
 
 @pytest.mark.parametrize(

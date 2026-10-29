@@ -319,7 +319,8 @@ def _extract_segmentation_instances(
             detail="The served model returned no segmentation output.",
         )
     count, height, width = (int(value) for value in np.asarray(payload["mask_shape"]).tolist())
-    packed = np.asarray(payload["masks"], dtype=np.uint8).reshape(count, -1)
+    # An explicit row width keeps a zero-instance payload decodable; ``-1`` cannot be inferred from 0 elements.
+    packed = np.asarray(payload["masks"], dtype=np.uint8).reshape(count, (height * width + 7) // 8)
     masks = np.unpackbits(packed, axis=1, count=height * width).reshape(count, height, width).astype(bool)
     boxes = np.asarray(payload["boxes"], dtype=np.float32).reshape(count, 4)
     scores = np.asarray(payload["scores"], dtype=np.float32).reshape(count)
