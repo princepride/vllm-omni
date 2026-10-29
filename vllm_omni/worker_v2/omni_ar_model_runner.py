@@ -267,6 +267,11 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # --- Omni: pooler_output ---
         engine_output_type = getattr(self.vllm_config.model_config, "engine_output_type", "text")
         need_pooler = engine_output_type != "text"
+        # The model's output contract applies independently of the sampler.
+        # Keep text_hidden for logits above even when downstream only needs codes.
+        include_hidden = sampling_output.include_hidden_states and bool(
+            getattr(self.model, "omni_pooler_payload_include_hidden", True)
+        )
 
         # --- Build base output ---
         model_runner_output = OmniModelRunnerOutput(
@@ -296,7 +301,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
-            text_hidden=text_hidden if need_pooler and sampling_output.include_hidden_states else None,
+            text_hidden=text_hidden if need_pooler and include_hidden else None,
             multimodal_outputs=multimodal_outputs if need_pooler else None,
             input_batch=input_batch if need_pooler else None,
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
@@ -312,8 +317,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         _guard_graph_replay_for_pooler_copy(
             self.main_stream,
             async_output.copy_event,
-            need_pooler=need_pooler
-            and (sampling_output.include_hidden_states or not sampling_output.owns_multimodal_outputs),
+            need_pooler=need_pooler and (include_hidden or not sampling_output.owns_multimodal_outputs),
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
         )
 
