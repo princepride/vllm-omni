@@ -301,12 +301,14 @@ def test_encoder_samples_the_returned_clip_behind_the_hidden_overlap():
         resolve_minimax_h3_shape(
             "t2va", SimpleNamespace(extra_args={}, num_frames=124, fps=24, height=None, width=None), None
         )
-    # A lone dimension is neither a size nor an inherited canvas.
+    # A lone dimension is neither a size nor an inherited canvas for T2VA; other
+    # tasks plan their canvas from the aspect ratio or image, as without continue_from.
     for height, width in ((768, None), (None, 1344)):
         half = SimpleNamespace(extra_args={"continue_from": "v"}, num_frames=124, fps=24, height=height, width=width)
         assert not continuation_inherits_source_canvas("t2va", half)
         with pytest.raises(OmniClientError, match="both height and width"):
             resolve_minimax_h3_shape("t2va", half, None)
+        assert resolve_minimax_h3_shape("ref2va", half, None)[:2] == (768, 1344)
 
 
 def test_edit_masks_written_for_the_returned_clip_map_onto_the_window():

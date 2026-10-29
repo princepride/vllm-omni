@@ -353,8 +353,9 @@ without `continue_from`:
   before the upscale. A T2VA continuation that sets neither a size nor an
   `aspect_ratio` keeps the source canvas; an explicit size or aspect ratio
   must match it, and a lone `height` or `width` is rejected. Timeline guides
-  on a continuation need that explicit size or aspect ratio unless the source
-  is 16:9, since guide frames are encoded before the source canvas is known.
+  on a T2VA continuation need that explicit size or aspect ratio unless the
+  source has the default 16:9 canvas (1344x768), since guide frames are
+  encoded before the source canvas is known.
 - Timeline guide `frame_index`, FL2VA `frame_indices`, latent-edit masks and
   source media, and `audio_mode=lock_source` driving audio refer to the returned
   clip: frame 0 is its first new frame, and negative indices count from its end.

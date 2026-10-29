@@ -236,8 +236,8 @@ def resolve_minimax_h3_shape(
 
     height = getattr(sampling, "height", None)
     width = getattr(sampling, "width", None)
-    if (height is None) != (width is None) and resolve_continuation_request(extra) is not None:
-        # A lone dimension would otherwise be replaced by the planned canvas.
+    if task == "t2va" and (height is None) != (width is None) and resolve_continuation_request(extra) is not None:
+        # A lone dimension would otherwise be replaced by the inherited source canvas.
         raise OmniClientError("MiniMax H3 continue_from needs both height and width, or neither")
     requested_aspect_ratio = target.get("aspect_ratio", extra.get("aspect_ratio"))
     if task == "t2va" and requested_aspect_ratio is None and resolve_continuation_request(extra) is not None:
