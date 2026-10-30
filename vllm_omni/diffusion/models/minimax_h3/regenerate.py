@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -102,12 +102,31 @@ class _RegenerateLoRAFusion(MiniMaxH3WeightFusion):
     error_cls: ClassVar[type[ValueError]] = MiniMaxH3RegenerateError
 
 
+def _fusion_peak_bytes(patches: Mapping[str, Any]) -> tuple[int, int]:
+    """LoRA rank and the largest transient accelerator memory one fused parameter needs.
+
+    Fusing a parameter holds its FP32 delta (for grouped QKV, the per-slot
+    products and the placed delta at once) next to the BF16 weight and result,
+    so twelve bytes per element bound it.
+    """
+    rank = peak = 0
+    for patch in patches.values():
+        factors = [(a, b) for a, b in patch.low_rank.values() if a is not None and b is not None]
+        if not factors:
+            continue
+        rank = max(rank, *(a.shape[0] for a, _ in factors))
+        elements = sum(b.shape[0] for _, b in factors) * max(a.shape[1] for a, _ in factors)
+        peak = max(peak, 12 * elements)
+    return rank, peak
+
+
 @dataclass
 class MiniMaxH3RegenerateAdapter:
     """An Open-H3-Regenerate bundle, resolved against one H3 transformer."""
 
     source: Path
     fusion: _RegenerateLoRAFusion
+    fusion_peak_bytes: int = 0
 
     @property
     def upscaler_path(self) -> Path:
@@ -143,11 +162,32 @@ class MiniMaxH3RegenerateAdapter:
             raise MiniMaxH3RegenerateError(
                 f"{root} is missing the release's latent upscaler {REGENERATE_UPSCALER_FILE}"
             )
-        logger.info("Open-H3-Regenerate bundle %s: %d fused parameters", root, len(patches))
-        return cls(source=root, fusion=_RegenerateLoRAFusion(source=lora_path, patches=patches, head_dim=head_dim))
+        rank, peak = _fusion_peak_bytes(patches)
+        # The fusion runs on the accelerator while the checkpoint streams in, on
+        # top of the weights already loaded; say how much it needs up front.
+        logger.info(
+            "Open-H3-Regenerate bundle %s: %d fused parameters, LoRA rank %d; fusing needs up to %.2f GiB "
+            "of accelerator memory per parameter while the checkpoint loads",
+            root,
+            len(patches),
+            rank,
+            peak / 2**30,
+        )
+        return cls(
+            source=root,
+            fusion=_RegenerateLoRAFusion(source=lora_path, patches=patches, head_dim=head_dim),
+            fusion_peak_bytes=peak,
+        )
 
     def apply(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
-        return self.fusion.apply(weights)
+        try:
+            yield from self.fusion.apply(weights)
+        except torch.OutOfMemoryError as exc:
+            raise MiniMaxH3RegenerateError(
+                f"ran out of accelerator memory fusing {self.source} into the checkpoint at load time; "
+                f"each fused parameter needs up to {self.fusion_peak_bytes / 2**30:.2f} GiB beyond the weights "
+                "already loaded. Free memory on these devices or serve on devices with more memory."
+            ) from exc
 
     def validate_fully_applied(self, loaded: Iterable[str] | None = None) -> None:
         self.fusion.validate_fully_applied(loaded)

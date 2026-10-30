@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+from vllm.logger import init_logger
 
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
@@ -47,6 +48,8 @@ from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
     MINIMAX_H3_TIMELINE_GUIDES_KEY,
     prepare_timeline_guides,
 )
+
+logger = init_logger(__name__)
 
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
@@ -698,9 +701,12 @@ def prepare_encoder_inputs(
             except subprocess.CalledProcessError as exc:
                 raise OmniClientError("MiniMax H3 could not decode source_video for editing") from exc
             video_edit = _frames_to_tensor(edit_video_frames)
-    if regenerate and edit_video_metadata is not None and edit_video_metadata["input_has_audio"]:
-        # Keep the draft's soundtrack for the output; the refiner never sees it.
-        audio_edit_mask = torch.zeros(2, audio_t)
+    if regenerate and edit_video_metadata is not None:
+        if edit_video_metadata["input_has_audio"]:
+            # Keep the draft's soundtrack for the output; the refiner never sees it.
+            audio_edit_mask = torch.zeros(2, audio_t)
+        else:
+            logger.warning("Open-H3-Regenerate draft has no audio track; the regenerated video will be silent")
 
     audio_edit: tuple[torch.Tensor, int] | None = None
     if audio_edit_mask is not None:

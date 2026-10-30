@@ -39,8 +39,11 @@ from a separate server.
 ## References
 
 - Release: <https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K>
-  and its reference code in
-  [NVlabs/Sana `models/Open-H3-Regenerate-2K`](https://github.com/NVlabs/Sana/tree/sol-engine/models/Open-H3-Regenerate-2K)
+  at revision `5809c33730c18b6b1c827b40974855a4288641b3`, and its reference code in
+  [NVlabs/Sana `models/Open-H3-Regenerate-2K`](https://github.com/NVlabs/Sana/tree/6e4a44002149418a547434b91d7280a8bbdcace3/models/Open-H3-Regenerate-2K)
+  at commit `6e4a44002149418a547434b91d7280a8bbdcace3`
+- Base model: <https://huggingface.co/MiniMaxAI/MiniMax-H3> at revision
+  `48d93ede732756e404a3b1b2f3b3a9b5a22f6cfc` (`FL2VA/`)
 - Base model and request API: [MiniMax H3 recipe](../MiniMaxAI/MiniMax-H3.md),
   [Videos API](../../docs/serving/videos_api.md#minimax-h3-regenerate)
 
@@ -61,6 +64,11 @@ while the checkpoint loads. The LMS Sharp AdaLN curve branches in
 `lora/sharp_curve_branches.safetensors` have all-zero up factors in this
 release, so they contribute nothing; the loader verifies that and does not need
 the release's separately fetched `adaln_t_table`.
+
+The fusion runs on the accelerator, one parameter at a time, on top of the
+weights already loaded. The largest parameter needs up to 1.72 GiB at that
+moment; the server logs the figure when it claims the bundle and reports an
+out-of-memory error during the fusion as such.
 
 ## Hardware
 
@@ -122,19 +130,35 @@ Expected: `h264,2560,1440,124` and an `aac` stream.
 Qualification evidence on this hardware (single bounded runs, not benchmarks):
 
 - **DiT parity.** One transformer forward on real weights: vLLM-Omni (native
-  FL2VA checkpoint, LoRA fused at load) against Diffusers
-  `MiniMaxH3Transformer3DModel` (the release's `base_model/`, LoRA merged as
-  `cast(W_fp32 + B @ A)` like the release). Fixed random 7x16x32 video
-  latent, 48 text rows, audio rows locked at timestep 1:
+  FL2VA checkpoint at the base revision above, LoRA fused at load) against
+  Diffusers 0.40.0 `MiniMaxH3Transformer3DModel` (the release's `base_model/`
+  at the release revision above, LoRA merged as `cast(W_fp32 + B @ A)` like
+  the release). Fixed random 7x16x32 video latent, 48 text rows and audio rows
+  locked at timestep 1, all drawn from seed 1234, at the first and last
+  sigmas of the default 3-step refine. Each run needs one GPU with about 80 GB
+  free:
+
+  ```bash
+  T=tools/minimax_h3/regenerate_dit_parity.py
+  PYTHONPATH=. python $T reference ref.pt
+  PYTHONPATH=. python $T reference --no-adapter ref-base.pt
+  PYTHONPATH=. python $T vllm-omni omni.pt
+  PYTHONPATH=. python $T vllm-omni --no-adapter omni-base.pt
+  PYTHONPATH=. python $T compare ref.pt omni.pt            # column 1
+  PYTHONPATH=. python $T compare ref-base.pt omni-base.pt  # column 2
+  PYTHONPATH=. python $T compare ref.pt ref-base.pt        # column 3
+  ```
 
   | sigma | vLLM-Omni vs reference, with adapter | same, base H3 without adapter | adapter vs base (reference) |
   | ----- | ------------------------------------ | ----------------------------- | --------------------------- |
-  | 0.909375 | rel. L2 1.2e-2, cosine 0.99993 | rel. L2 2.2e-2 | rel. L2 0.44 |
-  | 0.666667 | rel. L2 2.8e-2, cosine 0.9996 | rel. L2 1.8e-2 | rel. L2 0.38 |
+  | 0.909375 | rel. L2 1.2e-2, cosine 0.99993 | rel. L2 2.2e-2, cosine 0.99976 | rel. L2 0.44 |
+  | 0.666667 | rel. L2 2.8e-2, cosine 0.9996 | rel. L2 1.8e-2, cosine 0.99984 | rel. L2 0.38 |
 
   The adapted outputs agree as closely as the two base implementations do
   (BF16, FlashAttention vs cuDNN SDPA), while the adapter itself moves the
-  velocity by about 40%.
+  velocity by about 40%. The script downloads both models at the pinned
+  revisions (`--release-dir` and `--base-dir` take local copies instead) and
+  skips the Sharp curve branches after asserting they are zero.
 - **End to end.** A MiniMax-H3 T2VA draft (1344x768, 124 frames, 50 steps)
   regenerated with the command above, first request after startup:
 

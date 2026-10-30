@@ -247,7 +247,7 @@ def _regenerate_pipeline(adapter):
     pipeline._quality_policy = SimpleNamespace(resolve=lambda **_kwargs: SimpleNamespace(cache_dit=None))
     pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda _plan: None)
     pipeline._validate_refine_token_budget = lambda **_kwargs: None
-    pipeline._regenerate_silence = torch.full((2 * 3, 32), -0.25)
+    pipeline._regenerate_silence = ((22, 3), torch.full((2 * 3, 32), -0.25))
     requested = {}
 
     def resolve_upscale(extra, *, latent_h, latent_w):
@@ -374,3 +374,65 @@ def test_refine_pass_starts_from_the_upscaled_draft_at_the_release_sigma():
     torch.testing.assert_close(inputs["video_rows"], (1 - sigma) * rows + sigma * noise)
     torch.testing.assert_close(inputs["audio_rows"], silence)
     assert inputs["branch"].locked_audio_rows is not None
+
+
+def test_draft_is_upscaled_once_for_every_output_seed():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.load_vae_decoder = False
+    draft, silence = torch.zeros(1, 24, 2, 4, 6), torch.zeros(2, 32, 3)
+    target = SimpleNamespace(height=128, width=192)
+    pipeline._prepare_request_inputs = lambda _prompt, _sampling: {
+        "num_outputs": 2,
+        "seed": 5,
+        "latent_upscale": target,
+        "latent_refine": object(),
+        "regenerate_source": (draft, silence),
+        "regenerate_output_audio": None,
+        "preencode_mp4": False,
+    }
+    pipeline._denoise_kwargs = lambda _context: {}
+    upscaled, refined = [], []
+
+    def upscale(video_latent, requested):
+        assert video_latent is draft and requested is target
+        upscaled.append(torch.ones(1, 24, 2, 8, 12))
+        return upscaled[-1]
+
+    def refine(video_latent, audio_latent, *, context, seed):
+        assert video_latent is upscaled[0] and audio_latent is silence
+        refined.append(seed)
+        return video_latent + seed, audio_latent
+
+    pipeline._upscaled_latent = upscale
+    pipeline._refined_latents = refine
+    output = pipeline.forward(SimpleNamespace(prompts=["draft"], sampling_params=SimpleNamespace()))
+
+    assert len(upscaled) == 1 and refined == [5, 6]
+    videos = output.output["payload"]["trajectory"]["latents"]["video"]
+    assert [float(video[0, 0, 0, 0, 0]) for video in videos] == [6.0, 7.0]
+
+
+def test_silence_is_reencoded_when_the_clip_length_changes():
+    from contextlib import nullcontext
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline._component_on_device = lambda _module: nullcontext()
+    calls = []
+
+    def encode_waveform(waveform, sample_rate):
+        calls.append(waveform.shape[-1])
+        return torch.zeros(6, 32, dtype=torch.bfloat16), 3
+
+    pipeline.audio_vae = SimpleNamespace(encode_waveform=encode_waveform)
+    first = pipeline._regenerate_silence_rows(22, 3)
+    assert pipeline._regenerate_silence_rows(22, 3) is first and len(calls) == 1
+    # Another frame count that happens to share the audio length still re-encodes.
+    pipeline._regenerate_silence_rows(23, 3)
+    assert len(calls) == 2 and calls[0] != calls[1]
+    assert first.device.type == "cpu" and first.dtype == torch.float32

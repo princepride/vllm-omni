@@ -3302,17 +3302,22 @@ class MiniMaxH3Pipeline(
         }
 
     def _regenerate_silence_rows(self, num_frames: int, audio_t: int) -> torch.Tensor:
-        """Encoded stereo silence, the audio the release's refiner conditions on."""
+        """Encoded stereo silence, the audio the release's refiner conditions on.
+
+        The last encoding is reused only for the same clip length; it is kept on
+        the CPU in FP32, and callers place it where they need it.
+        """
+        key = (num_frames, audio_t)
         cached = getattr(self, "_regenerate_silence", None)
-        if cached is not None and cached.shape[0] == 2 * audio_t:
-            return cached
+        if cached is not None and cached[0] == key:
+            return cached[1]
         samples = round(num_frames / MINIMAX_H3_FPS * MINIMAX_H3_AUDIO_SAMPLE_RATE)
         with self._component_on_device(self.audio_vae):
             rows, encoded_t = self.audio_vae.encode_waveform(torch.zeros(2, samples), MINIMAX_H3_AUDIO_SAMPLE_RATE)
         if encoded_t != audio_t:
             raise RuntimeError(f"encoded silence has {encoded_t} audio latents, the canvas {audio_t}")
-        self._regenerate_silence = rows.float()
-        return self._regenerate_silence
+        self._regenerate_silence = (key, rows.to(device="cpu", dtype=torch.float32))
+        return self._regenerate_silence[1]
 
     def _prepare_regenerate_inputs(
         self,
@@ -3559,12 +3564,17 @@ class MiniMaxH3Pipeline(
         # Each seed appends one count on the output owner and none on peers;
         # decode_to_mp4 rejects multiple MP4 outputs for a single seed.
         frame_counts = []
+        regenerate_source = context.get("regenerate_source")
+        if regenerate_source is not None and upscale_target is not None:
+            # The draft is the same for every seed and the upscale deterministic:
+            # upscale it once; only the refine pass below depends on the seed.
+            regenerate_source = (self._upscaled_latent(regenerate_source[0], upscale_target), regenerate_source[1])
         for output_seed in _minimax_h3_output_seeds(context["seed"], num_outputs):
             check_request_cancellation()
             output_kwargs = {**denoise_kwargs, "seed": output_seed}
-            if context.get("regenerate_source") is not None:
+            if regenerate_source is not None:
                 # Open-H3-Regenerate starts from the encoded draft, not noise.
-                video_latent, audio_latent = context["regenerate_source"]
+                video_latent, audio_latent = regenerate_source
             elif context.get("continuation") is None:
                 video_latent, audio_latent = self.diffuse(
                     **output_kwargs,
@@ -3580,7 +3590,7 @@ class MiniMaxH3Pipeline(
                     text_conditioning=context.get("continuation_text_conditioning"),
                 )
             check_request_cancellation()
-            if upscale_target is not None:
+            if upscale_target is not None and regenerate_source is None:
                 video_latent = self._upscaled_latent(video_latent, upscale_target)
             if latent_refine is not None:
                 video_latent, audio_latent = self._refined_latents(
