@@ -18,6 +18,7 @@ from vllm_omni.diffusion.models.minimax_h3.continuation import (
 from vllm_omni.diffusion.models.minimax_h3.latent_cache import (
     CachedClip,
     LatentClipCache,
+    latent_cache_clips,
     plan_latent_continuation,
     trim_decoded_overlap,
 )
@@ -64,11 +65,18 @@ def test_lru_refreshes_on_get_and_evicts_the_oldest():
     assert cache.get("b") is None and cache.get("a") is first and cache.get("c") is third
 
 
-def test_zero_capacity_disables_the_cache(monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_H3_LATENT_CACHE_CLIPS", "0")
-    cache = LatentClipCache()
+def test_zero_capacity_disables_the_cache():
+    cache = LatentClipCache(capacity=0)
     cache.put("a", _clip(22))
     assert cache.get("a") is None and len(cache) == 0
+
+
+def test_cache_size_comes_from_additional_config():
+    assert latent_cache_clips(None) == latent_cache_clips({}) == 16
+    assert latent_cache_clips({"latent_cache_clips": 0}) == 0
+    for value in (-1, "8", True, 2.5):
+        with pytest.raises(ValueError, match="latent_cache_clips"):
+            latent_cache_clips({"latent_cache_clips": value})
 
 
 def test_request_contract():

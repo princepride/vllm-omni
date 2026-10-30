@@ -18,9 +18,9 @@ it does not survive a restart and is not shared between data-parallel replicas.
 
 from __future__ import annotations
 
-import os
 import threading
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -32,7 +32,8 @@ from vllm_omni.model_executor.models.minimax_h3.long_video import MINIMAX_H3_MAX
 from .continuation import LatentPrefix, _audio_t, _video_t
 
 LATENT_CACHE_KEY = "latent_cache_key"
-LATENT_CACHE_CLIPS_ENV = "VLLM_OMNI_H3_LATENT_CACHE_CLIPS"
+# ``--additional-config`` key for the cache size in clips; 0 disables it.
+LATENT_CACHE_CLIPS_CONFIG = "latent_cache_clips"
 DEFAULT_LATENT_CACHE_CLIPS = 16
 _FPS = 24
 _MAX_TIMELINE_FRAMES = int(MINIMAX_H3_MAX_CONTINUATION_SECONDS * _FPS)
@@ -52,14 +53,20 @@ class CachedClip:
         return self.start_frame + self.num_frames
 
 
+def latent_cache_clips(additional_config: Mapping[str, object] | None) -> int:
+    """The cache size from ``--additional-config``, or the default."""
+    value = (additional_config or {}).get(LATENT_CACHE_CLIPS_CONFIG, DEFAULT_LATENT_CACHE_CLIPS)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{LATENT_CACHE_CLIPS_CONFIG} must be a non-negative integer, got {value!r}")
+    return value
+
+
 class LatentClipCache:
     """Thread-safe LRU of :class:`CachedClip` keyed by video job id."""
 
-    def __init__(self, capacity: int | None = None) -> None:
-        if capacity is None:
-            capacity = int(os.environ.get(LATENT_CACHE_CLIPS_ENV, DEFAULT_LATENT_CACHE_CLIPS))
+    def __init__(self, capacity: int = DEFAULT_LATENT_CACHE_CLIPS) -> None:
         if capacity < 0:
-            raise ValueError(f"{LATENT_CACHE_CLIPS_ENV} must be non-negative")
+            raise ValueError(f"{LATENT_CACHE_CLIPS_CONFIG} must be non-negative")
         self.capacity = capacity
         self._clips: OrderedDict[str, CachedClip] = OrderedDict()
         self._lock = threading.Lock()

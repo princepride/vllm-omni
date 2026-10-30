@@ -386,10 +386,10 @@ curl -s http://localhost:8091/v1/videos \
   continue such a job, but its own output is not addressable. With
   `num_outputs_per_prompt > 1`, the first output is the one a later request
   continues. A chain may span up to 300 seconds of global timeline.
-- Latents live in each DiT worker process, in an LRU of
-  `VLLM_OMNI_H3_LATENT_CACHE_CLIPS` clips (default 16; `0` disables it). They
-  are lost on restart and not shared across data-parallel replicas. A missing
-  or evicted source returns 400; regenerate it or start a new chain.
+- Latents live in each DiT worker process, in an LRU of 16 clips; serve with
+  `--additional-config '{"latent_cache_clips": N}'` to change it (`0` disables
+  it). They are lost on restart and not shared across data-parallel replicas.
+  A missing or evicted source returns 400; regenerate it or start a new chain.
 
 ### Speech-to-Video
 

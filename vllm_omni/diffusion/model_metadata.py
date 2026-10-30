@@ -33,6 +33,12 @@ class DiffusionModelMetadata:
     supports_segmentation: bool = False
 
 
+# ``extra_args`` keys that only name a request (the video API's job-id tag for
+# ``supports_latent_continuation``) and never change its forward schedule, so
+# requests differing only in them may share a DLO data-parallel wave.
+REQUEST_IDENTITY_EXTRA_ARGS = frozenset({"latent_cache_key"})
+
+
 # FLUX.2 Klein supports up to four reference images.
 FLUX2_KLEIN_MAX_INPUT_IMAGES = 4
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4

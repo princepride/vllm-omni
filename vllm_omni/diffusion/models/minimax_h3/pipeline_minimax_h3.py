@@ -144,6 +144,7 @@ from .latent_cache import (
     CachedClip,
     LatentClipCache,
     LatentContinuation,
+    latent_cache_clips,
     plan_latent_continuation,
     trim_decoded_overlap,
 )
@@ -1303,7 +1304,7 @@ class MiniMaxH3Pipeline(
 
         self._quality_policy = MiniMaxH3QualityPolicy(od_config)
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
-        self._latent_clip_cache = LatentClipCache()
+        self._latent_clip_cache = LatentClipCache(latent_cache_clips(od_config.additional_config))
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
