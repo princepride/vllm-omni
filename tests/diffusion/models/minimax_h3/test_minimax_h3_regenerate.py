@@ -326,9 +326,16 @@ def test_pipeline_refuses_requests_outside_the_regenerate_contract(tmp_path):
         (_draft_conditioning(), plain, "regenerates drafts only"),
         (_draft_conditioning(video_mask=torch.ones(2, 4, 6)), _sampling(), "no video_noise_mask"),
         (_draft_conditioning(), _sampling(flow_shift=12), "flow_shift=6"),
+        # A 2K regenerate leaves the base canvas a cross-request continuation shares.
+        (_draft_conditioning(), _sampling(continue_from="video_gen_source"), "continue_from"),
     ):
         with pytest.raises(OmniClientError, match=message):
             pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
+    pipeline.od_config.controlnet_model_path = "/configured/control.safetensors"
+    with pytest.raises(OmniClientError, match="control inputs"):
+        pipeline._prepare_encoder_conditioning_inputs(
+            _draft_conditioning(), _sampling(canny={}), control_media={"control_path": "/tmp/hint.mp4"}
+        )
     pipeline._regenerate = None
     with pytest.raises(OmniClientError, match="--lora-path"):
         pipeline._prepare_encoder_conditioning_inputs(_draft_conditioning(), _sampling())
