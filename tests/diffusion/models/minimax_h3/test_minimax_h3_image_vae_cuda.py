@@ -8,7 +8,16 @@ import torch
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.minimax_h3.image_vae import MiniMaxH3ImageVAE
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+# ``decode_latent(use_cuda_graph=True)`` captures CUDA graphs. A device whose
+# ``device.type`` is not ``cuda`` (MUSA) skips the capture and decodes eagerly,
+# so there is no graph to assert on. ``torch.cuda.is_available()`` is
+# deliberately False on MUSA and True on ROCm, which is the split we want.
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.diffusion,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires a CUDA/HIP device"),
+]
 
 
 def test_graph_tile_decode_is_bitwise_eager():
